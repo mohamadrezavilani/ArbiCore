@@ -6,15 +6,15 @@ from uuid import uuid4
 from app.models.base import Base, UUIDMixin, TimestampMixin
 
 class Exchange(Base, UUIDMixin, TimestampMixin):
-    """Stores exchange metadata and API configuration."""
     __tablename__ = "exchanges"
 
-    name: Mapped[str] = mapped_column(String(50), unique=True, index=True)  # "nobitex", "wallex"
+    name: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     base_url: Mapped[str] = mapped_column(String(200))
-    orderbook_endpoint: Mapped[str] = mapped_column(String(100))  # e.g. "/v3/orderbook/{symbol}" or "/v1/depth"
+    orderbook_endpoint: Mapped[str] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(default=True)
+    taker_fee: Mapped[float] = mapped_column(Numeric(10, 6), default=0.0)   # fee when you take an order
+    maker_fee: Mapped[float] = mapped_column(Numeric(10, 6), default=0.0)   # fee when you place a limit order
 
-    # Relations
     symbols: Mapped[list["ExchangeSymbol"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
 
 class ExchangeSymbol(Base, UUIDMixin, TimestampMixin):
@@ -49,7 +49,7 @@ class ArbitrageOpportunity(Base, UUIDMixin, TimestampMixin):
     common_symbol: Mapped[str] = mapped_column(String(50), index=True)
     exchange_a_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"))
     exchange_b_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"))
-    trade_type: Mapped[str] = mapped_column(String(10))  # "buy" or "sell"
+    trade_type: Mapped[str] = mapped_column(String(50))  # "buy" or "sell"
     price_a: Mapped[float] = mapped_column(Numeric(20, 10))
     price_b: Mapped[float] = mapped_column(Numeric(20, 10))
     profit_percent: Mapped[float] = mapped_column(Numeric(10, 4))
