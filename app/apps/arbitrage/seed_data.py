@@ -1,29 +1,37 @@
 import asyncio
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
+from sqlalchemy import select
 from app.core.config import settings
+from app.core.database import AsyncSessionLocal   # if you have a session maker
+# If you don't have AsyncSessionLocal in database.py, use the engine directly:
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from app.apps.arbitrage.models import Exchange, ExchangeSymbol
 
 
 async def seed():
+    """
+    Seed exchanges and symbols into the database.
+    This function is idempotent – it checks for existing records before inserting.
+    """
+    # Use the same engine as your main app
     engine = create_async_engine(str(settings.DATABASE_URL), echo=True)
     async_session = async_sessionmaker(engine, expire_on_commit=False)
 
     async with async_session() as session:
-        # Wallex
+        # ========== 1. Check if any exchange already exists ==========
+        existing_exchange = await session.execute(select(Exchange).limit(1))
+        if existing_exchange.first():
+            print("✅ Exchanges already seeded – skipping.")
+            return
+
+        # ========== 2. Create exchange records ==========
         wallex = Exchange(
             name="wallex",
             base_url="https://api.wallex.ir",
             orderbook_endpoint="/v1/depth",
             is_active=True,
-            taker_fee=0.001,  # 0.1%
-            maker_fee=0.001  # same (if no distinction)
+            taker_fee=0.001,   # 0.1%
+            maker_fee=0.001
         )
-        # Nobitex
         nobitex = Exchange(
             name="nobitex",
             base_url="https://apiv2.nobitex.ir",
@@ -32,15 +40,13 @@ async def seed():
             taker_fee=0.001,
             maker_fee=0.001
         )
-
-        # Bitpin exchange
         bitpin = Exchange(
             name="bitpin",
             base_url="https://api.bitpin.org",
             orderbook_endpoint="/api/v1/mth/orderbook/{symbol}/",
             is_active=True,
-            taker_fee=0.0035,  # acceptor fee (0.35%)
-            maker_fee=0.003  # placer fee (0.3%)
+            taker_fee=0.0035,   # 0.35% acceptor fee
+            maker_fee=0.003      # 0.3% placer fee
         )
 
         session.add_all([wallex, nobitex, bitpin])
@@ -49,6 +55,7 @@ async def seed():
         await session.refresh(nobitex)
         await session.refresh(bitpin)
 
+        # ========== 3. Create symbol records ==========
         # Wallex symbols
         wallex_symbols = [
             ExchangeSymbol(exchange_id=wallex.id, original_symbol="TONTMN", common_symbol="TONIRT", price_conversion_factor=10.0, is_active=True),

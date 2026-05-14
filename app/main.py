@@ -7,19 +7,24 @@ from app.core.handlers import register_exception_handlers
 from app.core.logging import setup_logging
 from app.apps.arbitrage.api import router as arbitrage_router
 from app.apps.arbitrage.tasks import periodic_arbitrage_poll
+from app.apps.arbitrage.seed_data import seed   # <-- import your seeding function
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     setup_logging()
-    # Create tables (only for development – remove later and use Alembic)
+
+    # 1. Create all tables (if they don't exist)
     async with engine.begin() as conn:
         from app.models.base import Base
-        from app.apps.arbitrage import models  # import to register models
+        from app.apps.arbitrage import models   # registers models with Base
         await conn.run_sync(Base.metadata.create_all)
 
-    # Start background arbitrage polling
+    # 2. Seed initial data (exchanges, symbols) – runs only once
+    await seed()
+
+    # 3. Start background arbitrage polling
     poll_task = asyncio.create_task(periodic_arbitrage_poll())
 
     yield
@@ -37,10 +42,8 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Register global exception handlers
     register_exception_handlers(app)
 
-    # Include the arbitrage router directly – DO NOT mount a sub‑app
     app.include_router(
         arbitrage_router,
         prefix=f"{settings.API_V1_PREFIX}/arbitrage",
@@ -50,5 +53,5 @@ def create_app() -> FastAPI:
     return app
 
 
-# Create the global FastAPI instance
+# Global FastAPI instance – Render imports this
 app = create_app()
