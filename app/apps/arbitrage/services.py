@@ -6,6 +6,8 @@ from sqlalchemy.orm import selectinload
 from typing import Dict, Any, Optional, Tuple, List
 from app.core.config import settings
 from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity
+from app.apps.arbitrage.inventory import get_base_balance, update_base_balance, get_quote_balance, \
+    update_quote_balance
 
 logger = logging.getLogger(__name__)
 
@@ -128,41 +130,68 @@ class ArbitrageService:
         )
         db.add(snapshot)
 
-    # ---------- Generic fee‑aware arbitrage detection ----------
     async def detect_arbitrage_between(
-        self,
-        db: AsyncSession,
-        common_symbol: str,
-        exchange_a_name: str,
-        a_prices: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
-        a_taker_fee: float,
-        exchange_b_name: str,
-        b_prices: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
-        b_taker_fee: float,
+            self,
+            db: AsyncSession,
+            common_symbol: str,
+            exchange_a_name: str,
+            a_prices: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
+            a_taker_fee: float,
+            exchange_b_name: str,
+            b_prices: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
+            b_taker_fee: float,
     ) -> None:
-        """
-        Detect arbitrage opportunities between two exchanges, accounting for taker fees.
-        a_prices = (ask_price, ask_volume, bid_price, bid_volume)
-        """
         a_ask, a_ask_v, a_bid, a_bid_v = a_prices
         b_ask, b_ask_v, b_bid, b_bid_v = b_prices
 
-        # Fetch exchange IDs from DB
+        # Determine quote currency from symbol suffix
+        if common_symbol.endswith("IRT"):
+            quote_currency = "IRT"
+        elif common_symbol.endswith("USDT"):
+            quote_currency = "USDT"
+        else:
+            logger.warning(f"Unknown quote currency for symbol {common_symbol}")
+            return
+
+        # Get exchange IDs
         exch_a = await db.execute(select(Exchange).where(Exchange.name == exchange_a_name))
         exch_a_obj = exch_a.scalar_one_or_none()
         exch_b = await db.execute(select(Exchange).where(Exchange.name == exchange_b_name))
         exch_b_obj = exch_b.scalar_one_or_none()
         if not exch_a_obj or not exch_b_obj:
-            logger.warning(f"Exchange {exchange_a_name} or {exchange_b_name} not found")
             return
 
-        # Opportunity 1: buy on A (ask), sell on B (bid)
+        # ---------- Opportunity 1: buy on A (ask), sell on B (bid) ----------
         if a_ask and b_bid:
-            buy_cost = a_ask * (1 + a_taker_fee)
-            sell_revenue = b_bid * (1 - b_taker_fee)
-            if sell_revenue > buy_cost:
-                profit_percent = (sell_revenue - buy_cost) / buy_cost * 100
+            buy_cost_per_unit = a_ask * (1 + a_taker_fee)
+            sell_revenue_per_unit = b_bid * (1 - b_taker_fee)
+            if sell_revenue_per_unit > buy_cost_per_unit:
+                profit_percent = (sell_revenue_per_unit - buy_cost_per_unit) / buy_cost_per_unit * 100
                 if profit_percent >= settings.ARBITRAGE_MIN_PROFIT_PERCENT:
+                    # Check base balance on sell side (B)
+                    sell_base = await get_base_balance(db, exchange_b_name, common_symbol)
+                    if sell_base <= 0:
+                        logger.info(f"⏭️ Skip {common_symbol} on {exchange_b_name}: base balance {sell_base} ≤ 0")
+                        return
+
+                    # Check order book volumes
+                    max_volume = min(
+                        sell_base,
+                        b_bid_v if b_bid_v else float('inf'),
+                        a_ask_v if a_ask_v else float('inf')
+                    )
+                    if max_volume <= 0:
+                        return
+
+                    # Check quote balance on buy side (A)
+                    required_quote = max_volume * buy_cost_per_unit
+                    quote_balance = await get_quote_balance(db, exchange_a_name, quote_currency)
+                    if quote_balance < required_quote:
+                        logger.info(
+                            f"⏭️ Skip {common_symbol} on {exchange_a_name}: quote balance {quote_balance} < {required_quote}")
+                        return
+
+                    # --- Record opportunity ---
                     opp = ArbitrageOpportunity(
                         common_symbol=common_symbol,
                         exchange_a_id=exch_a_obj.id,
@@ -171,20 +200,53 @@ class ArbitrageService:
                         price_a=a_ask,
                         price_b=b_bid,
                         profit_percent=profit_percent,
+                        traded_volume=max_volume,
                     )
                     db.add(opp)
+
+                    # --- Update inventories ---
+                    # Base: + on A, - on B
+                    await update_base_balance(db, exchange_a_name, common_symbol, max_volume)
+                    await update_base_balance(db, exchange_b_name, common_symbol, -max_volume)
+
+                    # Quote: - on A (cost), + on B (revenue)
+                    quote_cost = max_volume * buy_cost_per_unit
+                    quote_revenue = max_volume * sell_revenue_per_unit
+                    await update_quote_balance(db, exchange_a_name, quote_currency, -quote_cost)
+                    await update_quote_balance(db, exchange_b_name, quote_currency, quote_revenue)
+
                     logger.info(
-                        f"✅ Opportunity: buy {common_symbol} on {exchange_a_name} @{a_ask} (fee {a_taker_fee:.4f}), "
-                        f"sell on {exchange_b_name} @{b_bid} (fee {b_taker_fee:.4f}), net profit {profit_percent:.2f}%"
+                        f"✅ Executed {max_volume:.4f} {common_symbol} : buy on {exchange_a_name} @{a_ask} (cost {quote_cost:.2f} {quote_currency}), "
+                        f"sell on {exchange_b_name} @{b_bid} (revenue {quote_revenue:.2f} {quote_currency}), net profit {profit_percent:.2f}%"
                     )
 
-        # Opportunity 2: buy on B (ask), sell on A (bid)
+        # ---------- Opportunity 2: buy on B (ask), sell on A (bid) ----------
         if b_ask and a_bid:
-            buy_cost = b_ask * (1 + b_taker_fee)
-            sell_revenue = a_bid * (1 - a_taker_fee)
-            if sell_revenue > buy_cost:
-                profit_percent = (sell_revenue - buy_cost) / buy_cost * 100
+            buy_cost_per_unit = b_ask * (1 + b_taker_fee)
+            sell_revenue_per_unit = a_bid * (1 - a_taker_fee)
+            if sell_revenue_per_unit > buy_cost_per_unit:
+                profit_percent = (sell_revenue_per_unit - buy_cost_per_unit) / buy_cost_per_unit * 100
                 if profit_percent >= settings.ARBITRAGE_MIN_PROFIT_PERCENT:
+                    sell_base = await get_base_balance(db, exchange_a_name, common_symbol)
+                    if sell_base <= 0:
+                        logger.info(f"⏭️ Skip {common_symbol} on {exchange_a_name}: base balance {sell_base} ≤ 0")
+                        return
+
+                    max_volume = min(
+                        sell_base,
+                        a_bid_v if a_bid_v else float('inf'),
+                        b_ask_v if b_ask_v else float('inf')
+                    )
+                    if max_volume <= 0:
+                        return
+
+                    required_quote = max_volume * buy_cost_per_unit
+                    quote_balance = await get_quote_balance(db, exchange_b_name, quote_currency)
+                    if quote_balance < required_quote:
+                        logger.info(
+                            f"⏭️ Skip {common_symbol} on {exchange_b_name}: quote balance {quote_balance} < {required_quote}")
+                        return
+
                     opp = ArbitrageOpportunity(
                         common_symbol=common_symbol,
                         exchange_a_id=exch_b_obj.id,
@@ -193,11 +255,21 @@ class ArbitrageService:
                         price_a=b_ask,
                         price_b=a_bid,
                         profit_percent=profit_percent,
+                        traded_volume=max_volume,
                     )
                     db.add(opp)
+
+                    await update_base_balance(db, exchange_b_name, common_symbol, max_volume)
+                    await update_base_balance(db, exchange_a_name, common_symbol, -max_volume)
+
+                    quote_cost = max_volume * buy_cost_per_unit
+                    quote_revenue = max_volume * sell_revenue_per_unit
+                    await update_quote_balance(db, exchange_b_name, quote_currency, -quote_cost)
+                    await update_quote_balance(db, exchange_a_name, quote_currency, quote_revenue)
+
                     logger.info(
-                        f"✅ Opportunity: buy {common_symbol} on {exchange_b_name} @{b_ask} (fee {b_taker_fee:.4f}), "
-                        f"sell on {exchange_a_name} @{a_bid} (fee {a_taker_fee:.4f}), net profit {profit_percent:.2f}%"
+                        f"✅ Executed {max_volume:.4f} {common_symbol} : buy on {exchange_b_name} @{b_ask} (cost {quote_cost:.2f} {quote_currency}), "
+                        f"sell on {exchange_a_name} @{a_bid} (revenue {quote_revenue:.2f} {quote_currency}), net profit {profit_percent:.2f}%"
                     )
 
     # ---------- Main polling routine ----------

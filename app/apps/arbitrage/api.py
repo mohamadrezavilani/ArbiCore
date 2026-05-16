@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from app.apps.arbitrage.models import OrderbookSnapshot, Exchange, ExchangeSymbol
 from app.apps.arbitrage.schemas import OrderbookSnapshotResponse
+from app.apps.arbitrage.models import BaseInventory, QuoteInventory
 
 router = APIRouter()
 
@@ -76,3 +77,20 @@ async def list_exchanges(db: AsyncSession = Depends(get_db)):
 async def list_symbols(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(models.ExchangeSymbol))
     return result.scalars().all()
+
+from app.apps.arbitrage.models import BaseInventory, QuoteInventory
+
+@router.get("/balances")
+async def get_balances(db: AsyncSession = Depends(get_db)):
+    base_result = await db.execute(
+        select(Exchange.name, BaseInventory.common_symbol, BaseInventory.balance)
+        .join(Exchange, Exchange.id == BaseInventory.exchange_id)
+    )
+    quote_result = await db.execute(
+        select(Exchange.name, QuoteInventory.currency, QuoteInventory.balance)
+        .join(Exchange, Exchange.id == QuoteInventory.exchange_id)
+    )
+    return {
+        "base_balances": [{"exchange": r[0], "symbol": r[1], "balance": float(r[2])} for r in base_result.all()],
+        "quote_balances": [{"exchange": r[0], "currency": r[1], "balance": float(r[2])} for r in quote_result.all()]
+    }
