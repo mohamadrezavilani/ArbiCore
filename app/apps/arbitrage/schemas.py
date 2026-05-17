@@ -67,3 +67,12 @@ class ScanTriggerResponse(BaseModel):
     message: str
     task_id: Optional[str]   # if you implement background task ID
 
+class SymbolSettingsCreate(BaseModel):
+    common_symbol: str
+    min_profit_percent: float
+    is_active: bool = True
+
+class SymbolSettingsResponse(SymbolSettingsCreate):
+    id: UUID4
+    created_at: datetime
+    updated_at: datetime

@@ -8,6 +8,8 @@ from app.core.config import settings
 from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity
 from app.apps.arbitrage.inventory import get_base_balance, update_base_balance, get_quote_balance, \
     update_quote_balance
+from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity, SymbolArbitrageSettings
+
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +169,16 @@ class ArbitrageService:
             sell_revenue_per_unit = b_bid * (1 - b_taker_fee)
             if sell_revenue_per_unit > buy_cost_per_unit:
                 profit_percent = (sell_revenue_per_unit - buy_cost_per_unit) / buy_cost_per_unit * 100
-                if profit_percent >= settings.ARBITRAGE_MIN_PROFIT_PERCENT:
+
+                # ---- NEW: Fetch per‑symbol minimum profit ----
+                min_profit = settings.ARBITRAGE_MIN_PROFIT_PERCENT
+                stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
+                result = await db.execute(stmt)
+                sym_settings = result.scalar_one_or_none()
+                if sym_settings and sym_settings.is_active:
+                    min_profit = sym_settings.min_profit_percent
+
+                if profit_percent >= min_profit:
                     # Check base balance on sell side (B)
                     sell_base = await get_base_balance(db, exchange_b_name, common_symbol)
                     if sell_base <= 0:
@@ -226,7 +237,16 @@ class ArbitrageService:
             sell_revenue_per_unit = a_bid * (1 - a_taker_fee)
             if sell_revenue_per_unit > buy_cost_per_unit:
                 profit_percent = (sell_revenue_per_unit - buy_cost_per_unit) / buy_cost_per_unit * 100
-                if profit_percent >= settings.ARBITRAGE_MIN_PROFIT_PERCENT:
+
+                # ---- NEW: Fetch per‑symbol minimum profit ----
+                min_profit = settings.ARBITRAGE_MIN_PROFIT_PERCENT
+                stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
+                result = await db.execute(stmt)
+                sym_settings = result.scalar_one_or_none()
+                if sym_settings and sym_settings.is_active:
+                    min_profit = sym_settings.min_profit_percent
+
+                if profit_percent >= min_profit:
                     sell_base = await get_base_balance(db, exchange_a_name, common_symbol)
                     if sell_base <= 0:
                         logger.info(f"⏭️ Skip {common_symbol} on {exchange_a_name}: base balance {sell_base} ≤ 0")

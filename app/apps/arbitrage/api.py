@@ -9,6 +9,8 @@ from app.apps.arbitrage.models import OrderbookSnapshot, Exchange, ExchangeSymbo
 from app.apps.arbitrage.schemas import OrderbookSnapshotResponse
 from app.apps.arbitrage.models import BaseInventory, QuoteInventory
 from sqlalchemy.orm import aliased
+from app.apps.arbitrage.models import SymbolArbitrageSettings
+from app.apps.arbitrage.schemas import SymbolSettingsCreate, SymbolSettingsResponse
 
 router = APIRouter()
 
@@ -240,3 +242,24 @@ async def get_system_stats(db: AsyncSession = Depends(get_db)):
         active_exchanges=active_ex,
         active_symbols=active_sym
     )
+
+@router.get("/settings", response_model=list[schemas.SymbolSettingsResponse])
+async def get_arbitrage_settings(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(SymbolArbitrageSettings))
+    return result.scalars().all()
+
+@router.post("/settings", response_model=schemas.SymbolSettingsResponse)
+async def create_or_update_setting(data: schemas.SymbolSettingsCreate, db: AsyncSession = Depends(get_db)):
+    # Check if exists
+    stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == data.common_symbol)
+    existing = await db.execute(stmt)
+    setting = existing.scalar_one_or_none()
+    if setting:
+        setting.min_profit_percent = data.min_profit_percent
+        setting.is_active = data.is_active
+    else:
+        setting = SymbolArbitrageSettings(**data.dict())
+        db.add(setting)
+    await db.commit()
+    await db.refresh(setting)
+    return setting

@@ -70,3 +70,11 @@ class QuoteInventory(Base, UUIDMixin, TimestampMixin):
     balance: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
 
     exchange: Mapped["Exchange"] = relationship(back_populates="quote_inventories")
+
+class SymbolArbitrageSettings(Base, UUIDMixin, TimestampMixin):
+    """Per‑symbol arbitrage settings (minimum profit percentage required)."""
+    __tablename__ = "symbol_arbitrage_settings"
+
+    common_symbol: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    min_profit_percent: Mapped[float] = mapped_column(Numeric(10, 4), default=0.5)
+    is_active: Mapped[bool] = mapped_column(default=True)
