@@ -43,4 +43,27 @@ class ArbitrageOpportunityResponse(BaseModel):
     price_a: float
     price_b: float
     profit_percent: float
+    traded_volume: float          # new
+    profit_quote: float           # new – actual profit in IRT or USDT
     created_at: datetime
+
+class OpportunitySummaryItem(BaseModel):
+    common_symbol: str
+    total_opportunities: int
+    sum_profit_percent: float
+    avg_profit_percent: float
+    total_estimated_profit_quote: float   # in IRT or USDT (based on symbol)
+    quote_currency: str
+
+class SystemStats(BaseModel):
+    total_opportunities: int
+    total_profit_irt: float
+    total_profit_usdt: float
+    last_scan_time: Optional[datetime]
+    active_exchanges: int
+    active_symbols: int
+
+class ScanTriggerResponse(BaseModel):
+    message: str
+    task_id: Optional[str]   # if you implement background task ID
+

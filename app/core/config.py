@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # Arbitrage
     ARBITRAGE_CHECK_INTERVAL_SECONDS: int = 10
-    ARBITRAGE_MIN_PROFIT_PERCENT: float = 0.1
+    ARBITRAGE_MIN_PROFIT_PERCENT: float = 0.5
 
     class Config:
         env_file = ".env"

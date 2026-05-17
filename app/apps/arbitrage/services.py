@@ -366,4 +366,4 @@ class ArbitrageService:
                         )
 
         await db.commit()
-        logger.info(f"✅ Polling cycle completed – processed {len(symbols)} symbols")
+        # logger.info(f"✅ Polling cycle completed – processed {len(symbols)} symbols")

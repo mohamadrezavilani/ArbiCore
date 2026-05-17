@@ -25,7 +25,8 @@ async def update_base_balance(db: AsyncSession, exchange_name: str, common_symbo
     ))
     inv = inv.scalar_one_or_none()
     if inv:
-        inv.balance += delta
+        # Convert Decimal to float, add delta, assign back (SQLAlchemy will convert to Decimal)
+        inv.balance = float(inv.balance) + delta
     else:
         db.add(BaseInventory(exchange_id=exch.id, common_symbol=common_symbol, balance=delta))
 
@@ -52,6 +53,6 @@ async def update_quote_balance(db: AsyncSession, exchange_name: str, currency: s
     ))
     inv = inv.scalar_one_or_none()
     if inv:
-        inv.balance += delta
+        inv.balance = float(inv.balance) + delta
     else:
         db.add(QuoteInventory(exchange_id=exch.id, currency=currency, balance=delta))
