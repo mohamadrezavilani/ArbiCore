@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -8,6 +8,8 @@ from app.apps.arbitrage.models import (
     OrderbookSnapshot, Exchange, ExchangeSymbol, ArbitrageOpportunity,
     BaseInventory, QuoteInventory, ExchangeFee, SymbolArbitrageSettings
 )
+from app.apps.arbitrage.models import Network, SymbolArbitrageSettings
+from app.apps.arbitrage.schemas import NetworkResponse, RiskSettingsResponse, RiskSettingsUpdate
 
 router = APIRouter()
 
@@ -243,3 +245,25 @@ async def create_or_update_setting(data: schemas.SymbolSettingsCreate, db: Async
     await db.commit()
     await db.refresh(setting)
     return setting
+
+@router.get("/networks", response_model=list[NetworkResponse])
+async def get_networks(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Network))
+    return result.scalars().all()
+
+@router.get("/risk-settings", response_model=list[RiskSettingsResponse])
+async def get_risk_settings(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(SymbolArbitrageSettings))
+    return result.scalars().all()
+
+@router.put("/risk-settings/{symbol}", response_model=RiskSettingsResponse)
+async def update_risk_settings(symbol: str, data: RiskSettingsUpdate, db: AsyncSession = Depends(get_db)):
+    stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == symbol)
+    settings = (await db.execute(stmt)).scalar_one_or_none()
+    if not settings:
+        raise HTTPException(status_code=404, detail="Symbol not found")
+    for key, value in data.dict(exclude_unset=True).items():
+        setattr(settings, key, value)
+    await db.commit()
+    await db.refresh(settings)
+    return settings

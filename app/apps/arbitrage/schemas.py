@@ -79,3 +79,30 @@ class SymbolSettingsResponse(SymbolSettingsCreate):
     id: UUID4
     created_at: datetime
     updated_at: datetime
+
+class NetworkResponse(BaseModel):
+    id: UUID4
+    symbol: str
+    network_name: str
+    fee_per_transfer: float
+    is_active: bool
+
+class RiskSettingsResponse(BaseModel):
+    id: UUID4
+    common_symbol: str
+    min_profit_percent: float
+    cutoff_threshold: float
+    min_trade_percent: float
+    min_trade_factor: float
+    valuability_factor: float
+    default_network_id: Optional[UUID4]
+    is_active: bool
+
+class RiskSettingsUpdate(BaseModel):
+    min_profit_percent: Optional[float] = None
+    cutoff_threshold: Optional[float] = None
+    min_trade_percent: Optional[float] = None
+    min_trade_factor: Optional[float] = None
+    valuability_factor: Optional[float] = None
+    default_network_id: Optional[UUID4] = None
+    is_active: Optional[bool] = None

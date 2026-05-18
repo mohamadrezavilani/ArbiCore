@@ -5,7 +5,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from typing import Dict, Any, Optional, Tuple, List
 from app.core.config import settings
-from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity, ExchangeFee, SymbolArbitrageSettings
+from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity, ExchangeFee, \
+    SymbolArbitrageSettings, Network
 from app.apps.arbitrage.inventory import get_base_balance, update_base_balance, get_quote_balance, update_quote_balance
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,32 @@ class ArbitrageService:
         )
         db.add(snapshot)
 
-    # ---------- Multi‑level arbitrage detection ----------
+    def calculate_trade_percent(self, net_gain: float, network_commission_quote: float,
+                                params: SymbolArbitrageSettings) -> float:
+        # Convert Decimal fields to float
+        cutoff = float(params.cutoff_threshold)
+        min_trade_pct = float(params.min_trade_percent)
+        min_trade_factor = float(params.min_trade_factor)
+        valuability_factor = float(params.valuability_factor)
+
+        min_threshold = min_trade_factor * network_commission_quote
+        full_threshold = valuability_factor * network_commission_quote
+
+        if net_gain <= 0:
+            return 0.0
+        if net_gain < cutoff:
+            return 0.0
+        if net_gain <= min_threshold:
+            return min_trade_pct
+        if net_gain >= full_threshold:
+            return 1.0
+
+        if full_threshold > min_threshold:
+            slope = (1.0 - min_trade_pct) / (full_threshold - min_threshold)
+            return min_trade_pct + slope * (net_gain - min_threshold)
+        else:
+            return min_trade_pct
+
     async def detect_arbitrage_between(
         self,
         db: AsyncSession,
@@ -130,12 +156,7 @@ class ArbitrageService:
         b_ask_levels: List[List[float]],
         b_bid_levels: List[List[float]],
     ) -> None:
-        """
-        Multi‑level arbitrage detection.
-        For opportunity 1: buy on A (use A's asks) and sell on B (use B's bids).
-        For opportunity 2: buy on B (use B's asks) and sell on A (use A's bids).
-        """
-        # Determine quote currency from symbol suffix
+        # Determine quote currency
         if common_symbol.endswith("IRT"):
             quote_currency = "IRT"
         elif common_symbol.endswith("USDT"):
@@ -144,7 +165,7 @@ class ArbitrageService:
             logger.warning(f"Unknown quote currency for symbol {common_symbol}")
             return
 
-        # Helper to fetch taker fee for an exchange given quote_currency
+        # Helper to get taker fee
         async def get_taker_fee(exchange_name: str) -> float:
             exch = await db.execute(select(Exchange).where(Exchange.name == exchange_name))
             exch_obj = exch.scalar_one_or_none()
@@ -166,178 +187,112 @@ class ArbitrageService:
         if not exch_a_obj or not exch_b_obj:
             return
 
-        a_taker_fee = await get_taker_fee(exchange_a_name)
-        b_taker_fee = await get_taker_fee(exchange_b_name)
+        # Get risk settings and network fee
+        settings_stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
+        settings = (await db.execute(settings_stmt)).scalar_one_or_none()
+        if not settings or not settings.is_active:
+            return
 
-        # ---------- Opportunity 1: buy on A (using A's asks), sell on B (using B's bids) ----------
+        network_fee_base = 0.0
+        if settings.default_network_id:
+            net_stmt = select(Network).where(Network.id == settings.default_network_id)
+            net = (await db.execute(net_stmt)).scalar_one_or_none()
+            if net:
+                network_fee_base = net.fee_per_transfer
+
+        a_fee = await get_taker_fee(exchange_a_name)
+        b_fee = await get_taker_fee(exchange_b_name)
+
+        # Helper to compute maximal trade (no risk scaling)
+        async def compute_max_trade(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee):
+            vol = cost = rev = 0.0
+            avail_base = await get_base_balance(db, sell_exch, common_symbol)
+            if avail_base <= 0:
+                return 0,0,0,0
+            avail_quote = await get_quote_balance(db, buy_exch, quote_currency)
+            if avail_quote <= 0:
+                return 0,0,0,0
+
+            i_buy = i_sell = 0
+            # make copies to avoid mutating original lists
+            buy_cpy = [l[:] for l in buy_levels]
+            sell_cpy = [l[:] for l in sell_levels]
+
+            while i_buy < len(buy_cpy) and i_sell < len(sell_cpy):
+                bprice, bvol = buy_cpy[i_buy]
+                sprice, svol = sell_cpy[i_sell]
+                cost_unit = bprice * (1 + buy_fee)
+                rev_unit = sprice * (1 - sell_fee)
+                if rev_unit <= cost_unit:
+                    break
+                take = min(bvol, svol, avail_base - vol, avail_quote / cost_unit)
+                if take <= 0:
+                    if bvol <= 0:
+                        i_buy += 1
+                    if svol <= 0:
+                        i_sell += 1
+                    continue
+                vol += take
+                cost += take * cost_unit
+                rev += take * rev_unit
+                buy_cpy[i_buy][1] -= take
+                sell_cpy[i_sell][1] -= take
+                if vol >= avail_base or cost >= avail_quote:
+                    break
+            return vol, cost, rev, rev - cost
+
+        # Process one direction (buy on A, sell on B)
+        async def process_opp(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee,
+                              buy_exch_obj, sell_exch_obj, prefix):
+            vol, cost, rev, gross_gain = await compute_max_trade(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee)
+            if vol <= 0:
+                return
+            vwap_buy = cost / vol
+            network_fee_quote = network_fee_base * vwap_buy
+            net_gain = gross_gain - network_fee_quote
+            if net_gain <= 0:
+                logger.debug(f"{common_symbol}: net gain {net_gain:.2f} after network fee {network_fee_quote:.2f}")
+                return
+            trade_pct = self.calculate_trade_percent(net_gain, network_fee_quote, settings)
+            if trade_pct <= 0:
+                return
+            actual_vol = vol * trade_pct
+            actual_cost = cost * trade_pct
+            actual_rev = rev * trade_pct
+            actual_profit_pct = (actual_rev - actual_cost) / actual_cost * 100 if actual_cost else 0
+            if actual_profit_pct < float(settings.min_profit_percent):
+                return
+
+            opp = ArbitrageOpportunity(
+                common_symbol=common_symbol,
+                exchange_a_id=buy_exch_obj.id,
+                exchange_b_id=sell_exch_obj.id,
+                trade_type=f"{prefix}_{buy_exch}_sell_on_{sell_exch}",
+                price_a=vwap_buy,
+                price_b=rev/vol,
+                profit_percent=actual_profit_pct,
+                traded_volume=actual_vol,
+            )
+            db.add(opp)
+
+            await update_base_balance(db, buy_exch, common_symbol, actual_vol)
+            await update_base_balance(db, sell_exch, common_symbol, -actual_vol)
+            await update_quote_balance(db, buy_exch, quote_currency, -actual_cost)
+            await update_quote_balance(db, sell_exch, quote_currency, actual_rev)
+
+            logger.info(
+                f"✅ Executed {actual_vol:.4f} {common_symbol} (risk {trade_pct:.1%} of max {vol:.4f}) "
+                f"buy {buy_exch} @{vwap_buy:.2f} sell {sell_exch} @{rev/vol:.2f} "
+                f"net profit {actual_profit_pct:.2f}% (network fee {network_fee_quote:.2f} {quote_currency})"
+            )
+
+        # Check both directions
         if a_ask_levels and b_bid_levels:
-            total_volume = 0.0
-            total_cost = 0.0
-            total_revenue = 0.0
-
-            # Get available base on sell side (B)
-            available_base = await get_base_balance(db, exchange_b_name, common_symbol)
-            if available_base <= 0:
-                logger.info(f"⏭️ Skip {common_symbol}: insufficient base on {exchange_b_name} ({available_base})")
-                return
-
-            # Get available quote on buy side (A)
-            available_quote = await get_quote_balance(db, exchange_a_name, quote_currency)
-
-            # Iterate through ask levels (sorted ascending) and bid levels (sorted descending)
-            i_ask = 0
-            i_bid = 0
-            while i_ask < len(a_ask_levels) and i_bid < len(b_bid_levels):
-                ask_price, ask_vol = a_ask_levels[i_ask]
-                bid_price, bid_vol = b_bid_levels[i_bid]
-
-                buy_cost_per_unit = ask_price * (1 + a_taker_fee)
-                sell_revenue_per_unit = bid_price * (1 - b_taker_fee)
-
-                # If this level is not profitable, stop (further levels are worse)
-                if sell_revenue_per_unit <= buy_cost_per_unit:
-                    break
-
-                # How much can we take from this level?
-                max_volume_this_level = min(
-                    ask_vol, bid_vol,
-                    available_base - total_volume,          # remaining base to sell
-                    available_quote / buy_cost_per_unit     # remaining quote to buy
-                )
-                if max_volume_this_level <= 0:
-                    # Move to next level on whichever side is exhausted
-                    if ask_vol <= 0:
-                        i_ask += 1
-                    if bid_vol <= 0:
-                        i_bid += 1
-                    continue
-
-                # Execute this partial level
-                total_volume += max_volume_this_level
-                total_cost += max_volume_this_level * buy_cost_per_unit
-                total_revenue += max_volume_this_level * sell_revenue_per_unit
-
-                # Reduce the level volumes
-                a_ask_levels[i_ask][1] -= max_volume_this_level
-                b_bid_levels[i_bid][1] -= max_volume_this_level
-
-                # If we reached inventory limits, stop
-                if total_volume >= available_base or total_cost >= available_quote:
-                    break
-
-            if total_volume > 0:
-                profit_percent = (total_revenue - total_cost) / total_cost * 100
-                min_profit = settings.ARBITRAGE_MIN_PROFIT_PERCENT
-                stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
-                result = await db.execute(stmt)
-                sym_settings = result.scalar_one_or_none()
-                if sym_settings and sym_settings.is_active:
-                    min_profit = sym_settings.min_profit_percent
-                if profit_percent >= min_profit:
-                    # VWAP prices
-                    vwap_buy = total_cost / total_volume if total_volume else 0
-                    vwap_sell = total_revenue / total_volume if total_volume else 0
-                    opp = ArbitrageOpportunity(
-                        common_symbol=common_symbol,
-                        exchange_a_id=exch_a_obj.id,
-                        exchange_b_id=exch_b_obj.id,
-                        trade_type=f"buy_on_{exchange_a_name}_sell_on_{exchange_b_name}",
-                        price_a=vwap_buy,
-                        price_b=vwap_sell,
-                        profit_percent=profit_percent,
-                        traded_volume=total_volume,
-                    )
-                    db.add(opp)
-
-                    # Update inventories
-                    await update_base_balance(db, exchange_a_name, common_symbol, total_volume)
-                    await update_base_balance(db, exchange_b_name, common_symbol, -total_volume)
-                    await update_quote_balance(db, exchange_a_name, quote_currency, -total_cost)
-                    await update_quote_balance(db, exchange_b_name, quote_currency, total_revenue)
-
-                    logger.info(
-                        f"✅ Executed {total_volume:.4f} {common_symbol} (buy on {exchange_a_name} VWAP {vwap_buy:.2f}, "
-                        f"sell on {exchange_b_name} VWAP {vwap_sell:.2f}) profit {profit_percent:.2f}%"
-                    )
-
-        # ---------- Opportunity 2: buy on B (using B's asks), sell on A (using A's bids) ----------
+            await process_opp(exchange_a_name, exchange_b_name, a_ask_levels, b_bid_levels, a_fee, b_fee,
+                              exch_a_obj, exch_b_obj, "buy_on")
         if b_ask_levels and a_bid_levels:
-            total_volume = 0.0
-            total_cost = 0.0
-            total_revenue = 0.0
-
-            available_base = await get_base_balance(db, exchange_a_name, common_symbol)
-            if available_base <= 0:
-                return
-
-            available_quote = await get_quote_balance(db, exchange_b_name, quote_currency)
-
-            i_ask = 0
-            i_bid = 0
-            while i_ask < len(b_ask_levels) and i_bid < len(a_bid_levels):
-                ask_price, ask_vol = b_ask_levels[i_ask]
-                bid_price, bid_vol = a_bid_levels[i_bid]
-
-                buy_cost_per_unit = ask_price * (1 + b_taker_fee)
-                sell_revenue_per_unit = bid_price * (1 - a_taker_fee)
-
-                if sell_revenue_per_unit <= buy_cost_per_unit:
-                    break
-
-                max_volume_this_level = min(
-                    ask_vol, bid_vol,
-                    available_base - total_volume,
-                    available_quote / buy_cost_per_unit
-                )
-                if max_volume_this_level <= 0:
-                    if ask_vol <= 0:
-                        i_ask += 1
-                    if bid_vol <= 0:
-                        i_bid += 1
-                    continue
-
-                total_volume += max_volume_this_level
-                total_cost += max_volume_this_level * buy_cost_per_unit
-                total_revenue += max_volume_this_level * sell_revenue_per_unit
-
-                b_ask_levels[i_ask][1] -= max_volume_this_level
-                a_bid_levels[i_bid][1] -= max_volume_this_level
-
-                if total_volume >= available_base or total_cost >= available_quote:
-                    break
-
-            if total_volume > 0:
-                profit_percent = (total_revenue - total_cost) / total_cost * 100
-                min_profit = settings.ARBITRAGE_MIN_PROFIT_PERCENT
-                stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
-                result = await db.execute(stmt)
-                sym_settings = result.scalar_one_or_none()
-                if sym_settings and sym_settings.is_active:
-                    min_profit = sym_settings.min_profit_percent
-                if profit_percent >= min_profit:
-                    vwap_buy = total_cost / total_volume if total_volume else 0
-                    vwap_sell = total_revenue / total_volume if total_volume else 0
-                    opp = ArbitrageOpportunity(
-                        common_symbol=common_symbol,
-                        exchange_a_id=exch_b_obj.id,
-                        exchange_b_id=exch_a_obj.id,
-                        trade_type=f"buy_on_{exchange_b_name}_sell_on_{exchange_a_name}",
-                        price_a=vwap_buy,
-                        price_b=vwap_sell,
-                        profit_percent=profit_percent,
-                        traded_volume=total_volume,
-                    )
-                    db.add(opp)
-
-                    await update_base_balance(db, exchange_b_name, common_symbol, total_volume)
-                    await update_base_balance(db, exchange_a_name, common_symbol, -total_volume)
-                    await update_quote_balance(db, exchange_b_name, quote_currency, -total_cost)
-                    await update_quote_balance(db, exchange_a_name, quote_currency, total_revenue)
-
-                    logger.info(
-                        f"✅ Executed {total_volume:.4f} {common_symbol} (buy on {exchange_b_name} VWAP {vwap_buy:.2f}, "
-                        f"sell on {exchange_a_name} VWAP {vwap_sell:.2f}) profit {profit_percent:.2f}%"
-                    )
+            await process_opp(exchange_b_name, exchange_a_name, b_ask_levels, a_bid_levels, b_fee, a_fee,
+                              exch_b_obj, exch_a_obj, "buy_on")
 
     # ---------- Main polling routine ----------
     async def poll_and_store(self, db: AsyncSession):
