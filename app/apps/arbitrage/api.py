@@ -1,16 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, func
+from fastapi import APIRouter, Depends
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.database import get_db
-from app.apps.arbitrage import models, schemas, services
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-from app.apps.arbitrage.models import OrderbookSnapshot, Exchange, ExchangeSymbol, ArbitrageOpportunity
-from app.apps.arbitrage.schemas import OrderbookSnapshotResponse
-from app.apps.arbitrage.models import BaseInventory, QuoteInventory
 from sqlalchemy.orm import aliased
-from app.apps.arbitrage.models import SymbolArbitrageSettings
-from app.apps.arbitrage.schemas import SymbolSettingsCreate, SymbolSettingsResponse
+from app.core.database import get_db
+from app.apps.arbitrage import models, schemas
+from app.apps.arbitrage.models import (
+    OrderbookSnapshot, Exchange, ExchangeSymbol, ArbitrageOpportunity,
+    BaseInventory, QuoteInventory, ExchangeFee, SymbolArbitrageSettings
+)
 
 router = APIRouter()
 
@@ -30,7 +27,7 @@ async def add_symbol(data: schemas.ExchangeSymbolCreate, db: AsyncSession = Depe
     await db.refresh(symbol)
     return symbol
 
-@router.get("/snapshots", response_model=list[OrderbookSnapshotResponse])
+@router.get("/snapshots", response_model=list[schemas.OrderbookSnapshotResponse])
 async def get_snapshots(limit: int = 20, db: AsyncSession = Depends(get_db)):
     stmt = (
         select(
@@ -50,9 +47,8 @@ async def get_snapshots(limit: int = 20, db: AsyncSession = Depends(get_db)):
     )
     result = await db.execute(stmt)
     rows = result.all()
-    # Convert each row to a dict that matches the response schema
     return [
-        OrderbookSnapshotResponse(
+        schemas.OrderbookSnapshotResponse(
             id=row.id,
             exchange_name=row.exchange_name,
             common_symbol=row.common_symbol,
@@ -65,35 +61,33 @@ async def get_snapshots(limit: int = 20, db: AsyncSession = Depends(get_db)):
         for row in rows
     ]
 
-
 @router.get("/opportunities", response_model=list[schemas.ArbitrageOpportunityResponse])
 async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db)):
-    ExchangeA = aliased(Exchange)
-    ExchangeB = aliased(Exchange)
-
-    stmt = (
-        select(
-            ArbitrageOpportunity.id,
-            ArbitrageOpportunity.common_symbol,
-            ArbitrageOpportunity.trade_type,
-            ArbitrageOpportunity.price_a,
-            ArbitrageOpportunity.price_b,
-            ArbitrageOpportunity.profit_percent,
-            ArbitrageOpportunity.traded_volume,
-            ArbitrageOpportunity.created_at,
-            ExchangeA.name.label("exchange_a_name"),
-            ExchangeB.name.label("exchange_b_name"),
-            (ArbitrageOpportunity.traded_volume *
-             (ArbitrageOpportunity.price_b * (1 - ExchangeB.taker_fee) -
-              ArbitrageOpportunity.price_a * (1 + ExchangeA.taker_fee))
-             ).label("profit_quote")
-        )
-        .join(ExchangeA, ArbitrageOpportunity.exchange_a_id == ExchangeA.id)
-        .join(ExchangeB, ArbitrageOpportunity.exchange_b_id == ExchangeB.id)
-        .order_by(ArbitrageOpportunity.created_at.desc())
-        .limit(limit)
-    )
-    result = await db.execute(stmt)
+    # Raw SQL to join with exchange_fees using case for quote_currency
+    raw_sql = text("""
+        SELECT
+            ao.id,
+            ao.common_symbol,
+            ao.trade_type,
+            ao.price_a,
+            ao.price_b,
+            ao.profit_percent,
+            ao.traded_volume,
+            ao.created_at,
+            ea.name AS exchange_a_name,
+            eb.name AS exchange_b_name,
+            (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))) AS profit_quote
+        FROM arbitrage_opportunities ao
+        JOIN exchanges ea ON ao.exchange_a_id = ea.id
+        JOIN exchanges eb ON ao.exchange_b_id = eb.id
+        JOIN exchange_fees fa ON fa.exchange_id = ea.id
+            AND fa.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
+        JOIN exchange_fees fb ON fb.exchange_id = eb.id
+            AND fb.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
+        ORDER BY ao.created_at DESC
+        LIMIT :limit
+    """)
+    result = await db.execute(raw_sql, {"limit": limit})
     rows = result.all()
     return [
         schemas.ArbitrageOpportunityResponse(
@@ -114,28 +108,29 @@ async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db))
 
 @router.get("/opportunities/summary", response_model=list[schemas.OpportunitySummaryItem])
 async def get_opportunity_summary(db: AsyncSession = Depends(get_db)):
-    ExchangeA = aliased(Exchange)
-    ExchangeB = aliased(Exchange)
-
-    stmt = (
-        select(
-            ArbitrageOpportunity.common_symbol,
-            func.count(ArbitrageOpportunity.id).label("total"),
-            func.sum(ArbitrageOpportunity.profit_percent).label("sum_percent"),
-            func.avg(ArbitrageOpportunity.profit_percent).label("avg_percent"),
-            func.sum(
-                ArbitrageOpportunity.traded_volume *
-                (ArbitrageOpportunity.price_b * (1 - ExchangeB.taker_fee) -
-                 ArbitrageOpportunity.price_a * (1 + ExchangeA.taker_fee))
-            ).label("total_profit_quote")
+    raw_sql = text("""
+        WITH profit_calc AS (
+            SELECT
+                ao.common_symbol,
+                ao.profit_percent,
+                (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))) AS profit_quote
+            FROM arbitrage_opportunities ao
+            JOIN exchange_fees fa ON fa.exchange_id = ao.exchange_a_id
+                AND fa.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
+            JOIN exchange_fees fb ON fb.exchange_id = ao.exchange_b_id
+                AND fb.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
         )
-        .join(ExchangeA, ArbitrageOpportunity.exchange_a_id == ExchangeA.id)
-        .join(ExchangeB, ArbitrageOpportunity.exchange_b_id == ExchangeB.id)
-        .group_by(ArbitrageOpportunity.common_symbol)
-    )
-    result = await db.execute(stmt)
+        SELECT
+            common_symbol,
+            COUNT(*) AS total_opportunities,
+            SUM(profit_percent) AS sum_profit_percent,
+            AVG(profit_percent) AS avg_profit_percent,
+            SUM(profit_quote) AS total_estimated_profit_quote
+        FROM profit_calc
+        GROUP BY common_symbol
+    """)
+    result = await db.execute(raw_sql)
     rows = result.all()
-
     summary = []
     for row in rows:
         if row.common_symbol.endswith("IRT"):
@@ -147,10 +142,10 @@ async def get_opportunity_summary(db: AsyncSession = Depends(get_db)):
         summary.append(
             schemas.OpportunitySummaryItem(
                 common_symbol=row.common_symbol,
-                total_opportunities=row.total,
-                sum_profit_percent=float(row.sum_percent) if row.sum_percent else 0.0,
-                avg_profit_percent=float(row.avg_percent) if row.avg_percent else 0.0,
-                total_estimated_profit_quote=float(row.total_profit_quote) if row.total_profit_quote else 0.0,
+                total_opportunities=row.total_opportunities,
+                sum_profit_percent=float(row.sum_profit_percent) if row.sum_profit_percent else 0.0,
+                avg_profit_percent=float(row.avg_profit_percent) if row.avg_profit_percent else 0.0,
+                total_estimated_profit_quote=float(row.total_estimated_profit_quote) if row.total_estimated_profit_quote else 0.0,
                 quote_currency=quote
             )
         )
@@ -165,8 +160,6 @@ async def list_exchanges(db: AsyncSession = Depends(get_db)):
 async def list_symbols(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(models.ExchangeSymbol))
     return result.scalars().all()
-
-from app.apps.arbitrage.models import BaseInventory, QuoteInventory
 
 @router.get("/balances")
 async def get_balances(db: AsyncSession = Depends(get_db)):
@@ -183,55 +176,39 @@ async def get_balances(db: AsyncSession = Depends(get_db)):
         "quote_balances": [{"exchange": r[0], "currency": r[1], "balance": float(r[2])} for r in quote_result.all()]
     }
 
-
 @router.get("/stats", response_model=schemas.SystemStats)
 async def get_system_stats(db: AsyncSession = Depends(get_db)):
-    ExchangeA = aliased(Exchange)
-    ExchangeB = aliased(Exchange)
+    raw_sql = text("""
+        WITH profit_calc AS (
+            SELECT
+                ao.common_symbol,
+                (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))) AS profit_quote
+            FROM arbitrage_opportunities ao
+            JOIN exchange_fees fa ON fa.exchange_id = ao.exchange_a_id
+                AND fa.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
+            JOIN exchange_fees fb ON fb.exchange_id = ao.exchange_b_id
+                AND fb.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
+        )
+        SELECT
+            COALESCE(SUM(CASE WHEN common_symbol LIKE '%IRT' THEN profit_quote ELSE 0 END), 0) AS total_profit_irt,
+            COALESCE(SUM(CASE WHEN common_symbol LIKE '%USDT' THEN profit_quote ELSE 0 END), 0) AS total_profit_usdt
+        FROM profit_calc
+    """)
+    result = await db.execute(raw_sql)
+    profit_row = result.first()
+    profit_irt = float(profit_row.total_profit_irt) if profit_row else 0.0
+    profit_usdt = float(profit_row.total_profit_usdt) if profit_row else 0.0
 
-    # Total opportunities
     total_opp = await db.execute(select(func.count(ArbitrageOpportunity.id)))
     total_opp = total_opp.scalar() or 0
 
-    # Total profit in IRT
-    profit_irt_stmt = (
-        select(func.sum(
-            ArbitrageOpportunity.traded_volume *
-            (ArbitrageOpportunity.price_b * (1 - ExchangeB.taker_fee) -
-             ArbitrageOpportunity.price_a * (1 + ExchangeA.taker_fee))
-        ))
-        .join(ExchangeA, ArbitrageOpportunity.exchange_a_id == ExchangeA.id)
-        .join(ExchangeB, ArbitrageOpportunity.exchange_b_id == ExchangeB.id)
-        .where(ArbitrageOpportunity.common_symbol.like("%IRT"))
-    )
-    profit_irt = await db.execute(profit_irt_stmt)
-    profit_irt = float(profit_irt.scalar() or 0.0)
-
-    # Total profit in USDT
-    profit_usdt_stmt = (
-        select(func.sum(
-            ArbitrageOpportunity.traded_volume *
-            (ArbitrageOpportunity.price_b * (1 - ExchangeB.taker_fee) -
-             ArbitrageOpportunity.price_a * (1 + ExchangeA.taker_fee))
-        ))
-        .join(ExchangeA, ArbitrageOpportunity.exchange_a_id == ExchangeA.id)
-        .join(ExchangeB, ArbitrageOpportunity.exchange_b_id == ExchangeB.id)
-        .where(ArbitrageOpportunity.common_symbol.like("%USDT"))
-    )
-    profit_usdt = await db.execute(profit_usdt_stmt)
-    profit_usdt = float(profit_usdt.scalar() or 0.0)
-
-    # Last scan time
     last_scan = await db.execute(select(func.max(OrderbookSnapshot.created_at)))
     last_scan = last_scan.scalar()
 
-    # Active exchanges count
     active_ex = await db.execute(select(func.count()).select_from(Exchange).where(Exchange.is_active == True))
     active_ex = active_ex.scalar() or 0
 
-    # Active symbols count
-    active_sym = await db.execute(
-        select(func.count()).select_from(ExchangeSymbol).where(ExchangeSymbol.is_active == True))
+    active_sym = await db.execute(select(func.count()).select_from(ExchangeSymbol).where(ExchangeSymbol.is_active == True))
     active_sym = active_sym.scalar() or 0
 
     return schemas.SystemStats(
@@ -250,7 +227,6 @@ async def get_arbitrage_settings(db: AsyncSession = Depends(get_db)):
 
 @router.post("/settings", response_model=schemas.SymbolSettingsResponse)
 async def create_or_update_setting(data: schemas.SymbolSettingsCreate, db: AsyncSession = Depends(get_db)):
-    # Check if exists
     stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == data.common_symbol)
     existing = await db.execute(stmt)
     setting = existing.scalar_one_or_none()

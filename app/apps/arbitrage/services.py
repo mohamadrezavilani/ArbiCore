@@ -5,11 +5,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from typing import Dict, Any, Optional, Tuple, List
 from app.core.config import settings
-from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity
-from app.apps.arbitrage.inventory import get_base_balance, update_base_balance, get_quote_balance, \
-    update_quote_balance
-from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity, SymbolArbitrageSettings
-
+from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity, ExchangeFee, SymbolArbitrageSettings
+from app.apps.arbitrage.inventory import get_base_balance, update_base_balance, get_quote_balance, update_quote_balance
 
 logger = logging.getLogger(__name__)
 
@@ -132,16 +129,15 @@ class ArbitrageService:
         )
         db.add(snapshot)
 
+    # ---------- Arbitrage detection with per‑currency fees ----------
     async def detect_arbitrage_between(
-            self,
-            db: AsyncSession,
-            common_symbol: str,
-            exchange_a_name: str,
-            a_prices: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
-            a_taker_fee: float,
-            exchange_b_name: str,
-            b_prices: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
-            b_taker_fee: float,
+        self,
+        db: AsyncSession,
+        common_symbol: str,
+        exchange_a_name: str,
+        a_prices: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
+        exchange_b_name: str,
+        b_prices: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
     ) -> None:
         a_ask, a_ask_v, a_bid, a_bid_v = a_prices
         b_ask, b_ask_v, b_bid, b_bid_v = b_prices
@@ -155,6 +151,20 @@ class ArbitrageService:
             logger.warning(f"Unknown quote currency for symbol {common_symbol}")
             return
 
+        # Helper to fetch taker fee for an exchange given quote_currency
+        async def get_taker_fee(exchange_name: str) -> float:
+            exch = await db.execute(select(Exchange).where(Exchange.name == exchange_name))
+            exch_obj = exch.scalar_one_or_none()
+            if not exch_obj:
+                return 0.0
+            fee_stmt = select(ExchangeFee).where(
+                ExchangeFee.exchange_id == exch_obj.id,
+                ExchangeFee.quote_currency == quote_currency
+            )
+            fee_rec = await db.execute(fee_stmt)
+            fee = fee_rec.scalar_one_or_none()
+            return float(fee.taker_fee) if fee else 0.0
+
         # Get exchange IDs
         exch_a = await db.execute(select(Exchange).where(Exchange.name == exchange_a_name))
         exch_a_obj = exch_a.scalar_one_or_none()
@@ -163,6 +173,9 @@ class ArbitrageService:
         if not exch_a_obj or not exch_b_obj:
             return
 
+        a_taker_fee = await get_taker_fee(exchange_a_name)
+        b_taker_fee = await get_taker_fee(exchange_b_name)
+
         # ---------- Opportunity 1: buy on A (ask), sell on B (bid) ----------
         if a_ask and b_bid:
             buy_cost_per_unit = a_ask * (1 + a_taker_fee)
@@ -170,7 +183,7 @@ class ArbitrageService:
             if sell_revenue_per_unit > buy_cost_per_unit:
                 profit_percent = (sell_revenue_per_unit - buy_cost_per_unit) / buy_cost_per_unit * 100
 
-                # ---- NEW: Fetch per‑symbol minimum profit ----
+                # Per‑symbol minimum profit threshold
                 min_profit = settings.ARBITRAGE_MIN_PROFIT_PERCENT
                 stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
                 result = await db.execute(stmt)
@@ -185,7 +198,6 @@ class ArbitrageService:
                         logger.info(f"⏭️ Skip {common_symbol} on {exchange_b_name}: base balance {sell_base} ≤ 0")
                         return
 
-                    # Check order book volumes
                     max_volume = min(
                         sell_base,
                         b_bid_v if b_bid_v else float('inf'),
@@ -198,11 +210,10 @@ class ArbitrageService:
                     required_quote = max_volume * buy_cost_per_unit
                     quote_balance = await get_quote_balance(db, exchange_a_name, quote_currency)
                     if quote_balance < required_quote:
-                        logger.info(
-                            f"⏭️ Skip {common_symbol} on {exchange_a_name}: quote balance {quote_balance} < {required_quote}")
+                        logger.info(f"⏭️ Skip {common_symbol} on {exchange_a_name}: quote balance {quote_balance} < {required_quote}")
                         return
 
-                    # --- Record opportunity ---
+                    # Record opportunity
                     opp = ArbitrageOpportunity(
                         common_symbol=common_symbol,
                         exchange_a_id=exch_a_obj.id,
@@ -215,12 +226,10 @@ class ArbitrageService:
                     )
                     db.add(opp)
 
-                    # --- Update inventories ---
-                    # Base: + on A, - on B
+                    # Update inventories
                     await update_base_balance(db, exchange_a_name, common_symbol, max_volume)
                     await update_base_balance(db, exchange_b_name, common_symbol, -max_volume)
 
-                    # Quote: - on A (cost), + on B (revenue)
                     quote_cost = max_volume * buy_cost_per_unit
                     quote_revenue = max_volume * sell_revenue_per_unit
                     await update_quote_balance(db, exchange_a_name, quote_currency, -quote_cost)
@@ -238,7 +247,6 @@ class ArbitrageService:
             if sell_revenue_per_unit > buy_cost_per_unit:
                 profit_percent = (sell_revenue_per_unit - buy_cost_per_unit) / buy_cost_per_unit * 100
 
-                # ---- NEW: Fetch per‑symbol minimum profit ----
                 min_profit = settings.ARBITRAGE_MIN_PROFIT_PERCENT
                 stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
                 result = await db.execute(stmt)
@@ -263,8 +271,7 @@ class ArbitrageService:
                     required_quote = max_volume * buy_cost_per_unit
                     quote_balance = await get_quote_balance(db, exchange_b_name, quote_currency)
                     if quote_balance < required_quote:
-                        logger.info(
-                            f"⏭️ Skip {common_symbol} on {exchange_b_name}: quote balance {quote_balance} < {required_quote}")
+                        logger.info(f"⏭️ Skip {common_symbol} on {exchange_b_name}: quote balance {quote_balance} < {required_quote}")
                         return
 
                     opp = ArbitrageOpportunity(
@@ -315,9 +322,7 @@ class ArbitrageService:
 
         async with aiohttp.ClientSession() as session:
             for common_symbol, exchange_symbols in symbol_group.items():
-                # Store prices for each exchange
                 exchange_data = {}
-
                 for ex_sym in exchange_symbols:
                     exchange_name = ex_sym.exchange.name
                     original_symbol = ex_sym.original_symbol
@@ -365,15 +370,7 @@ class ArbitrageService:
                         else:
                             logger.debug(f"Failed to fetch bitpin {original_symbol}")
 
-                # Fetch taker fees for exchanges that have data
-                fees = {}
-                for name in exchange_data.keys():
-                    exch = await db.execute(select(Exchange).where(Exchange.name == name))
-                    exch_obj = exch.scalar_one_or_none()
-                    if exch_obj:
-                        fees[name] = float(exch_obj.taker_fee)
-
-                # Compare every pair of exchanges that we have data for
+                # Compare every pair of exchanges that have data
                 exchange_names = list(exchange_data.keys())
                 for i in range(len(exchange_names)):
                     for j in range(i + 1, len(exchange_names)):
@@ -381,9 +378,9 @@ class ArbitrageService:
                         name_b = exchange_names[j]
                         await self.detect_arbitrage_between(
                             db, common_symbol,
-                            name_a, exchange_data[name_a], fees.get(name_a, 0),
-                            name_b, exchange_data[name_b], fees.get(name_b, 0)
+                            name_a, exchange_data[name_a],
+                            name_b, exchange_data[name_b]
                         )
 
         await db.commit()
-        # logger.info(f"✅ Polling cycle completed – processed {len(symbols)} symbols")
+        # Optional: logger.info("✅ Polling cycle completed")

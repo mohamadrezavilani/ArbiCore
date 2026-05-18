@@ -2,9 +2,7 @@ import asyncio
 from sqlalchemy import select
 from app.core.config import settings
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from app.apps.arbitrage.models import Exchange, ExchangeSymbol, BaseInventory, QuoteInventory
-from app.apps.arbitrage.models import SymbolArbitrageSettings
-
+from app.apps.arbitrage.models import Exchange, ExchangeSymbol, BaseInventory, QuoteInventory, ExchangeFee, SymbolArbitrageSettings
 
 async def seed():
     engine = create_async_engine(str(settings.DATABASE_URL), echo=True)
@@ -17,26 +15,27 @@ async def seed():
             print("✅ Exchanges already seeded – skipping.")
             return
 
-        # Exchanges
+        # ========== 1. Exchanges ==========
         wallex = Exchange(
             name="wallex", base_url="https://api.wallex.ir", orderbook_endpoint="/v1/depth",
-            is_active=True, taker_fee=0.001, maker_fee=0.001
+            is_active=True
         )
         nobitex = Exchange(
             name="nobitex", base_url="https://apiv2.nobitex.ir", orderbook_endpoint="/v3/orderbook/{symbol}",
-            is_active=True, taker_fee=0.001, maker_fee=0.001
+            is_active=True
         )
         bitpin = Exchange(
             name="bitpin", base_url="https://api.bitpin.org", orderbook_endpoint="/api/v1/mth/orderbook/{symbol}/",
-            is_active=True, taker_fee=0.0035, maker_fee=0.003
+            is_active=True
         )
         session.add_all([wallex, nobitex, bitpin])
         await session.commit()
         await session.refresh(wallex)
         await session.refresh(nobitex)
         await session.refresh(bitpin)
+        print("✅ Exchanges created.")
 
-        # Symbols
+        # ========== 2. Symbols ==========
         symbols = [
             # Wallex
             ExchangeSymbol(exchange_id=wallex.id, original_symbol="TONTMN", common_symbol="TONIRT", price_conversion_factor=10.0),
@@ -53,7 +52,25 @@ async def seed():
         ]
         session.add_all(symbols)
         await session.commit()
+        print("✅ Symbols created.")
 
+        # ========== 3. Fees (per exchange and quote currency) ==========
+        fees = [
+            # Wallex
+            ExchangeFee(exchange_id=wallex.id, quote_currency="IRT", taker_fee=0.003, maker_fee=0.0025),
+            ExchangeFee(exchange_id=wallex.id, quote_currency="USDT", taker_fee=0.003, maker_fee=0.0025),
+            # Nobitex
+            ExchangeFee(exchange_id=nobitex.id, quote_currency="IRT", taker_fee=0.0025, maker_fee=0.0025),
+            ExchangeFee(exchange_id=nobitex.id, quote_currency="USDT", taker_fee=0.0013, maker_fee=0.001),
+            # Bitpin
+            ExchangeFee(exchange_id=bitpin.id, quote_currency="IRT", taker_fee=0.0035, maker_fee=0.003),
+            ExchangeFee(exchange_id=bitpin.id, quote_currency="USDT", taker_fee=0.0035, maker_fee=0.003),
+        ]
+        session.add_all(fees)
+        await session.commit()
+        print("✅ Fees created.")
+
+        # ========== 4. Inventories ==========
         # Base inventory: 100 units of each base symbol per exchange
         for exchange in [wallex, nobitex, bitpin]:
             for sym in ["TONIRT", "TONUSDT", "USDTIRT"]:
@@ -61,18 +78,19 @@ async def seed():
 
         # Quote inventory: 10,000,000 IRT and 10,000 USDT per exchange
         for exchange in [wallex, nobitex, bitpin]:
-            session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=500_000_000.0))
-            session.add(QuoteInventory(exchange_id=exchange.id, currency="USDT", balance=500.0))
+            session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=10_000_000.0))
+            session.add(QuoteInventory(exchange_id=exchange.id, currency="USDT", balance=10_000.0))
 
-        # Default min profit percentages
+        await session.commit()
+        print("✅ Inventories created.")
+
+        # ========== 5. Symbol arbitrage settings ==========
         settings_rows = [
             SymbolArbitrageSettings(common_symbol="TONIRT", min_profit_percent=0.5, is_active=True),
-            SymbolArbitrageSettings(common_symbol="TONUSDT", min_profit_percent=0.001, is_active=True),
+            SymbolArbitrageSettings(common_symbol="TONUSDT", min_profit_percent=0.1, is_active=True),
             SymbolArbitrageSettings(common_symbol="USDTIRT", min_profit_percent=0.5, is_active=True),
         ]
         session.add_all(settings_rows)
-        await session.commit()
-
         await session.commit()
         print("✅ Database seeded successfully.")
 

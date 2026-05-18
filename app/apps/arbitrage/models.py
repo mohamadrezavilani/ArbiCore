@@ -10,12 +10,22 @@ class Exchange(Base, UUIDMixin, TimestampMixin):
     base_url: Mapped[str] = mapped_column(String(200))
     orderbook_endpoint: Mapped[str] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(default=True)
-    taker_fee: Mapped[float] = mapped_column(Numeric(10, 6), default=0.0)
-    maker_fee: Mapped[float] = mapped_column(Numeric(10, 6), default=0.0)
 
     symbols: Mapped[list["ExchangeSymbol"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
     base_inventories: Mapped[list["BaseInventory"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
     quote_inventories: Mapped[list["QuoteInventory"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
+    fees: Mapped[list["ExchangeFee"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
+
+
+class ExchangeFee(Base, UUIDMixin, TimestampMixin):
+    __tablename__ = "exchange_fees"
+
+    exchange_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"), nullable=False)
+    quote_currency: Mapped[str] = mapped_column(String(10), nullable=False)  # 'IRT' or 'USDT'
+    taker_fee: Mapped[float] = mapped_column(Numeric(10, 6), default=0.0)
+    maker_fee: Mapped[float] = mapped_column(Numeric(10, 6), default=0.0)
+
+    exchange: Mapped["Exchange"] = relationship(back_populates="fees")
 
 class ExchangeSymbol(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "exchange_symbols"
