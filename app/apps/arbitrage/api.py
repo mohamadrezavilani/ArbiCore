@@ -36,6 +36,8 @@ async def get_snapshots(limit: int = 20, db: AsyncSession = Depends(get_db)):
             OrderbookSnapshot.best_ask_volume,
             OrderbookSnapshot.best_bid_price,
             OrderbookSnapshot.best_bid_volume,
+            OrderbookSnapshot.asks,
+            OrderbookSnapshot.bids,
             OrderbookSnapshot.created_at,
             Exchange.name.label("exchange_name"),
             ExchangeSymbol.common_symbol.label("common_symbol")
@@ -56,6 +58,8 @@ async def get_snapshots(limit: int = 20, db: AsyncSession = Depends(get_db)):
             best_ask_volume=row.best_ask_volume,
             best_bid_price=row.best_bid_price,
             best_bid_volume=row.best_bid_volume,
+            asks=row.asks,
+            bids=row.bids,
             created_at=row.created_at
         )
         for row in rows

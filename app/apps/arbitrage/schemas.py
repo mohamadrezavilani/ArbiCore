@@ -1,6 +1,7 @@
 from pydantic import BaseModel, UUID4
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+
 
 # ... (keep previous Opportunity schemas if any)
 
@@ -32,6 +33,8 @@ class OrderbookSnapshotResponse(BaseModel):
     best_ask_volume: Optional[float]
     best_bid_price: Optional[float]
     best_bid_volume: Optional[float]
+    asks: Optional[List[List[float]]]   # added
+    bids: Optional[List[List[float]]]   # added
     created_at: datetime
 
 class ArbitrageOpportunityResponse(BaseModel):

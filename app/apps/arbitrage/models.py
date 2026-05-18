@@ -47,6 +47,8 @@ class OrderbookSnapshot(Base, UUIDMixin, TimestampMixin):
     best_ask_volume: Mapped[float] = mapped_column(Numeric(20, 10), nullable=True)
     best_bid_price: Mapped[float] = mapped_column(Numeric(20, 10), nullable=True)
     best_bid_volume: Mapped[float] = mapped_column(Numeric(20, 10), nullable=True)
+    asks: Mapped[list] = mapped_column(JSON, nullable=True)   # [[price, volume], ...]
+    bids: Mapped[list] = mapped_column(JSON, nullable=True)   # [[price, volume], ...]
     raw_data: Mapped[dict] = mapped_column(JSON, nullable=True)
 
 class ArbitrageOpportunity(Base, UUIDMixin, TimestampMixin):
