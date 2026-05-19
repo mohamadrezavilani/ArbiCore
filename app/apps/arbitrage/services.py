@@ -6,7 +6,7 @@ from sqlalchemy.orm import selectinload
 from typing import Dict, Any, Optional, Tuple, List
 from app.core.config import settings
 from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity, ExchangeFee, \
-    SymbolArbitrageSettings, Network
+    SymbolArbitrageSettings, Network, BaseInventory
 from app.apps.arbitrage.inventory import get_base_balance, update_base_balance, get_quote_balance, update_quote_balance
 
 logger = logging.getLogger(__name__)
@@ -165,6 +165,7 @@ class ArbitrageService:
             exch = await db.execute(select(Exchange).where(Exchange.name == exchange_name))
             exch_obj = exch.scalar_one_or_none()
             if not exch_obj:
+                logger.warning(f"Exchange {exchange_name} not found for fee query")
                 return 0.0
             fee_stmt = select(ExchangeFee).where(
                 ExchangeFee.exchange_id == exch_obj.id,
@@ -172,7 +173,12 @@ class ArbitrageService:
             )
             fee_rec = await db.execute(fee_stmt)
             fee = fee_rec.scalar_one_or_none()
-            return float(fee.taker_fee) if fee else 0.0
+            if not fee:
+                logger.warning(f"No fee record for {exchange_name} {quote_currency}")
+                return 0.0
+            fee_val = float(fee.taker_fee)
+            # logger.info(f"Fee for {exchange_name} {quote_currency} = {fee_val}")
+            return fee_val
 
         exch_a = await db.execute(select(Exchange).where(Exchange.name == exchange_a_name))
         exch_a_obj = exch_a.scalar_one_or_none()
@@ -238,31 +244,25 @@ class ArbitrageService:
             if vol <= 0:
                 return
             vwap_buy = cost / vol
-            # Network fee in quote currency (fixed per trade)
+            vwap_sell = rev / vol
+            # Gross profit percent after exchange fees
+            gross_profit_pct = ((rev - cost) / cost) * 100 if cost else 0
+            logger.info(f"Max trade for {common_symbol}: vol={vol}, cost={cost}, rev={rev}, gross_profit_pct={gross_profit_pct:.4f}%")
+
+            # Risk uses gross gain (after exchange fees) and network fee as threshold
             network_fee_quote = network_fee_base * vwap_buy
-            net_gain = gross_gain - network_fee_quote
-            if net_gain <= 0:
-                logger.debug(f"{common_symbol}: net gain {net_gain:.2f} after network fee {network_fee_quote:.2f}")
-                return
-
-            trade_pct = self.calculate_trade_percent(net_gain, network_fee_quote, settings)
+            trade_pct = self.calculate_trade_percent(gross_gain, network_fee_quote, settings)
             if trade_pct <= 0:
+                logger.info( f"but trade_pct={trade_pct}")
                 return
 
-            # Scale volume, cost, revenue proportionally
             actual_vol = vol * trade_pct
             actual_cost = cost * trade_pct
             actual_rev = rev * trade_pct
-            # Network fee is fixed (does not scale)
-            actual_net_profit = (actual_rev - actual_cost) - network_fee_quote
-            if actual_net_profit <= 0:
-                logger.debug(f"{common_symbol}: scaled trade net profit {actual_net_profit:.2f} <= 0")
-                return
-
-            actual_net_profit = (actual_rev - actual_cost) - network_fee_quote
-            actual_profit_pct = (actual_net_profit / actual_cost) * 100 if actual_cost else 0
+            actual_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
 
             if actual_profit_pct < float(settings.min_profit_percent):
+                logger.info( f"but actual_profit_pct={actual_profit_pct} less than min_profit_percent={settings.min_profit_percent}")
                 return
 
             opp = ArbitrageOpportunity(
@@ -271,13 +271,12 @@ class ArbitrageService:
                 exchange_b_id=sell_exch_obj.id,
                 trade_type=f"{prefix}_{buy_exch}_sell_on_{sell_exch}",
                 price_a=vwap_buy,
-                price_b=rev/vol,
+                price_b=vwap_sell,
                 profit_percent=actual_profit_pct,
                 traded_volume=actual_vol,
             )
             db.add(opp)
 
-            # Update inventories (network fee not deducted because it's external)
             await update_base_balance(db, buy_exch, common_symbol, actual_vol)
             await update_base_balance(db, sell_exch, common_symbol, -actual_vol)
             await update_quote_balance(db, buy_exch, quote_currency, -actual_cost)
@@ -285,8 +284,8 @@ class ArbitrageService:
 
             logger.info(
                 f"✅ Executed {actual_vol:.4f} {common_symbol} (risk {trade_pct:.1%} of max {vol:.4f}) "
-                f"buy {buy_exch} @{vwap_buy:.2f} sell {sell_exch} @{rev/vol:.2f} "
-                f"net profit {actual_profit_pct:.2f}% (network fee {network_fee_quote:.2f} {quote_currency})"
+                f"buy {buy_exch} @{vwap_buy:.2f} sell {sell_exch} @{vwap_sell:.2f} "
+                f"profit {actual_profit_pct:.2f}% (network fee {network_fee_quote:.2f} used for risk)"
             )
 
         if a_ask_levels and b_bid_levels:
@@ -295,6 +294,9 @@ class ArbitrageService:
         if b_ask_levels and a_bid_levels:
             await process_opp(exchange_b_name, exchange_a_name, b_ask_levels, a_bid_levels, b_fee, a_fee,
                               exch_b_obj, exch_a_obj, "buy_on")
+
+        # After all balances updated
+        await self.rebalance_symbol_if_needed(db, common_symbol, quote_currency)
 
     async def poll_and_store(self, db: AsyncSession):
         stmt = (
@@ -379,3 +381,65 @@ class ArbitrageService:
                         )
 
         await db.commit()
+
+    async def rebalance_symbol_if_needed(self, db: AsyncSession, common_symbol: str, quote_currency: str):
+        """
+        After a trade, if any exchange has zero balance of common_symbol,
+        transfer 75% of the largest source balance from another exchange
+        (after deducting network fee) to the empty exchange.
+        """
+        # Get all active exchanges and their base balances for this symbol
+        stmt = (
+            select(Exchange.id, Exchange.name, BaseInventory.balance)
+            .join(BaseInventory, BaseInventory.exchange_id == Exchange.id)
+            .where(BaseInventory.common_symbol == common_symbol)
+            .where(Exchange.is_active == True)
+        )
+        result = await db.execute(stmt)
+        rows = result.all()
+
+        # Find exchanges with zero balance
+        zero_exchanges = [row for row in rows if float(row.balance) <= 0]
+        if not zero_exchanges:
+            return
+
+        # Find exchanges with positive balance
+        positive_exchanges = [row for row in rows if float(row.balance) > 0]
+        if not positive_exchanges:
+            logger.warning(f"No positive balance for {common_symbol} to rebalance")
+            return
+
+        # For simplicity, we only rebalance the first zero exchange
+        target_exch = zero_exchanges[0]
+        # Find the source with the largest balance
+        source_exch = max(positive_exchanges, key=lambda x: float(x.balance))
+        source_balance = float(source_exch.balance)
+        transfer_amount = source_balance * 0.50  # 50% of source balance
+
+        # Get network fee for this symbol (in base currency)
+        settings_stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
+        settings = (await db.execute(settings_stmt)).scalar_one_or_none()
+        if not settings or not settings.default_network_id:
+            logger.warning(f"No network fee configured for {common_symbol}, skipping rebalance")
+            return
+        net_stmt = select(Network).where(Network.id == settings.default_network_id)
+        net = (await db.execute(net_stmt)).scalar_one_or_none()
+        if not net:
+            logger.warning(f"Network not found for {common_symbol}, skipping rebalance")
+            return
+        network_fee = float(net.fee_per_transfer)
+
+        if transfer_amount <= network_fee:
+            logger.info(f"Transfer amount {transfer_amount:.4f} {common_symbol} <= network fee {network_fee}, skipping")
+            return
+
+        net_received = transfer_amount - network_fee
+
+        # Update balances
+        await update_base_balance(db, source_exch.name, common_symbol, -transfer_amount)
+        await update_base_balance(db, target_exch.name, common_symbol, net_received)
+
+        logger.info(
+            f"🔄 Rebalanced {common_symbol}: sent {transfer_amount:.4f} from {source_exch.name} to {target_exch.name} "
+            f"(network fee {network_fee:.4f}), net received {net_received:.4f}"
+        )

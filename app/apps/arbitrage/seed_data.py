@@ -128,7 +128,7 @@ async def seed():
             SymbolArbitrageSettings(
                 common_symbol="TONUSDT",
                 min_profit_percent=0.1,
-                cutoff_threshold=0.1,
+                cutoff_threshold=0.005,
                 min_trade_percent=0.20,
                 min_trade_factor=0.3,
                 valuability_factor=1.0,

@@ -68,7 +68,7 @@ async def get_snapshots(limit: int = 20, db: AsyncSession = Depends(get_db)):
 
 @router.get("/opportunities", response_model=list[schemas.ArbitrageOpportunityResponse])
 async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db)):
-    # Raw SQL that includes network fee subtraction
+    # Correct: price_a and price_b already include fees, so profit = volume * (price_b - price_a)
     raw_sql = text("""
         SELECT
             ao.id,
@@ -81,17 +81,10 @@ async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db))
             ao.created_at,
             ea.name AS exchange_a_name,
             eb.name AS exchange_b_name,
-            (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))
-             - COALESCE(n.fee_per_transfer * ao.price_a, 0)) AS profit_quote
+            (ao.traded_volume * (ao.price_b - ao.price_a)) AS profit_quote
         FROM arbitrage_opportunities ao
         JOIN exchanges ea ON ao.exchange_a_id = ea.id
         JOIN exchanges eb ON ao.exchange_b_id = eb.id
-        JOIN exchange_fees fa ON fa.exchange_id = ea.id
-            AND fa.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
-        JOIN exchange_fees fb ON fb.exchange_id = eb.id
-            AND fb.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
-        LEFT JOIN symbol_arbitrage_settings sas ON sas.common_symbol = ao.common_symbol
-        LEFT JOIN networks n ON n.id = sas.default_network_id
         ORDER BY ao.created_at DESC
         LIMIT :limit
     """)
@@ -117,27 +110,13 @@ async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db))
 @router.get("/opportunities/summary", response_model=list[schemas.OpportunitySummaryItem])
 async def get_opportunity_summary(db: AsyncSession = Depends(get_db)):
     raw_sql = text("""
-        WITH profit_calc AS (
-            SELECT
-                ao.common_symbol,
-                ao.profit_percent,
-                (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))
-                 - COALESCE(n.fee_per_transfer * ao.price_a, 0)) AS profit_quote
-            FROM arbitrage_opportunities ao
-            JOIN exchange_fees fa ON fa.exchange_id = ao.exchange_a_id
-                AND fa.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
-            JOIN exchange_fees fb ON fb.exchange_id = ao.exchange_b_id
-                AND fb.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
-            LEFT JOIN symbol_arbitrage_settings sas ON sas.common_symbol = ao.common_symbol
-            LEFT JOIN networks n ON n.id = sas.default_network_id
-        )
         SELECT
             common_symbol,
             COUNT(*) AS total_opportunities,
             SUM(profit_percent) AS sum_profit_percent,
             AVG(profit_percent) AS avg_profit_percent,
-            SUM(profit_quote) AS total_estimated_profit_quote
-        FROM profit_calc
+            SUM(traded_volume * (price_b - price_a)) AS total_estimated_profit_quote
+        FROM arbitrage_opportunities
         GROUP BY common_symbol
     """)
     result = await db.execute(raw_sql)
@@ -190,23 +169,10 @@ async def get_balances(db: AsyncSession = Depends(get_db)):
 @router.get("/stats", response_model=schemas.SystemStats)
 async def get_system_stats(db: AsyncSession = Depends(get_db)):
     raw_sql = text("""
-        WITH profit_calc AS (
-            SELECT
-                ao.common_symbol,
-                (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))
-                 - COALESCE(n.fee_per_transfer * ao.price_a, 0)) AS profit_quote
-            FROM arbitrage_opportunities ao
-            JOIN exchange_fees fa ON fa.exchange_id = ao.exchange_a_id
-                AND fa.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
-            JOIN exchange_fees fb ON fb.exchange_id = ao.exchange_b_id
-                AND fb.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
-            LEFT JOIN symbol_arbitrage_settings sas ON sas.common_symbol = ao.common_symbol
-            LEFT JOIN networks n ON n.id = sas.default_network_id
-        )
         SELECT
-            COALESCE(SUM(CASE WHEN common_symbol LIKE '%IRT' THEN profit_quote ELSE 0 END), 0) AS total_profit_irt,
-            COALESCE(SUM(CASE WHEN common_symbol LIKE '%USDT' THEN profit_quote ELSE 0 END), 0) AS total_profit_usdt
-        FROM profit_calc
+            COALESCE(SUM(CASE WHEN common_symbol LIKE '%IRT' THEN traded_volume * (price_b - price_a) ELSE 0 END), 0) AS total_profit_irt,
+            COALESCE(SUM(CASE WHEN common_symbol LIKE '%USDT' THEN traded_volume * (price_b - price_a) ELSE 0 END), 0) AS total_profit_usdt
+        FROM arbitrage_opportunities
     """)
     result = await db.execute(raw_sql)
     profit_row = result.first()
