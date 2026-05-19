@@ -33,7 +33,6 @@ class ArbitrageService:
             return None
 
     def wallex_extract_levels(self, orderbook: Dict[str, Any]) -> Tuple[Optional[List[List[float]]], Optional[List[List[float]]]]:
-        """Return (asks, bids) as lists of [price, volume]."""
         asks = orderbook.get("ask", [])
         bids = orderbook.get("bid", [])
         ask_levels = [[float(a["price"]), float(a["quantity"])] for a in asks] if asks else []
@@ -121,7 +120,6 @@ class ArbitrageService:
 
     def calculate_trade_percent(self, net_gain: float, network_commission_quote: float,
                                 params: SymbolArbitrageSettings) -> float:
-        # Convert Decimal fields to float
         cutoff = float(params.cutoff_threshold)
         min_trade_pct = float(params.min_trade_percent)
         min_trade_factor = float(params.min_trade_factor)
@@ -142,8 +140,7 @@ class ArbitrageService:
         if full_threshold > min_threshold:
             slope = (1.0 - min_trade_pct) / (full_threshold - min_threshold)
             return min_trade_pct + slope * (net_gain - min_threshold)
-        else:
-            return min_trade_pct
+        return min_trade_pct
 
     async def detect_arbitrage_between(
         self,
@@ -156,7 +153,6 @@ class ArbitrageService:
         b_ask_levels: List[List[float]],
         b_bid_levels: List[List[float]],
     ) -> None:
-        # Determine quote currency
         if common_symbol.endswith("IRT"):
             quote_currency = "IRT"
         elif common_symbol.endswith("USDT"):
@@ -165,7 +161,6 @@ class ArbitrageService:
             logger.warning(f"Unknown quote currency for symbol {common_symbol}")
             return
 
-        # Helper to get taker fee
         async def get_taker_fee(exchange_name: str) -> float:
             exch = await db.execute(select(Exchange).where(Exchange.name == exchange_name))
             exch_obj = exch.scalar_one_or_none()
@@ -179,7 +174,6 @@ class ArbitrageService:
             fee = fee_rec.scalar_one_or_none()
             return float(fee.taker_fee) if fee else 0.0
 
-        # Get exchange IDs
         exch_a = await db.execute(select(Exchange).where(Exchange.name == exchange_a_name))
         exch_a_obj = exch_a.scalar_one_or_none()
         exch_b = await db.execute(select(Exchange).where(Exchange.name == exchange_b_name))
@@ -187,7 +181,6 @@ class ArbitrageService:
         if not exch_a_obj or not exch_b_obj:
             return
 
-        # Get risk settings and network fee
         settings_stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
         settings = (await db.execute(settings_stmt)).scalar_one_or_none()
         if not settings or not settings.is_active:
@@ -198,23 +191,21 @@ class ArbitrageService:
             net_stmt = select(Network).where(Network.id == settings.default_network_id)
             net = (await db.execute(net_stmt)).scalar_one_or_none()
             if net:
-                network_fee_base = net.fee_per_transfer
+                network_fee_base = float(net.fee_per_transfer)
 
         a_fee = await get_taker_fee(exchange_a_name)
         b_fee = await get_taker_fee(exchange_b_name)
 
-        # Helper to compute maximal trade (no risk scaling)
         async def compute_max_trade(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee):
             vol = cost = rev = 0.0
             avail_base = await get_base_balance(db, sell_exch, common_symbol)
             if avail_base <= 0:
-                return 0,0,0,0
+                return 0, 0, 0, 0
             avail_quote = await get_quote_balance(db, buy_exch, quote_currency)
             if avail_quote <= 0:
-                return 0,0,0,0
+                return 0, 0, 0, 0
 
             i_buy = i_sell = 0
-            # make copies to avoid mutating original lists
             buy_cpy = [l[:] for l in buy_levels]
             sell_cpy = [l[:] for l in sell_levels]
 
@@ -241,25 +232,36 @@ class ArbitrageService:
                     break
             return vol, cost, rev, rev - cost
 
-        # Process one direction (buy on A, sell on B)
         async def process_opp(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee,
                               buy_exch_obj, sell_exch_obj, prefix):
             vol, cost, rev, gross_gain = await compute_max_trade(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee)
             if vol <= 0:
                 return
             vwap_buy = cost / vol
+            # Network fee in quote currency (fixed per trade)
             network_fee_quote = network_fee_base * vwap_buy
             net_gain = gross_gain - network_fee_quote
             if net_gain <= 0:
                 logger.debug(f"{common_symbol}: net gain {net_gain:.2f} after network fee {network_fee_quote:.2f}")
                 return
+
             trade_pct = self.calculate_trade_percent(net_gain, network_fee_quote, settings)
             if trade_pct <= 0:
                 return
+
+            # Scale volume, cost, revenue proportionally
             actual_vol = vol * trade_pct
             actual_cost = cost * trade_pct
             actual_rev = rev * trade_pct
-            actual_profit_pct = (actual_rev - actual_cost) / actual_cost * 100 if actual_cost else 0
+            # Network fee is fixed (does not scale)
+            actual_net_profit = (actual_rev - actual_cost) - network_fee_quote
+            if actual_net_profit <= 0:
+                logger.debug(f"{common_symbol}: scaled trade net profit {actual_net_profit:.2f} <= 0")
+                return
+
+            actual_net_profit = (actual_rev - actual_cost) - network_fee_quote
+            actual_profit_pct = (actual_net_profit / actual_cost) * 100 if actual_cost else 0
+
             if actual_profit_pct < float(settings.min_profit_percent):
                 return
 
@@ -275,6 +277,7 @@ class ArbitrageService:
             )
             db.add(opp)
 
+            # Update inventories (network fee not deducted because it's external)
             await update_base_balance(db, buy_exch, common_symbol, actual_vol)
             await update_base_balance(db, sell_exch, common_symbol, -actual_vol)
             await update_quote_balance(db, buy_exch, quote_currency, -actual_cost)
@@ -286,7 +289,6 @@ class ArbitrageService:
                 f"net profit {actual_profit_pct:.2f}% (network fee {network_fee_quote:.2f} {quote_currency})"
             )
 
-        # Check both directions
         if a_ask_levels and b_bid_levels:
             await process_opp(exchange_a_name, exchange_b_name, a_ask_levels, b_bid_levels, a_fee, b_fee,
                               exch_a_obj, exch_b_obj, "buy_on")
@@ -294,7 +296,6 @@ class ArbitrageService:
             await process_opp(exchange_b_name, exchange_a_name, b_ask_levels, a_bid_levels, b_fee, a_fee,
                               exch_b_obj, exch_a_obj, "buy_on")
 
-    # ---------- Main polling routine ----------
     async def poll_and_store(self, db: AsyncSession):
         stmt = (
             select(ExchangeSymbol)
@@ -305,20 +306,17 @@ class ArbitrageService:
         )
         result = await db.execute(stmt)
         symbols = result.scalars().all()
-
         if not symbols:
             logger.warning("No active exchange symbols found. Please seed exchanges and symbols first.")
             return
 
-        # Group symbols by their common name
         symbol_group: Dict[str, List[ExchangeSymbol]] = {}
         for sym in symbols:
             symbol_group.setdefault(sym.common_symbol, []).append(sym)
 
         async with aiohttp.ClientSession() as session:
             for common_symbol, exchange_symbols in symbol_group.items():
-                exchange_data = {}  # key = exchange_name, value = (ask_levels, bid_levels, best_ask_p, best_ask_v, best_bid_p, best_bid_v)
-
+                exchange_data = {}
                 for ex_sym in exchange_symbols:
                     exchange_name = ex_sym.exchange.name
                     original_symbol = ex_sym.original_symbol
@@ -328,7 +326,6 @@ class ArbitrageService:
                         ob = await self.fetch_wallex_orderbook(session, original_symbol)
                         if ob:
                             ask_levels, bid_levels = self.wallex_extract_levels(ob)
-                            # Apply conversion factor to prices
                             ask_levels = [[p * factor, v] for p, v in ask_levels] if ask_levels else []
                             bid_levels = [[p * factor, v] for p, v in bid_levels] if bid_levels else []
                             best_ask = ask_levels[0] if ask_levels else [None, None]
@@ -339,9 +336,6 @@ class ArbitrageService:
                                 ask_levels, bid_levels, ob
                             )
                             exchange_data["wallex"] = (ask_levels, bid_levels)
-                        else:
-                            logger.debug(f"Failed to fetch wallex {original_symbol}")
-
                     elif exchange_name == "nobitex":
                         ob = await self.fetch_nobitex_orderbook(session, original_symbol)
                         if ob:
@@ -356,9 +350,6 @@ class ArbitrageService:
                                 ask_levels, bid_levels, ob
                             )
                             exchange_data["nobitex"] = (ask_levels, bid_levels)
-                        else:
-                            logger.debug(f"Failed to fetch nobitex {original_symbol}")
-
                     elif exchange_name == "bitpin":
                         ob = await self.fetch_bitpin_orderbook(session, original_symbol)
                         if ob:
@@ -373,10 +364,7 @@ class ArbitrageService:
                                 ask_levels, bid_levels, ob
                             )
                             exchange_data["bitpin"] = (ask_levels, bid_levels)
-                        else:
-                            logger.debug(f"Failed to fetch bitpin {original_symbol}")
 
-                # Compare every pair of exchanges that have data
                 exchange_names = list(exchange_data.keys())
                 for i in range(len(exchange_names)):
                     for j in range(i + 1, len(exchange_names)):
@@ -384,7 +372,6 @@ class ArbitrageService:
                         name_b = exchange_names[j]
                         a_ask_levels, a_bid_levels = exchange_data[name_a]
                         b_ask_levels, b_bid_levels = exchange_data[name_b]
-                        # For each pair, we check both directions (the function will evaluate both opportunities)
                         await self.detect_arbitrage_between(
                             db, common_symbol,
                             name_a, a_ask_levels, a_bid_levels,
@@ -392,4 +379,3 @@ class ArbitrageService:
                         )
 
         await db.commit()
-        # logger.info("✅ Polling cycle completed")

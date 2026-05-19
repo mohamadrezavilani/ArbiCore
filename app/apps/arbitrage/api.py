@@ -6,9 +6,8 @@ from app.core.database import get_db
 from app.apps.arbitrage import models, schemas
 from app.apps.arbitrage.models import (
     OrderbookSnapshot, Exchange, ExchangeSymbol, ArbitrageOpportunity,
-    BaseInventory, QuoteInventory, ExchangeFee, SymbolArbitrageSettings
+    BaseInventory, QuoteInventory, ExchangeFee, SymbolArbitrageSettings, Network
 )
-from app.apps.arbitrage.models import Network, SymbolArbitrageSettings
 from app.apps.arbitrage.schemas import NetworkResponse, RiskSettingsResponse, RiskSettingsUpdate
 
 router = APIRouter()
@@ -69,7 +68,7 @@ async def get_snapshots(limit: int = 20, db: AsyncSession = Depends(get_db)):
 
 @router.get("/opportunities", response_model=list[schemas.ArbitrageOpportunityResponse])
 async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db)):
-    # Raw SQL to join with exchange_fees using case for quote_currency
+    # Raw SQL that includes network fee subtraction
     raw_sql = text("""
         SELECT
             ao.id,
@@ -82,7 +81,8 @@ async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db))
             ao.created_at,
             ea.name AS exchange_a_name,
             eb.name AS exchange_b_name,
-            (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))) AS profit_quote
+            (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))
+             - COALESCE(n.fee_per_transfer * ao.price_a, 0)) AS profit_quote
         FROM arbitrage_opportunities ao
         JOIN exchanges ea ON ao.exchange_a_id = ea.id
         JOIN exchanges eb ON ao.exchange_b_id = eb.id
@@ -90,6 +90,8 @@ async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db))
             AND fa.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
         JOIN exchange_fees fb ON fb.exchange_id = eb.id
             AND fb.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
+        LEFT JOIN symbol_arbitrage_settings sas ON sas.common_symbol = ao.common_symbol
+        LEFT JOIN networks n ON n.id = sas.default_network_id
         ORDER BY ao.created_at DESC
         LIMIT :limit
     """)
@@ -106,7 +108,7 @@ async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db))
             price_b=row.price_b,
             profit_percent=row.profit_percent,
             traded_volume=row.traded_volume,
-            profit_quote=float(row.profit_quote) if row.profit_quote else 0.0,
+            profit_quote=float(row.profit_quote) if row.profit_quote is not None else 0.0,
             created_at=row.created_at
         )
         for row in rows
@@ -119,12 +121,15 @@ async def get_opportunity_summary(db: AsyncSession = Depends(get_db)):
             SELECT
                 ao.common_symbol,
                 ao.profit_percent,
-                (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))) AS profit_quote
+                (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))
+                 - COALESCE(n.fee_per_transfer * ao.price_a, 0)) AS profit_quote
             FROM arbitrage_opportunities ao
             JOIN exchange_fees fa ON fa.exchange_id = ao.exchange_a_id
                 AND fa.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
             JOIN exchange_fees fb ON fb.exchange_id = ao.exchange_b_id
                 AND fb.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
+            LEFT JOIN symbol_arbitrage_settings sas ON sas.common_symbol = ao.common_symbol
+            LEFT JOIN networks n ON n.id = sas.default_network_id
         )
         SELECT
             common_symbol,
@@ -188,12 +193,15 @@ async def get_system_stats(db: AsyncSession = Depends(get_db)):
         WITH profit_calc AS (
             SELECT
                 ao.common_symbol,
-                (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))) AS profit_quote
+                (ao.traded_volume * (ao.price_b * (1 - fb.taker_fee) - ao.price_a * (1 + fa.taker_fee))
+                 - COALESCE(n.fee_per_transfer * ao.price_a, 0)) AS profit_quote
             FROM arbitrage_opportunities ao
             JOIN exchange_fees fa ON fa.exchange_id = ao.exchange_a_id
                 AND fa.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
             JOIN exchange_fees fb ON fb.exchange_id = ao.exchange_b_id
                 AND fb.quote_currency = CASE WHEN ao.common_symbol LIKE '%IRT' THEN 'IRT' ELSE 'USDT' END
+            LEFT JOIN symbol_arbitrage_settings sas ON sas.common_symbol = ao.common_symbol
+            LEFT JOIN networks n ON n.id = sas.default_network_id
         )
         SELECT
             COALESCE(SUM(CASE WHEN common_symbol LIKE '%IRT' THEN profit_quote ELSE 0 END), 0) AS total_profit_irt,
@@ -259,11 +267,11 @@ async def get_risk_settings(db: AsyncSession = Depends(get_db)):
 @router.put("/risk-settings/{symbol}", response_model=RiskSettingsResponse)
 async def update_risk_settings(symbol: str, data: RiskSettingsUpdate, db: AsyncSession = Depends(get_db)):
     stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == symbol)
-    settings = (await db.execute(stmt)).scalar_one_or_none()
-    if not settings:
+    settings_obj = (await db.execute(stmt)).scalar_one_or_none()
+    if not settings_obj:
         raise HTTPException(status_code=404, detail="Symbol not found")
     for key, value in data.dict(exclude_unset=True).items():
-        setattr(settings, key, value)
+        setattr(settings_obj, key, value)
     await db.commit()
-    await db.refresh(settings)
-    return settings
+    await db.refresh(settings_obj)
+    return settings_obj
