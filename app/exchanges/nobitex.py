@@ -2,6 +2,8 @@ import aiohttp
 import asyncio
 import time
 from typing import Dict, Any, Optional
+
+from app.core.config import settings
 from app.exchanges.base import ExchangeClient, OrderResult
 
 class NobitexClient(ExchangeClient):
