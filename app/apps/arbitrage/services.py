@@ -399,7 +399,7 @@ class ArbitrageService:
         rows = result.all()
 
         # Find exchanges with zero balance
-        zero_exchanges = [row for row in rows if float(row.balance) <= 0]
+        zero_exchanges = [row for row in rows if float(row.balance) <= 20]
         if not zero_exchanges:
             return
 
