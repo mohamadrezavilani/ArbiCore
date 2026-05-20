@@ -262,6 +262,7 @@ class ArbitrageService:
             network_fee_quote = network_fee_base * vwap_buy
             trade_pct = self.calculate_trade_percent(gross_gain, network_fee_quote, settings)
             if trade_pct <= 0:
+                logger.info(f"Cannot create opportunity for {trade_pct} <= 0")
                 return
 
             actual_vol = vol * trade_pct
@@ -269,6 +270,7 @@ class ArbitrageService:
             actual_rev = rev * trade_pct
             gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
             if gross_profit_pct < float(settings.min_profit_percent):
+                logger.info(f"Cannot create opportunity for {gross_profit_pct} < {settings.min_profit_percent}")
                 return
 
             # Check trading mode from Exchange table
