@@ -1,6 +1,6 @@
 import uuid
 from typing import Optional
-
+import enum
 from sqlalchemy import String, Numeric, ForeignKey, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, UUIDMixin, TimestampMixin
@@ -11,11 +11,13 @@ class Exchange(Base, UUIDMixin, TimestampMixin):
     base_url: Mapped[str] = mapped_column(String(200))
     orderbook_endpoint: Mapped[str] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(default=True)
+    mode: Mapped[str] = mapped_column(String(20), default="simulator")   # "simulator" or "live"
 
     symbols: Mapped[list["ExchangeSymbol"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
     base_inventories: Mapped[list["BaseInventory"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
     quote_inventories: Mapped[list["QuoteInventory"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
     fees: Mapped[list["ExchangeFee"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
+
 
 class ExchangeFee(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "exchange_fees"

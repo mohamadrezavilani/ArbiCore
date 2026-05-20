@@ -20,15 +20,15 @@ async def seed():
         # ========== 1. Exchanges ==========
         wallex = Exchange(
             name="wallex", base_url="https://api.wallex.ir", orderbook_endpoint="/v1/depth",
-            is_active=True
+            is_active=True, mode="simulator"
         )
         nobitex = Exchange(
             name="nobitex", base_url="https://apiv2.nobitex.ir", orderbook_endpoint="/v3/orderbook/{symbol}",
-            is_active=True
+            is_active=True, mode="simulator"
         )
         bitpin = Exchange(
             name="bitpin", base_url="https://api.bitpin.org", orderbook_endpoint="/api/v1/mth/orderbook/{symbol}/",
-            is_active=True
+            is_active=True, mode="simulator"
         )
         session.add_all([wallex, nobitex, bitpin])
         await session.commit()
@@ -39,15 +39,12 @@ async def seed():
 
         # ========== 2. Symbols ==========
         symbols = [
-            # Wallex
             ExchangeSymbol(exchange_id=wallex.id, original_symbol="TONTMN", common_symbol="TONIRT", price_conversion_factor=10.0),
             ExchangeSymbol(exchange_id=wallex.id, original_symbol="TONUSDT", common_symbol="TONUSDT", price_conversion_factor=1.0),
             ExchangeSymbol(exchange_id=wallex.id, original_symbol="USDTTMN", common_symbol="USDTIRT", price_conversion_factor=10.0),
-            # Nobitex
             ExchangeSymbol(exchange_id=nobitex.id, original_symbol="TONIRT", common_symbol="TONIRT", price_conversion_factor=1.0),
             ExchangeSymbol(exchange_id=nobitex.id, original_symbol="TONUSDT", common_symbol="TONUSDT", price_conversion_factor=1.0),
             ExchangeSymbol(exchange_id=nobitex.id, original_symbol="USDTIRT", common_symbol="USDTIRT", price_conversion_factor=1.0),
-            # Bitpin
             ExchangeSymbol(exchange_id=bitpin.id, original_symbol="TON_USDT", common_symbol="TONUSDT", price_conversion_factor=1.0),
             ExchangeSymbol(exchange_id=bitpin.id, original_symbol="TON_IRT", common_symbol="TONIRT", price_conversion_factor=10.0),
             ExchangeSymbol(exchange_id=bitpin.id, original_symbol="USDT_IRT", common_symbol="USDTIRT", price_conversion_factor=10.0),
@@ -56,15 +53,12 @@ async def seed():
         await session.commit()
         print("✅ Symbols created.")
 
-        # ========== 3. Fees (per exchange and quote currency) ==========
+        # ========== 3. Fees ==========
         fees = [
-            # Wallex
             ExchangeFee(exchange_id=wallex.id, quote_currency="IRT", taker_fee=0.003, maker_fee=0.0025),
             ExchangeFee(exchange_id=wallex.id, quote_currency="USDT", taker_fee=0.003, maker_fee=0.0025),
-            # Nobitex
             ExchangeFee(exchange_id=nobitex.id, quote_currency="IRT", taker_fee=0.0025, maker_fee=0.0025),
             ExchangeFee(exchange_id=nobitex.id, quote_currency="USDT", taker_fee=0.0013, maker_fee=0.001),
-            # Bitpin
             ExchangeFee(exchange_id=bitpin.id, quote_currency="IRT", taker_fee=0.0035, maker_fee=0.003),
             ExchangeFee(exchange_id=bitpin.id, quote_currency="USDT", taker_fee=0.0035, maker_fee=0.003),
         ]
@@ -73,12 +67,10 @@ async def seed():
         print("✅ Fees created.")
 
         # ========== 4. Inventories ==========
-        # Base inventory: 100 units of each base symbol per exchange
         for exchange in [wallex, nobitex, bitpin]:
             for sym in ["TONIRT", "TONUSDT", "USDTIRT"]:
                 session.add(BaseInventory(exchange_id=exchange.id, common_symbol=sym, balance=100.0))
 
-        # Quote inventory: 10,000,000 IRT and 10,000 USDT per exchange
         for exchange in [wallex, nobitex, bitpin]:
             session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=10_000_000.0))
             session.add(QuoteInventory(exchange_id=exchange.id, currency="USDT", balance=10_000.0))
@@ -86,16 +78,7 @@ async def seed():
         await session.commit()
         print("✅ Inventories created.")
 
-        # ========== 5. Symbol arbitrage settings ==========
-        settings_rows = [
-            SymbolArbitrageSettings(common_symbol="TONIRT", min_profit_percent=0.5, is_active=True),
-            SymbolArbitrageSettings(common_symbol="TONUSDT", min_profit_percent=0.1, is_active=True),
-            SymbolArbitrageSettings(common_symbol="USDTIRT", min_profit_percent=0.5, is_active=True),
-        ]
-        session.add_all(settings_rows)
-        await session.commit()
-
-        # ========== 6. Networks ==========
+        # ========== 5. Networks ==========
         networks = [
             Network(symbol="TONIRT", network_name="TON", fee_per_transfer=0.1),
             Network(symbol="TONUSDT", network_name="TON", fee_per_transfer=0.1),
@@ -106,9 +89,9 @@ async def seed():
         ]
         session.add_all(networks)
         await session.commit()
+        print("✅ Networks created.")
 
-        # ========== 7. Symbol arbitrage settings with risk parameters and default network ==========
-        # First, get the network IDs for the defaults
+        # ========== 6. Symbol arbitrage settings (with default network IDs) ==========
         ton_network = (await session.execute(
             select(Network).where(Network.symbol == "TONIRT", Network.network_name == "TON"))).scalar_one()
         trc20_network = (await session.execute(

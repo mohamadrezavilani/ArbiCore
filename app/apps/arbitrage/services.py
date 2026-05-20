@@ -1,13 +1,19 @@
 import logging
 import aiohttp
+import asyncio
+import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from typing import Dict, Any, Optional, Tuple, List
 from app.core.config import settings
 from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity, ExchangeFee, \
-    SymbolArbitrageSettings, Network, BaseInventory
-from app.apps.arbitrage.inventory import get_base_balance, update_base_balance, get_quote_balance, update_quote_balance
+    SymbolArbitrageSettings, Network
+from app.apps.arbitrage.inventory import (
+    get_base_balance, update_base_balance, set_base_balance,
+    get_quote_balance, update_quote_balance, set_quote_balance
+)
+from app.exchanges.factory import get_exchange_client
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +21,23 @@ class ArbitrageService:
     def __init__(self):
         self.poll_interval = settings.ARBITRAGE_CHECK_INTERVAL_SECONDS
 
-    # ---------- Wallex ----------
+    # ---------- Helper: sync real balances after live trade ----------
+    async def sync_balances_from_exchange(self, db: AsyncSession, exchange_name: str, client):
+        """After a live trade, replace database balances with real exchange balances."""
+        real_balances = await client.get_balances()
+        # Fetch mapping from original_symbol to common_symbol for this exchange
+        stmt = select(ExchangeSymbol).join(Exchange).where(Exchange.name == exchange_name)
+        result = await db.execute(stmt)
+        symbols = result.scalars().all()
+        asset_to_common = {sym.original_symbol: sym.common_symbol for sym in symbols}
+        for asset, balance in real_balances.items():
+            if asset in ("IRT", "USDT"):
+                await set_quote_balance(db, exchange_name, asset, balance)
+            else:
+                common = asset_to_common.get(asset, asset)
+                await set_base_balance(db, exchange_name, common, balance)
+
+    # ---------- Exchange-specific fetch & extraction ----------
     async def fetch_wallex_orderbook(self, session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
         url = "https://api.wallex.ir/v1/depth"
         params = {"symbol": symbol}
@@ -39,7 +61,6 @@ class ArbitrageService:
         bid_levels = [[float(b["price"]), float(b["quantity"])] for b in bids] if bids else []
         return ask_levels, bid_levels
 
-    # ---------- Nobitex ----------
     async def fetch_nobitex_orderbook(self, session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
         url = f"https://apiv2.nobitex.ir/v3/orderbook/{symbol}"
         try:
@@ -62,7 +83,6 @@ class ArbitrageService:
         bid_levels = [[float(price), float(vol)] for price, vol in bids] if bids else []
         return ask_levels, bid_levels
 
-    # ---------- Bitpin ----------
     async def fetch_bitpin_orderbook(self, session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
         url = f"https://api.bitpin.org/api/v1/mth/orderbook/{symbol}/"
         try:
@@ -80,7 +100,7 @@ class ArbitrageService:
         bid_levels = [[float(price), float(vol)] for price, vol in bids] if bids else []
         return ask_levels, bid_levels
 
-    # ---------- Storage helpers ----------
+    # ---------- Storage helper ----------
     async def store_orderbook_snapshot(
         self, db: AsyncSession, exchange_name: str, symbol_original: str, common_symbol: str,
         ask_price: Optional[float], ask_vol: Optional[float],
@@ -94,7 +114,6 @@ class ArbitrageService:
         if not exchange:
             logger.warning(f"Exchange '{exchange_name}' not found in DB")
             return
-
         sym_stmt = select(ExchangeSymbol).where(
             ExchangeSymbol.exchange_id == exchange.id,
             ExchangeSymbol.original_symbol == symbol_original
@@ -104,7 +123,6 @@ class ArbitrageService:
         if not symbol:
             logger.warning(f"Symbol '{symbol_original}' for exchange '{exchange_name}' not found")
             return
-
         snapshot = OrderbookSnapshot(
             exchange_id=exchange.id,
             symbol_id=symbol.id,
@@ -118,6 +136,7 @@ class ArbitrageService:
         )
         db.add(snapshot)
 
+    # ---------- Risk formula ----------
     def calculate_trade_percent(self, net_gain: float, network_commission_quote: float,
                                 params: SymbolArbitrageSettings) -> float:
         cutoff = float(params.cutoff_threshold)
@@ -142,6 +161,7 @@ class ArbitrageService:
             return min_trade_pct + slope * (net_gain - min_threshold)
         return min_trade_pct
 
+    # ---------- Core arbitrage detection (supports both simulator & live) ----------
     async def detect_arbitrage_between(
         self,
         db: AsyncSession,
@@ -153,6 +173,7 @@ class ArbitrageService:
         b_ask_levels: List[List[float]],
         b_bid_levels: List[List[float]],
     ) -> None:
+        # Determine quote currency
         if common_symbol.endswith("IRT"):
             quote_currency = "IRT"
         elif common_symbol.endswith("USDT"):
@@ -165,7 +186,6 @@ class ArbitrageService:
             exch = await db.execute(select(Exchange).where(Exchange.name == exchange_name))
             exch_obj = exch.scalar_one_or_none()
             if not exch_obj:
-                logger.warning(f"Exchange {exchange_name} not found for fee query")
                 return 0.0
             fee_stmt = select(ExchangeFee).where(
                 ExchangeFee.exchange_id == exch_obj.id,
@@ -173,12 +193,7 @@ class ArbitrageService:
             )
             fee_rec = await db.execute(fee_stmt)
             fee = fee_rec.scalar_one_or_none()
-            if not fee:
-                logger.warning(f"No fee record for {exchange_name} {quote_currency}")
-                return 0.0
-            fee_val = float(fee.taker_fee)
-            # logger.info(f"Fee for {exchange_name} {quote_currency} = {fee_val}")
-            return fee_val
+            return float(fee.taker_fee) if fee else 0.0
 
         exch_a = await db.execute(select(Exchange).where(Exchange.name == exchange_a_name))
         exch_a_obj = exch_a.scalar_one_or_none()
@@ -206,10 +221,10 @@ class ArbitrageService:
             vol = cost = rev = 0.0
             avail_base = await get_base_balance(db, sell_exch, common_symbol)
             if avail_base <= 0:
-                return 0, 0, 0, 0
+                return 0,0,0,0
             avail_quote = await get_quote_balance(db, buy_exch, quote_currency)
             if avail_quote <= 0:
-                return 0, 0, 0, 0
+                return 0,0,0,0
 
             i_buy = i_sell = 0
             buy_cpy = [l[:] for l in buy_levels]
@@ -244,27 +259,67 @@ class ArbitrageService:
             if vol <= 0:
                 return
             vwap_buy = cost / vol
-            vwap_sell = rev / vol
-            # Gross profit percent after exchange fees
-            gross_profit_pct = ((rev - cost) / cost) * 100 if cost else 0
-            logger.info(f"Max trade for {common_symbol}: vol={vol}, cost={cost}, rev={rev}, gross_profit_pct={gross_profit_pct:.4f}%")
-
-            # Risk uses gross gain (after exchange fees) and network fee as threshold
             network_fee_quote = network_fee_base * vwap_buy
             trade_pct = self.calculate_trade_percent(gross_gain, network_fee_quote, settings)
             if trade_pct <= 0:
-                logger.info( f"but trade_pct={trade_pct}")
                 return
 
             actual_vol = vol * trade_pct
             actual_cost = cost * trade_pct
             actual_rev = rev * trade_pct
-            actual_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
-
-            if actual_profit_pct < float(settings.min_profit_percent):
-                logger.info( f"but actual_profit_pct={actual_profit_pct} less than min_profit_percent={settings.min_profit_percent}")
+            gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
+            if gross_profit_pct < float(settings.min_profit_percent):
                 return
 
+            # Check trading mode from Exchange table
+            buy_mode = (await db.execute(select(Exchange.mode).where(Exchange.name == buy_exch))).scalar_one_or_none()
+            sell_mode = (await db.execute(select(Exchange.mode).where(Exchange.name == sell_exch))).scalar_one_or_none()
+            is_live = (buy_mode == "live" and sell_mode == "live")
+
+            if is_live:
+                # LIVE TRADING
+                buy_client = get_exchange_client(buy_exch)
+                sell_client = get_exchange_client(sell_exch)
+                if not buy_client or not sell_client:
+                    logger.error(f"Cannot create clients for {buy_exch} / {sell_exch}")
+                    return
+
+                short_uuid = uuid.uuid4().hex[:8]
+                buy_order = await buy_client.place_market_order(
+                    symbol=common_symbol, side="buy", amount=actual_vol, client_order_id=f"buy_{short_uuid}"
+                )
+                if buy_order.status != "filled":
+                    logger.error(f"Buy order failed on {buy_exch}: {buy_order}")
+                    await buy_client.cancel_order(buy_order.client_order_id)
+                    return
+
+                sell_order = await sell_client.place_market_order(
+                    symbol=common_symbol, side="sell", amount=actual_vol, client_order_id=f"sell_{short_uuid}"
+                )
+                if sell_order.status != "filled":
+                    logger.error(f"Sell order failed on {sell_exch}: {sell_order}")
+                    await sell_client.cancel_order(sell_order.client_order_id)
+                    return
+
+                # Sync real balances
+                await self.sync_balances_from_exchange(db, buy_exch, buy_client)
+                await self.sync_balances_from_exchange(db, sell_exch, sell_client)
+
+                # Use actual fill prices
+                vwap_buy = buy_order.filled_price
+                vwap_sell = sell_order.filled_price
+                actual_vol = min(buy_order.filled_volume, sell_order.filled_volume)
+                actual_cost = actual_vol * vwap_buy
+                actual_rev = actual_vol * vwap_sell
+                gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
+            else:
+                # SIMULATOR MODE
+                await update_base_balance(db, buy_exch, common_symbol, actual_vol)
+                await update_base_balance(db, sell_exch, common_symbol, -actual_vol)
+                await update_quote_balance(db, buy_exch, quote_currency, -actual_cost)
+                await update_quote_balance(db, sell_exch, quote_currency, actual_rev)
+
+            # Record opportunity (same for both modes)
             opp = ArbitrageOpportunity(
                 common_symbol=common_symbol,
                 exchange_a_id=buy_exch_obj.id,
@@ -272,22 +327,17 @@ class ArbitrageService:
                 trade_type=f"{prefix}_{buy_exch}_sell_on_{sell_exch}",
                 price_a=vwap_buy,
                 price_b=vwap_sell,
-                profit_percent=actual_profit_pct,
+                profit_percent=gross_profit_pct,
                 traded_volume=actual_vol,
             )
             db.add(opp)
-
-            await update_base_balance(db, buy_exch, common_symbol, actual_vol)
-            await update_base_balance(db, sell_exch, common_symbol, -actual_vol)
-            await update_quote_balance(db, buy_exch, quote_currency, -actual_cost)
-            await update_quote_balance(db, sell_exch, quote_currency, actual_rev)
-
             logger.info(
                 f"✅ Executed {actual_vol:.4f} {common_symbol} (risk {trade_pct:.1%} of max {vol:.4f}) "
                 f"buy {buy_exch} @{vwap_buy:.2f} sell {sell_exch} @{vwap_sell:.2f} "
-                f"profit {actual_profit_pct:.2f}% (network fee {network_fee_quote:.2f} used for risk)"
+                f"profit {gross_profit_pct:.2f}% (network fee {network_fee_quote:.2f} used for risk)"
             )
 
+        # Check both directions
         if a_ask_levels and b_bid_levels:
             await process_opp(exchange_a_name, exchange_b_name, a_ask_levels, b_bid_levels, a_fee, b_fee,
                               exch_a_obj, exch_b_obj, "buy_on")
@@ -295,9 +345,7 @@ class ArbitrageService:
             await process_opp(exchange_b_name, exchange_a_name, b_ask_levels, a_bid_levels, b_fee, a_fee,
                               exch_b_obj, exch_a_obj, "buy_on")
 
-        # After all balances updated
-        await self.rebalance_symbol_if_needed(db, common_symbol, quote_currency)
-
+    # ---------- Main polling routine ----------
     async def poll_and_store(self, db: AsyncSession):
         stmt = (
             select(ExchangeSymbol)
@@ -381,65 +429,3 @@ class ArbitrageService:
                         )
 
         await db.commit()
-
-    async def rebalance_symbol_if_needed(self, db: AsyncSession, common_symbol: str, quote_currency: str):
-        """
-        After a trade, if any exchange has zero balance of common_symbol,
-        transfer 75% of the largest source balance from another exchange
-        (after deducting network fee) to the empty exchange.
-        """
-        # Get all active exchanges and their base balances for this symbol
-        stmt = (
-            select(Exchange.id, Exchange.name, BaseInventory.balance)
-            .join(BaseInventory, BaseInventory.exchange_id == Exchange.id)
-            .where(BaseInventory.common_symbol == common_symbol)
-            .where(Exchange.is_active == True)
-        )
-        result = await db.execute(stmt)
-        rows = result.all()
-
-        # Find exchanges with zero balance
-        zero_exchanges = [row for row in rows if float(row.balance) <= 20]
-        if not zero_exchanges:
-            return
-
-        # Find exchanges with positive balance
-        positive_exchanges = [row for row in rows if float(row.balance) > 0]
-        if not positive_exchanges:
-            logger.warning(f"No positive balance for {common_symbol} to rebalance")
-            return
-
-        # For simplicity, we only rebalance the first zero exchange
-        target_exch = zero_exchanges[0]
-        # Find the source with the largest balance
-        source_exch = max(positive_exchanges, key=lambda x: float(x.balance))
-        source_balance = float(source_exch.balance)
-        transfer_amount = source_balance * 0.50  # 50% of source balance
-
-        # Get network fee for this symbol (in base currency)
-        settings_stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
-        settings = (await db.execute(settings_stmt)).scalar_one_or_none()
-        if not settings or not settings.default_network_id:
-            logger.warning(f"No network fee configured for {common_symbol}, skipping rebalance")
-            return
-        net_stmt = select(Network).where(Network.id == settings.default_network_id)
-        net = (await db.execute(net_stmt)).scalar_one_or_none()
-        if not net:
-            logger.warning(f"Network not found for {common_symbol}, skipping rebalance")
-            return
-        network_fee = float(net.fee_per_transfer)
-
-        if transfer_amount <= network_fee:
-            logger.info(f"Transfer amount {transfer_amount:.4f} {common_symbol} <= network fee {network_fee}, skipping")
-            return
-
-        net_received = transfer_amount - network_fee
-
-        # Update balances
-        await update_base_balance(db, source_exch.name, common_symbol, -transfer_amount)
-        await update_base_balance(db, target_exch.name, common_symbol, net_received)
-
-        logger.info(
-            f"🔄 Rebalanced {common_symbol}: sent {transfer_amount:.4f} from {source_exch.name} to {target_exch.name} "
-            f"(network fee {network_fee:.4f}), net received {net_received:.4f}"
-        )

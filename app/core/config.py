@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     ARBITRAGE_CHECK_INTERVAL_SECONDS: int = 10
     ARBITRAGE_MIN_PROFIT_PERCENT: float = 0.5
 
+    WALLEX_API_KEY: str = ""
+    WALLEX_API_SECRET: str = ""
+    NOBITEX_API_KEY: str = ""
+    NOBITEX_API_SECRET: str = ""
+    BITPIN_API_KEY: str = ""
+    BITPIN_API_SECRET: str = ""
+
     class Config:
         env_file = ".env"
         case_sensitive = True

@@ -56,3 +56,31 @@ async def update_quote_balance(db: AsyncSession, exchange_name: str, currency: s
         inv.balance = float(inv.balance) + delta
     else:
         db.add(QuoteInventory(exchange_id=exch.id, currency=currency, balance=delta))
+
+async def set_base_balance(db: AsyncSession, exchange_name: str, common_symbol: str, new_balance: float):
+    exch = await db.execute(select(Exchange).where(Exchange.name == exchange_name))
+    exch = exch.scalar_one_or_none()
+    if not exch: return
+    inv = await db.execute(select(BaseInventory).where(
+        BaseInventory.exchange_id == exch.id,
+        BaseInventory.common_symbol == common_symbol
+    ))
+    inv = inv.scalar_one_or_none()
+    if inv:
+        inv.balance = new_balance
+    else:
+        db.add(BaseInventory(exchange_id=exch.id, common_symbol=common_symbol, balance=new_balance))
+
+async def set_quote_balance(db: AsyncSession, exchange_name: str, currency: str, new_balance: float):
+    exch = await db.execute(select(Exchange).where(Exchange.name == exchange_name))
+    exch = exch.scalar_one_or_none()
+    if not exch: return
+    inv = await db.execute(select(QuoteInventory).where(
+        QuoteInventory.exchange_id == exch.id,
+        QuoteInventory.currency == currency
+    ))
+    inv = inv.scalar_one_or_none()
+    if inv:
+        inv.balance = new_balance
+    else:
+        db.add(QuoteInventory(exchange_id=exch.id, currency=currency, balance=new_balance))
