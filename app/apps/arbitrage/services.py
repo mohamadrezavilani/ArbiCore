@@ -38,6 +38,7 @@ class ArbitrageService:
                 await set_base_balance(db, exchange_name, common, balance)
 
     # ---------- Exchange-specific fetch & extraction ----------
+    # (all fetch and extract methods remain unchanged – omitted for brevity, but include them as in your previous version)
     async def fetch_wallex_orderbook(self, session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
         url = "https://api.wallex.ir/v1/depth"
         params = {"symbol": symbol}
@@ -280,7 +281,7 @@ class ArbitrageService:
             is_live = (buy_mode == "live" and sell_mode == "live")
 
             if is_live:
-                # LIVE TRADING
+                # LIVE TRADING – atomic concurrent orders
                 buy_client = get_exchange_client(buy_exch)
                 sell_client = get_exchange_client(sell_exch)
                 if not buy_client or not sell_client:
@@ -288,33 +289,41 @@ class ArbitrageService:
                     return
 
                 short_uuid = uuid.uuid4().hex[:8]
-                buy_order = await buy_client.place_market_order(
-                    symbol=common_symbol, side="buy", amount=actual_vol, client_order_id=f"buy_{short_uuid}"
-                )
-                if buy_order.status != "filled":
-                    logger.error(f"Buy order failed on {buy_exch}: {buy_order}")
-                    await buy_client.cancel_order(buy_order.client_order_id)
+                buy_order_id = f"buy_{short_uuid}"
+                sell_order_id = f"sell_{short_uuid}"
+
+                # Place both orders concurrently
+                buy_task = asyncio.create_task(buy_client.place_market_order(
+                    symbol=common_symbol, side="buy", amount=actual_vol, client_order_id=buy_order_id
+                ))
+                sell_task = asyncio.create_task(sell_client.place_market_order(
+                    symbol=common_symbol, side="sell", amount=actual_vol, client_order_id=sell_order_id
+                ))
+                buy_result, sell_result = await asyncio.gather(buy_task, sell_task)
+
+                buy_ok = buy_result.status == "filled"
+                sell_ok = sell_result.status == "filled"
+
+                if not buy_ok or not sell_ok:
+                    # Cancel any order that is not filled
+                    if not buy_ok and buy_result.order_id:
+                        await buy_client.cancel_order(buy_result.client_order_id)
+                    if not sell_ok and sell_result.order_id:
+                        await sell_client.cancel_order(sell_result.client_order_id)
+                    logger.error(f"Atomic trade failed: buy={buy_result.status}, sell={sell_result.status}")
                     return
 
-                sell_order = await sell_client.place_market_order(
-                    symbol=common_symbol, side="sell", amount=actual_vol, client_order_id=f"sell_{short_uuid}"
-                )
-                if sell_order.status != "filled":
-                    logger.error(f"Sell order failed on {sell_exch}: {sell_order}")
-                    await sell_client.cancel_order(sell_order.client_order_id)
-                    return
+                # Both succeeded – use actual fill prices
+                vwap_buy = buy_result.filled_price
+                vwap_sell = sell_result.filled_price
+                actual_vol = min(buy_result.filled_volume, sell_result.filled_volume)
+                actual_cost = actual_vol * vwap_buy
+                actual_rev = actual_vol * vwap_sell
+                gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
 
                 # Sync real balances
                 await self.sync_balances_from_exchange(db, buy_exch, buy_client)
                 await self.sync_balances_from_exchange(db, sell_exch, sell_client)
-
-                # Use actual fill prices
-                vwap_buy = buy_order.filled_price
-                vwap_sell = sell_order.filled_price
-                actual_vol = min(buy_order.filled_volume, sell_order.filled_volume)
-                actual_cost = actual_vol * vwap_buy
-                actual_rev = actual_vol * vwap_sell
-                gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
             else:
                 # SIMULATOR MODE
                 await update_base_balance(db, buy_exch, common_symbol, actual_vol)
