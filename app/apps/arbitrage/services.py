@@ -7,8 +7,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from typing import Dict, Any, Optional, Tuple, List
 from app.core.config import settings
-from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity, ExchangeFee, \
-    SymbolArbitrageSettings, Network
+from app.apps.arbitrage.models import (
+    Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity,
+    ExchangeFee, SymbolArbitrageSettings, Network, RejectedOpportunity
+)
 from app.apps.arbitrage.inventory import (
     get_base_balance, update_base_balance, set_base_balance,
     get_quote_balance, update_quote_balance, set_quote_balance
@@ -25,7 +27,6 @@ class ArbitrageService:
     async def sync_balances_from_exchange(self, db: AsyncSession, exchange_name: str, client):
         """After a live trade, replace database balances with real exchange balances."""
         real_balances = await client.get_balances()
-        # Fetch mapping from original_symbol to common_symbol for this exchange
         stmt = select(ExchangeSymbol).join(Exchange).where(Exchange.name == exchange_name)
         result = await db.execute(stmt)
         symbols = result.scalars().all()
@@ -37,8 +38,24 @@ class ArbitrageService:
                 common = asset_to_common.get(asset, asset)
                 await set_base_balance(db, exchange_name, common, balance)
 
-    # ---------- Exchange-specific fetch & extraction ----------
-    # (all fetch and extract methods remain unchanged – omitted for brevity, but include them as in your previous version)
+    # ---------- Rejected opportunity logger ----------
+    async def log_rejected_opportunity(
+        self, db: AsyncSession, common_symbol: str, exchange_a: str, exchange_b: str,
+        trade_type: str, reason: str, details: Optional[Dict] = None
+    ):
+        rejected = RejectedOpportunity(
+            common_symbol=common_symbol,
+            exchange_a_name=exchange_a,
+            exchange_b_name=exchange_b,
+            trade_type=trade_type,
+            rejection_reason=reason,
+            details=details or {}
+        )
+        db.add(rejected)
+        # We'll flush but not commit (commit happens at end of poll cycle)
+        await db.flush()
+
+    # ---------- Exchange fetch & extraction (unchanged) ----------
     async def fetch_wallex_orderbook(self, session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
         url = "https://api.wallex.ir/v1/depth"
         params = {"symbol": symbol}
@@ -162,7 +179,7 @@ class ArbitrageService:
             return min_trade_pct + slope * (net_gain - min_threshold)
         return min_trade_pct
 
-    # ---------- Core arbitrage detection (supports both simulator & live) ----------
+    # ---------- Core arbitrage detection (supports both simulator & live with timeout) ----------
     async def detect_arbitrage_between(
         self,
         db: AsyncSession,
@@ -257,42 +274,64 @@ class ArbitrageService:
         async def process_opp(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee,
                               buy_exch_obj, sell_exch_obj, prefix):
             vol, cost, rev, gross_gain = await compute_max_trade(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee)
+            trade_type_label = f"{prefix}_{buy_exch}_sell_on_{sell_exch}"
             if vol <= 0:
+                # await self.log_rejected_opportunity(
+                #     db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                #     "No volume from order book (insufficient depth or inventory)",
+                #     {"vol": vol}
+                # )
                 return
             vwap_buy = cost / vol
             vwap_sell = rev / vol
             network_fee_quote = network_fee_base * vwap_buy
             trade_pct = self.calculate_trade_percent(gross_gain, network_fee_quote, settings)
             if trade_pct <= 0:
-                logger.info(f"Cannot create opportunity for {common_symbol} cause {trade_pct} <= 0")
+                await self.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                    "Trade percent <= 0 (risk threshold not met)",
+                    {"trade_pct": trade_pct, "gross_gain": gross_gain, "network_fee_quote": network_fee_quote}
+                )
                 return
 
             actual_vol = vol * trade_pct
             actual_cost = cost * trade_pct
             actual_rev = rev * trade_pct
             gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
-            if gross_profit_pct < float(settings.min_profit_percent):
-                logger.info(f"Cannot create opportunity for {common_symbol} cause {gross_profit_pct} < {settings.min_profit_percent}")
+            min_profit = float(settings.min_profit_percent)
+            if gross_profit_pct < min_profit:
+                await self.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                    f"Gross profit {gross_profit_pct:.2f}% below min {min_profit}%",
+                    {"gross_profit_pct": gross_profit_pct, "min_profit_percent": min_profit}
+                )
                 return
 
-            # Check trading mode from Exchange table
+            # Check trading mode
             buy_mode = (await db.execute(select(Exchange.mode).where(Exchange.name == buy_exch))).scalar_one_or_none()
             sell_mode = (await db.execute(select(Exchange.mode).where(Exchange.name == sell_exch))).scalar_one_or_none()
             is_live = (buy_mode == "live" and sell_mode == "live")
 
             if is_live:
-                # LIVE TRADING – atomic concurrent orders
+                # LIVE TRADING with two‑stage timeout
+                timeout_initial = 5.0  # seconds to wait for both to fill
+                timeout_extended = 60.0  # seconds to wait for the second leg after first fills
+                poll_interval = 0.5
                 buy_client = get_exchange_client(buy_exch)
                 sell_client = get_exchange_client(sell_exch)
                 if not buy_client or not sell_client:
-                    logger.error(f"Cannot create clients for {buy_exch} / {sell_exch}")
+                    await self.log_rejected_opportunity(
+                        db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                        "Could not create exchange clients",
+                        {"buy_client": buy_client is not None, "sell_client": sell_client is not None}
+                    )
                     return
 
                 short_uuid = uuid.uuid4().hex[:8]
                 buy_order_id = f"buy_{short_uuid}"
                 sell_order_id = f"sell_{short_uuid}"
 
-                # Place both orders concurrently
+                # Place orders concurrently
                 buy_task = asyncio.create_task(buy_client.place_market_order(
                     symbol=common_symbol, side="buy", amount=actual_vol, client_order_id=buy_order_id
                 ))
@@ -301,29 +340,109 @@ class ArbitrageService:
                 ))
                 buy_result, sell_result = await asyncio.gather(buy_task, sell_task)
 
-                buy_ok = buy_result.status == "filled"
-                sell_ok = sell_result.status == "filled"
-
-                if not buy_ok or not sell_ok:
-                    # Cancel any order that is not filled
-                    if not buy_ok and buy_result.order_id:
+                # Initial check: if any order failed immediately (not filled), abort both
+                if buy_result.status != "filled" or sell_result.status != "filled":
+                    if buy_result.status != "filled" and buy_result.order_id:
                         await buy_client.cancel_order(buy_result.client_order_id)
-                    if not sell_ok and sell_result.order_id:
+                    if sell_result.status != "filled" and sell_result.order_id:
                         await sell_client.cancel_order(sell_result.client_order_id)
-                    logger.error(f"Atomic trade failed: buy={buy_result.status}, sell={sell_result.status}")
+                    await self.log_rejected_opportunity(
+                        db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                        "Atomic trade failed (order placement)",
+                        {"buy_status": buy_result.status, "sell_status": sell_result.status}
+                    )
                     return
 
-                # Both succeeded – use actual fill prices
-                vwap_buy = buy_result.filled_price
-                vwap_sell = sell_result.filled_price
-                actual_vol = min(buy_result.filled_volume, sell_result.filled_volume)
-                actual_cost = actual_vol * vwap_buy
-                actual_rev = actual_vol * vwap_sell
-                gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
+                # Poll for fill statuses
+                start = asyncio.get_event_loop().time()
+                buy_filled = sell_filled = False
+                while (asyncio.get_event_loop().time() - start) < timeout_initial:
+                    if not buy_filled:
+                        buy_status = await buy_client.order_status(buy_result.client_order_id)
+                        if buy_status.status == "filled":
+                            buy_filled = True
+                            buy_result = buy_status
+                    if not sell_filled:
+                        sell_status = await sell_client.order_status(sell_result.client_order_id)
+                        if sell_status.status == "filled":
+                            sell_filled = True
+                            sell_result = sell_status
+                    if buy_filled and sell_filled:
+                        break
+                    await asyncio.sleep(poll_interval)
 
-                # Sync real balances
-                await self.sync_balances_from_exchange(db, buy_exch, buy_client)
-                await self.sync_balances_from_exchange(db, sell_exch, sell_client)
+                # If both filled within initial timeout -> success
+                if buy_filled and sell_filled:
+                    vwap_buy = buy_result.filled_price
+                    vwap_sell = sell_result.filled_price
+                    actual_vol = min(buy_result.filled_volume, sell_result.filled_volume)
+                    actual_cost = actual_vol * vwap_buy
+                    actual_rev = actual_vol * vwap_sell
+                    gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
+                    await self.sync_balances_from_exchange(db, buy_exch, buy_client)
+                    await self.sync_balances_from_exchange(db, sell_exch, sell_client)
+                else:
+                    # One leg filled, the other not yet -> wait extended timeout for the remaining leg
+                    if buy_filled and not sell_filled:
+                        # Wait for sell order to fill
+                        extended_start = asyncio.get_event_loop().time()
+                        while (asyncio.get_event_loop().time() - extended_start) < timeout_extended:
+                            sell_status = await sell_client.order_status(sell_result.client_order_id)
+                            if sell_status.status == "filled":
+                                sell_filled = True
+                                sell_result = sell_status
+                                break
+                            await asyncio.sleep(poll_interval)
+                        if not sell_filled:
+                            # Sell order still not filled – cancel it, but keep the buy (we now have a position)
+                            await sell_client.cancel_order(sell_result.client_order_id)
+                            await self.log_rejected_opportunity(
+                                db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                                "Second leg (sell) did not fill within extended timeout – buy leg executed but sell leg cancelled",
+                                {"buy_filled": buy_filled, "sell_filled": sell_filled}
+                            )
+                            # Do NOT rollback the buy order – it is already executed. We now have an unbalanced inventory.
+                            # This situation requires manual intervention or a hedging mechanism.
+                            # For now, we simply abort the opportunity.
+                            return
+                    elif sell_filled and not buy_filled:
+                        # Wait for buy order to fill
+                        extended_start = asyncio.get_event_loop().time()
+                        while (asyncio.get_event_loop().time() - extended_start) < timeout_extended:
+                            buy_status = await buy_client.order_status(buy_result.client_order_id)
+                            if buy_status.status == "filled":
+                                buy_filled = True
+                                buy_result = buy_status
+                                break
+                            await asyncio.sleep(poll_interval)
+                        if not buy_filled:
+                            await buy_client.cancel_order(buy_result.client_order_id)
+                            await self.log_rejected_opportunity(
+                                db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                                "Second leg (buy) did not fill within extended timeout – sell leg executed but buy leg cancelled",
+                                {"buy_filled": buy_filled, "sell_filled": sell_filled}
+                            )
+                            return
+                    else:
+                        # Neither filled – cancel both
+                        await buy_client.cancel_order(buy_result.client_order_id)
+                        await sell_client.cancel_order(sell_result.client_order_id)
+                        await self.log_rejected_opportunity(
+                            db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                            "Neither leg filled within initial timeout",
+                            {"buy_filled": buy_filled, "sell_filled": sell_filled}
+                        )
+                        return
+
+                    # If we reached here, both are now filled (after extended wait)
+                    vwap_buy = buy_result.filled_price
+                    vwap_sell = sell_result.filled_price
+                    actual_vol = min(buy_result.filled_volume, sell_result.filled_volume)
+                    actual_cost = actual_vol * vwap_buy
+                    actual_rev = actual_vol * vwap_sell
+                    gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
+                    await self.sync_balances_from_exchange(db, buy_exch, buy_client)
+                    await self.sync_balances_from_exchange(db, sell_exch, sell_client)
             else:
                 # SIMULATOR MODE
                 await update_base_balance(db, buy_exch, common_symbol, actual_vol)
@@ -336,7 +455,7 @@ class ArbitrageService:
                 common_symbol=common_symbol,
                 exchange_a_id=buy_exch_obj.id,
                 exchange_b_id=sell_exch_obj.id,
-                trade_type=f"{prefix}_{buy_exch}_sell_on_{sell_exch}",
+                trade_type=trade_type_label,
                 price_a=vwap_buy,
                 price_b=vwap_sell,
                 profit_percent=gross_profit_pct,
@@ -357,7 +476,7 @@ class ArbitrageService:
             await process_opp(exchange_b_name, exchange_a_name, b_ask_levels, a_bid_levels, b_fee, a_fee,
                               exch_b_obj, exch_a_obj, "buy_on")
 
-    # ---------- Main polling routine ----------
+    # ---------- Main polling routine (unchanged) ----------
     async def poll_and_store(self, db: AsyncSession):
         stmt = (
             select(ExchangeSymbol)

@@ -95,3 +95,13 @@ class SymbolArbitrageSettings(Base, UUIDMixin, TimestampMixin):
     # Default network to use for transferring this symbol
     default_network_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("networks.id"), nullable=True)
     default_network: Mapped[Optional["Network"]] = relationship()
+
+class RejectedOpportunity(Base, UUIDMixin, TimestampMixin):
+    __tablename__ = "rejected_opportunities"
+
+    common_symbol: Mapped[str] = mapped_column(String(50), index=True)
+    exchange_a_name: Mapped[str] = mapped_column(String(50))
+    exchange_b_name: Mapped[str] = mapped_column(String(50))
+    trade_type: Mapped[str] = mapped_column(String(50))  # e.g., "buy_on_wallex_sell_on_nobitex"
+    rejection_reason: Mapped[str] = mapped_column(String(200))
+    details: Mapped[dict] = mapped_column(JSON, nullable=True)  # store prices, fees, thresholds, etc.

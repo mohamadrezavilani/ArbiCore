@@ -106,3 +106,13 @@ class RiskSettingsUpdate(BaseModel):
     valuability_factor: Optional[float] = None
     default_network_id: Optional[UUID4] = None
     is_active: Optional[bool] = None
+
+class RejectedOpportunityResponse(BaseModel):
+    id: UUID4
+    common_symbol: str
+    exchange_a_name: str
+    exchange_b_name: str
+    trade_type: str
+    rejection_reason: str
+    details: Optional[dict]
+    created_at: datetime

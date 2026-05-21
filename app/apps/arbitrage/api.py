@@ -241,3 +241,11 @@ async def update_risk_settings(symbol: str, data: RiskSettingsUpdate, db: AsyncS
     await db.commit()
     await db.refresh(settings_obj)
     return settings_obj
+
+from app.apps.arbitrage.models import RejectedOpportunity
+
+@router.get("/rejected-opportunities", response_model=list[schemas.RejectedOpportunityResponse])
+async def get_rejected_opportunities(limit: int = 50, db: AsyncSession = Depends(get_db)):
+    stmt = select(RejectedOpportunity).order_by(RejectedOpportunity.created_at.desc()).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
