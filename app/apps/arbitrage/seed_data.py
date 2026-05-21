@@ -100,7 +100,7 @@ async def seed():
         settings_rows = [
             SymbolArbitrageSettings(
                 common_symbol="TONIRT",
-                min_profit_percent=0.5,
+                min_profit_percent=0.1,
                 cutoff_threshold=0.1,
                 min_trade_percent=0.20,
                 min_trade_factor=0.3,
@@ -110,7 +110,7 @@ async def seed():
             ),
             SymbolArbitrageSettings(
                 common_symbol="TONUSDT",
-                min_profit_percent=0.1,
+                min_profit_percent=0.001,
                 cutoff_threshold=0.005,
                 min_trade_percent=0.20,
                 min_trade_factor=0.3,
@@ -120,7 +120,7 @@ async def seed():
             ),
             SymbolArbitrageSettings(
                 common_symbol="USDTIRT",
-                min_profit_percent=0.5,
+                min_profit_percent=0.1,
                 cutoff_threshold=0.1,
                 min_trade_percent=0.20,
                 min_trade_factor=0.3,
