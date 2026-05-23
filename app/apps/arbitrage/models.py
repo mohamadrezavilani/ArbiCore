@@ -96,6 +96,9 @@ class SymbolArbitrageSettings(Base, UUIDMixin, TimestampMixin):
     default_network_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("networks.id"), nullable=True)
     default_network: Mapped[Optional["Network"]] = relationship()
 
+    opportunistic_rebalance_enabled: Mapped[bool] = mapped_column(default=False)
+    opportunistic_rebalance_max_loss_percent: Mapped[float] = mapped_column(Numeric(10, 6), default=0.5)
+
 class RejectedOpportunity(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "rejected_opportunities"
 

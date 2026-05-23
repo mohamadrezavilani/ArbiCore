@@ -1,7 +1,7 @@
 import aiohttp
 import asyncio
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 from app.core.config import settings
 from app.exchanges.base import ExchangeClient, OrderResult
@@ -17,10 +17,8 @@ class BitpinClient(ExchangeClient):
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def _ensure_token(self):
-        """Get a new access token if expired or not present."""
         if self.access_token and time.time() < self.token_expiry:
             return
-        # If we have a refresh token, use it
         if self.refresh_token:
             try:
                 url = f"{self.base_url}/api/v1/usr/refresh_token/"
@@ -35,12 +33,8 @@ class BitpinClient(ExchangeClient):
                         self.refresh_token = None
             except Exception:
                 self.refresh_token = None
-        # Full login
         url = f"{self.base_url}/api/v1/usr/authenticate/"
-        payload = {
-            "api_key": self.api_key,
-            "secret_key": self.secret_key
-        }
+        payload = {"api_key": self.api_key, "secret_key": self.secret_key}
         async with self.session.post(url, json=payload) as resp:
             if resp.status != 200:
                 text = await resp.text()
@@ -54,10 +48,7 @@ class BitpinClient(ExchangeClient):
         if not self.session:
             self.session = aiohttp.ClientSession()
         await self._ensure_token()
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json"
-        }
+        headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
         url = f"{self.base_url}{path}"
         try:
             async with self.session.request(method, url, headers=headers, json=json_data) as resp:
@@ -68,7 +59,6 @@ class BitpinClient(ExchangeClient):
                     raise Exception(f"Bitpin API error {resp.status}: {text}")
                 return await resp.json()
         except Exception as e:
-            # If token expired, retry once
             if "401" in str(e) or "403" in str(e):
                 self.access_token = None
                 await self._ensure_token()
@@ -90,7 +80,6 @@ class BitpinClient(ExchangeClient):
                     balances[asset] = balance
             return balances
         except Exception as e:
-            print(f"Error fetching Bitpin balances: {e}")
             return {}
 
     async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str) -> OrderResult:
@@ -124,7 +113,6 @@ class BitpinClient(ExchangeClient):
                 raw_response=response
             )
         except Exception as e:
-            print(f"Error placing market order on Bitpin: {e}")
             return OrderResult(
                 order_id="",
                 client_order_id=client_order_id,
@@ -168,7 +156,6 @@ class BitpinClient(ExchangeClient):
                     fee=0,
                     raw_response=None
                 )
-            print(f"Error getting order status on Bitpin: {e}")
             return OrderResult(
                 order_id="",
                 client_order_id=client_order_id,
@@ -186,8 +173,25 @@ class BitpinClient(ExchangeClient):
         except Exception as e:
             if "404" in str(e) or "406" in str(e):
                 return True
-            print(f"Error cancelling order on Bitpin: {e}")
             return False
 
     async def withdraw(self, currency: str, amount: float, address: str, network: str) -> str:
         raise NotImplementedError("Withdraw not implemented for Bitpin")
+
+    # ----- NEW: Orderbook fetching and parsing -----
+    async def fetch_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
+        url = f"{self.base_url}/api/v1/mth/orderbook/{symbol}/"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+        except Exception:
+            return None
+
+    def extract_levels(self, raw_orderbook: Dict[str, Any]) -> Tuple[List[List[float]], List[List[float]]]:
+        asks = raw_orderbook.get("asks", [])
+        bids = raw_orderbook.get("bids", [])
+        ask_levels = [[float(price), float(vol)] for price, vol in asks] if asks else []
+        bid_levels = [[float(price), float(vol)] for price, vol in bids] if bids else []
+        return ask_levels, bid_levels

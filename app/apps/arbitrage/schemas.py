@@ -73,6 +73,32 @@ class SymbolSettingsCreate(BaseModel):
     common_symbol: str
     min_profit_percent: float
     is_active: bool = True
+    opportunistic_rebalance_enabled: bool = False
+    opportunistic_rebalance_max_loss_percent: float = 0.5
+
+class RiskSettingsResponse(BaseModel):
+    id: UUID4
+    common_symbol: str
+    min_profit_percent: float
+    cutoff_threshold: float
+    min_trade_percent: float
+    min_trade_factor: float
+    valuability_factor: float
+    default_network_id: Optional[UUID4]
+    is_active: bool
+    opportunistic_rebalance_enabled: bool
+    opportunistic_rebalance_max_loss_percent: float
+
+class RiskSettingsUpdate(BaseModel):
+    min_profit_percent: Optional[float] = None
+    cutoff_threshold: Optional[float] = None
+    min_trade_percent: Optional[float] = None
+    min_trade_factor: Optional[float] = None
+    valuability_factor: Optional[float] = None
+    default_network_id: Optional[UUID4] = None
+    is_active: Optional[bool] = None
+    opportunistic_rebalance_enabled: Optional[bool] = None
+    opportunistic_rebalance_max_loss_percent: Optional[float] = None
 
 class SymbolSettingsResponse(SymbolSettingsCreate):
     id: UUID4
@@ -86,25 +112,7 @@ class NetworkResponse(BaseModel):
     fee_per_transfer: float
     is_active: bool
 
-class RiskSettingsResponse(BaseModel):
-    id: UUID4
-    common_symbol: str
-    min_profit_percent: float
-    cutoff_threshold: float
-    min_trade_percent: float
-    min_trade_factor: float
-    valuability_factor: float
-    default_network_id: Optional[UUID4]
-    is_active: bool
 
-class RiskSettingsUpdate(BaseModel):
-    min_profit_percent: Optional[float] = None
-    cutoff_threshold: Optional[float] = None
-    min_trade_percent: Optional[float] = None
-    min_trade_factor: Optional[float] = None
-    valuability_factor: Optional[float] = None
-    default_network_id: Optional[UUID4] = None
-    is_active: Optional[bool] = None
 
 class RejectedOpportunityResponse(BaseModel):
     id: UUID4
@@ -135,3 +143,18 @@ class DashboardResponse(BaseModel):
     opportunities: Dict[str, Any]  # {"executed_today": int, "rejected_today": int, "last_24h_profit": float}
     rebalances: Dict[str, Any]  # {"last_24h_count": int, "last_24h_total_sent": float}
     system_health: Dict[str, Any]  # {"active_exchanges": int, "active_symbols": int, "last_scan_time": str}
+
+# Add at the end of schemas.py
+class ActionLogResponse(BaseModel):
+    id: UUID4
+    timestamp: datetime
+    action_type: str  # trade, rebalance, rejection
+    details: Dict[str, Any]
+
+class RealizedProfitResponse(BaseModel):
+    currency: str
+    days: int
+    trade_profit: float
+    network_fees: float
+    net_profit: float
+    since: datetime

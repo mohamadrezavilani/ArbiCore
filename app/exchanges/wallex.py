@@ -1,7 +1,7 @@
 import uuid
 import aiohttp
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from decimal import Decimal
 from app.exchanges.base import ExchangeClient, OrderResult
 from app.core.config import settings
@@ -22,7 +22,6 @@ class WallexClient(ExchangeClient):
             headers.update(kwargs.pop("headers"))
         url = f"{self.base_url}{path}"
         async with self.session.request(method, url, headers=headers, **kwargs) as resp:
-            # Wallex returns 201 for order creation
             if resp.status not in (200, 201):
                 text = await resp.text()
                 raise Exception(f"Wallex API error {resp.status}: {text}")
@@ -39,18 +38,10 @@ class WallexClient(ExchangeClient):
             elif asset == "USDT":
                 mapped["USDT"] = float(info.get("value", 0))
             else:
-                # For base assets like TONTMN, we keep the asset name as is
                 mapped[asset] = float(info.get("value", 0))
         return mapped
 
     async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str) -> OrderResult:
-        """
-        Place a limit order at market price? Wallex requires a price for limit orders.
-        For market orders, we need to use a very high/low price to simulate market.
-        Alternatively, we can fetch orderbook and use best ask/bid price.
-        For simplicity, we'll use best ask/bid price from orderbook.
-        """
-        # Fetch current orderbook to get best price
         ob_data = await self._request("GET", f"/v1/depth", params={"symbol": symbol})
         result = ob_data.get("result", {})
         if not result:
@@ -59,7 +50,6 @@ class WallexClient(ExchangeClient):
             best_price = float(result["ask"][0]["price"])
         else:
             best_price = float(result["bid"][0]["price"])
-        # Place limit order at best price (effectively market)
         payload = {
             "client_id": client_order_id,
             "price": str(best_price),
@@ -69,7 +59,6 @@ class WallexClient(ExchangeClient):
             "type": "LIMIT"
         }
         response = await self._request("POST", "/v1/account/orders", json=payload)
-        # Response contains result with clientOrderId, executedQty, etc.
         order_data = response.get("result", {})
         executed_qty = float(order_data.get("executedQty", 0))
         executed_price = float(order_data.get("executedPrice", best_price))
@@ -86,11 +75,9 @@ class WallexClient(ExchangeClient):
         )
 
     async def order_status(self, client_order_id: str) -> OrderResult:
-        """Get order status using clientOrderId."""
         try:
             response = await self._request("GET", f"/v1/account/orders/{client_order_id}")
         except Exception as e:
-            # If order not found (e.g., cancelled and removed), treat as cancelled
             if "404" in str(e):
                 return OrderResult(
                     order_id=client_order_id,
@@ -104,7 +91,6 @@ class WallexClient(ExchangeClient):
             raise
         order_data = response.get("result", {})
         status_raw = order_data.get("status", "").lower()
-        # Map Wallex status to our internal status
         if status_raw == "filled":
             status = "filled"
         elif status_raw in ("canceled", "cancelled"):
@@ -127,17 +113,37 @@ class WallexClient(ExchangeClient):
         )
 
     async def cancel_order(self, client_order_id: str) -> bool:
-        """Cancel order by clientOrderId."""
         try:
             await self._request("DELETE", f"/v1/account/orders/{client_order_id}")
             return True
         except Exception as e:
-            # If already cancelled or not found, we consider success
             if "404" in str(e):
                 return True
             return False
 
     async def withdraw(self, currency: str, amount: float, address: str, network: str) -> str:
-        """Withdraw – not fully implemented; placeholder."""
-        # Wallex has separate withdrawal endpoint; we can implement later if needed.
         raise NotImplementedError("Withdraw not implemented for Wallex in this version")
+
+    # ----- NEW: Orderbook fetching and parsing -----
+    async def fetch_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch public orderbook for a symbol."""
+        url = f"{self.base_url}/v1/depth"
+        params = {"symbol": symbol}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=10) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    if data.get("success"):
+                        return data["result"]
+                    else:
+                        return None
+        except Exception as e:
+            return None
+
+    def extract_levels(self, raw_orderbook: Dict[str, Any]) -> Tuple[List[List[float]], List[List[float]]]:
+        asks = raw_orderbook.get("ask", [])
+        bids = raw_orderbook.get("bid", [])
+        ask_levels = [[float(a["price"]), float(a["quantity"])] for a in asks] if asks else []
+        bid_levels = [[float(b["price"]), float(b["quantity"])] for b in bids] if bids else []
+        return ask_levels, bid_levels

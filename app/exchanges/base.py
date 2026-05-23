@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
 
 @dataclass
@@ -48,4 +48,18 @@ class ExchangeClient(ABC):
     @abstractmethod
     async def withdraw(self, currency: str, amount: float, address: str, network: str) -> str:
         """Withdraw funds to an external address. Returns transaction ID."""
+        pass
+
+    # NEW: fetch and parse orderbook
+    @abstractmethod
+    async def fetch_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch raw orderbook data from the exchange (public endpoint)."""
+        pass
+
+    @abstractmethod
+    def extract_levels(self, raw_orderbook: Dict[str, Any]) -> Tuple[List[List[float]], List[List[float]]]:
+        """
+        Extract ask and bid levels from raw orderbook.
+        Returns (asks, bids) where each is a list of [price, volume].
+        """
         pass
