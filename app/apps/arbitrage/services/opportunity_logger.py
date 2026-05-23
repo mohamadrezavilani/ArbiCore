@@ -16,8 +16,8 @@ class OpportunityLogger:
         reason: str,
         details: Optional[Dict] = None
     ):
-        # if details and details.get('reason') and 'No profit' not in details['reason']:
-        logger.info(f"❌ Rejected {common_symbol} {trade_type}: {reason} | details={details}")
+        if details and details.get('reason') and 'No profit' not in details['reason']:
+            logger.info(f"❌ Rejected {common_symbol} {trade_type}: {reason} | details={details}")
         rejected = RejectedOpportunity(
             common_symbol=common_symbol,
             exchange_a_name=exchange_a,
