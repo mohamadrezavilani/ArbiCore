@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, union_all, text, func
+from sqlalchemy import select, union_all, func, cast, String
+from sqlalchemy.orm import aliased
 from app.core.database import get_db
-from app.apps.arbitrage.models import ArbitrageOpportunity, RebalanceLog, RejectedOpportunity
+from app.apps.arbitrage.models import ArbitrageOpportunity, RebalanceLog, RejectedOpportunity, Exchange
 from typing import Optional, List
 from datetime import datetime
 from pydantic import BaseModel
@@ -12,7 +13,7 @@ router = APIRouter()
 class ActionItem(BaseModel):
     id: str
     timestamp: datetime
-    action_type: str  # "trade", "rebalance", "rejection"
+    action_type: str
     details: dict
 
 @router.get("/", response_model=List[ActionItem])
@@ -21,18 +22,16 @@ async def get_actions(
     action_type: Optional[str] = Query(None, pattern="^(trade|rebalance|rejection)$"),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Unified action log: combines trades, rebalances, and rejected opportunities.
-    """
-    # Build individual queries
+    ExchangeA = aliased(Exchange)
+    ExchangeB = aliased(Exchange)
     trades_query = select(
         ArbitrageOpportunity.id.label("id"),
         ArbitrageOpportunity.created_at.label("timestamp"),
-        func.cast("trade", type=str).label("action_type"),
+        cast("trade", String).label("action_type"),
         func.json_build_object(
             "common_symbol", ArbitrageOpportunity.common_symbol,
-            "exchange_a", text("ea.name"),
-            "exchange_b", text("eb.name"),
+            "exchange_a", ExchangeA.name,
+            "exchange_b", ExchangeB.name,
             "trade_type", ArbitrageOpportunity.trade_type,
             "price_a", ArbitrageOpportunity.price_a,
             "price_b", ArbitrageOpportunity.price_b,
@@ -41,15 +40,15 @@ async def get_actions(
             "profit_quote", ArbitrageOpportunity.traded_volume * (ArbitrageOpportunity.price_b - ArbitrageOpportunity.price_a)
         ).label("details")
     ).join(
-        text("exchanges ea"), text("ArbitrageOpportunity.exchange_a_id = ea.id")
+        ExchangeA, ArbitrageOpportunity.exchange_a_id == ExchangeA.id
     ).join(
-        text("exchanges eb"), text("ArbitrageOpportunity.exchange_b_id = eb.id")
+        ExchangeB, ArbitrageOpportunity.exchange_b_id == ExchangeB.id
     )
 
     rebalances_query = select(
         RebalanceLog.id.label("id"),
         RebalanceLog.created_at.label("timestamp"),
-        func.cast("rebalance", type=str).label("action_type"),
+        cast("rebalance", String).label("action_type"),
         func.json_build_object(
             "common_symbol", RebalanceLog.common_symbol,
             "currency", RebalanceLog.currency,
@@ -65,7 +64,7 @@ async def get_actions(
     rejections_query = select(
         RejectedOpportunity.id.label("id"),
         RejectedOpportunity.created_at.label("timestamp"),
-        func.cast("rejection", type=str).label("action_type"),
+        cast("rejection", String).label("action_type"),
         func.json_build_object(
             "common_symbol", RejectedOpportunity.common_symbol,
             "exchange_a", RejectedOpportunity.exchange_a_name,
@@ -76,9 +75,7 @@ async def get_actions(
         ).label("details")
     )
 
-    # Union all
-    combined = union_all(trades_query, rebalances_query, rejections_query).subquery()
-
+    combined = union_all(trades_query, rebalances_query, rejections_query).alias("combined")
     stmt = select(
         combined.c.id,
         combined.c.timestamp,

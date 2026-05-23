@@ -10,7 +10,8 @@ from .rebalance_logs import router as rebalance_logs_router
 from .actions import router as actions_router
 from .pools import router as pools_router
 
-router = APIRouter(prefix="/arbitrage", tags=["arbitrage"])
+# Remove the prefix "/arbitrage" – it will be added by the main app
+router = APIRouter(tags=["arbitrage"])
 
 router.include_router(dashboard_router, prefix="/dashboard", tags=["dashboard"])
 router.include_router(exchanges_router, prefix="/exchanges", tags=["exchanges"])
