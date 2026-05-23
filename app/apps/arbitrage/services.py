@@ -9,13 +9,17 @@ from typing import Dict, Any, Optional, Tuple, List
 from app.core.config import settings
 from app.apps.arbitrage.models import (
     Exchange, ExchangeSymbol, OrderbookSnapshot, ArbitrageOpportunity,
-    ExchangeFee, SymbolArbitrageSettings, Network, RejectedOpportunity
+    ExchangeFee, SymbolArbitrageSettings, Network, RejectedOpportunity, RebalanceLog
 )
 from app.apps.arbitrage.inventory import (
     get_base_balance, update_base_balance, set_base_balance,
     get_quote_balance, update_quote_balance, set_quote_balance
 )
 from app.exchanges.factory import get_exchange_client
+from app.apps.arbitrage.models import BaseInventory, SymbolArbitrageSettings, Network
+from app.apps.arbitrage.inventory import update_base_balance
+from app.apps.arbitrage.models import QuoteInventory
+from app.apps.arbitrage.inventory import update_quote_balance
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +42,13 @@ class ArbitrageService:
                 common = asset_to_common.get(asset, asset)
                 await set_base_balance(db, exchange_name, common, balance)
 
-    # ---------- Rejected opportunity logger ----------
+    # ---------- Rejected opportunity logger (logs to console + db) ----------
     async def log_rejected_opportunity(
         self, db: AsyncSession, common_symbol: str, exchange_a: str, exchange_b: str,
         trade_type: str, reason: str, details: Optional[Dict] = None
     ):
+        if details.get('reason') is not None and not details.get('reason').__contains__('No profit'):
+            logger.info(f"❌ Rejected {common_symbol} {trade_type}: {reason} | details={details}")
         rejected = RejectedOpportunity(
             common_symbol=common_symbol,
             exchange_a_name=exchange_a,
@@ -52,10 +58,27 @@ class ArbitrageService:
             details=details or {}
         )
         db.add(rejected)
-        # We'll flush but not commit (commit happens at end of poll cycle)
         await db.flush()
 
-    # ---------- Exchange fetch & extraction (unchanged) ----------
+    # ---------- Rebalance logging ----------
+    async def log_rebalance(
+        self, db: AsyncSession, common_symbol: str, currency: str,
+        from_exch: str, to_exch: str, amount_sent: float, fee: float, net: float, reason: str
+    ):
+        log = RebalanceLog(
+            common_symbol=common_symbol if common_symbol else None,
+            currency=currency if currency else None,
+            from_exchange=from_exch,
+            to_exchange=to_exch,
+            amount_sent=amount_sent,
+            network_fee=fee,
+            net_received=net,
+            reason=reason
+        )
+        db.add(log)
+        await db.flush()
+
+    # ---------- Exchange-specific fetch & extraction (unchanged) ----------
     async def fetch_wallex_orderbook(self, session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
         url = "https://api.wallex.ir/v1/depth"
         params = {"symbol": symbol}
@@ -179,7 +202,125 @@ class ArbitrageService:
             return min_trade_pct + slope * (net_gain - min_threshold)
         return min_trade_pct
 
-    # ---------- Core arbitrage detection (supports both simulator & live with timeout) ----------
+    # ---------- Rebalancing (base) ----------
+    async def rebalance_symbol_if_needed(self, db: AsyncSession, common_symbol: str, threshold_ratio: float = 0.1):
+        """
+        If any exchange's base balance is less than threshold_ratio * average_balance,
+        transfer from the richest exchange to the poorest.
+        """
+
+        stmt = (
+            select(Exchange.name, Exchange.id, BaseInventory.balance)
+            .join(BaseInventory, BaseInventory.exchange_id == Exchange.id)
+            .where(BaseInventory.common_symbol == common_symbol)
+            .where(Exchange.is_active == True)
+        )
+        result = await db.execute(stmt)
+        rows = result.all()
+        if not rows or len(rows) < 2:
+            return
+
+        balances = [(r.name, float(r.balance)) for r in rows]
+        avg_balance = sum(b for _, b in balances) / len(balances)
+        min_balance = min(b for _, b in balances)
+        max_balance = max(b for _, b in balances)
+
+        # If the min balance is above threshold ratio of average, do nothing
+        if min_balance >= threshold_ratio * avg_balance:
+            return
+
+        # Find poorest and richest
+        poorest = min(balances, key=lambda x: x[1])
+        richest = max(balances, key=lambda x: x[1])
+
+        # Transfer amount: 75% of richest's balance (or enough to bring poorest up to average)
+        transfer_amount = min(richest[1] * 0.75, richest[1] - 1e-6)  # leave a tiny amount
+        if transfer_amount <= 0:
+            return
+
+        # Get network fee
+        settings_stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
+        settings_obj = (await db.execute(settings_stmt)).scalar_one_or_none()
+        network_fee = 0.0
+        if settings_obj and settings_obj.default_network_id:
+            net_stmt = select(Network).where(Network.id == settings_obj.default_network_id)
+            net = (await db.execute(net_stmt)).scalar_one_or_none()
+            if net:
+                network_fee = float(net.fee_per_transfer)
+
+        if transfer_amount <= network_fee:
+            logger.info(f"Transfer amount {transfer_amount:.4f} {common_symbol} <= network fee {network_fee}, skipping")
+            return
+
+        net_received = transfer_amount - network_fee
+
+        await update_base_balance(db, richest[0], common_symbol, -transfer_amount)
+        await update_base_balance(db, poorest[0], common_symbol, net_received)
+
+        await self.log_rebalance(
+            db, common_symbol, None, richest[0], poorest[0],
+            transfer_amount, network_fee, net_received,
+            f"base_balance_{common_symbol}_below_{threshold_ratio*100:.0f}%_avg"
+        )
+        logger.info(
+            f"🔄 Rebalanced {common_symbol}: sent {transfer_amount:.4f} from {richest[0]} to {poorest[0]} "
+            f"(network fee {network_fee:.4f}), net received {net_received:.4f}"
+        )
+
+    # ---------- Rebalancing (quote) ----------
+    async def rebalance_quote_if_needed(self, db: AsyncSession, currency: str, threshold_ratio: float = 0.1):
+        """
+        If any exchange's quote balance (IRT or USDT) is less than threshold_ratio * average_balance,
+        transfer from the richest exchange to the poorest.
+        """
+
+        stmt = (
+            select(Exchange.name, Exchange.id, QuoteInventory.balance)
+            .join(QuoteInventory, QuoteInventory.exchange_id == Exchange.id)
+            .where(QuoteInventory.currency == currency)
+            .where(Exchange.is_active == True)
+        )
+        result = await db.execute(stmt)
+        rows = result.all()
+        if not rows or len(rows) < 2:
+            return
+
+        balances = [(r.name, float(r.balance)) for r in rows]
+        avg_balance = sum(b for _, b in balances) / len(balances)
+        min_balance = min(b for _, b in balances)
+
+        if min_balance >= threshold_ratio * avg_balance:
+            return
+
+        poorest = min(balances, key=lambda x: x[1])
+        richest = max(balances, key=lambda x: x[1])
+
+        transfer_amount = richest[1] * 0.75
+        if transfer_amount <= 0:
+            return
+
+        # For quote transfers, assume zero network fee (or you can add later)
+        network_fee = 0.0
+
+        if transfer_amount <= network_fee:
+            return
+
+        net_received = transfer_amount - network_fee
+
+        await update_quote_balance(db, richest[0], currency, -transfer_amount)
+        await update_quote_balance(db, poorest[0], currency, net_received)
+
+        await self.log_rebalance(
+            db, None, currency, richest[0], poorest[0],
+            transfer_amount, network_fee, net_received,
+            f"quote_balance_{currency}_below_{threshold_ratio*100:.0f}%_avg"
+        )
+        logger.info(
+            f"🔄 Rebalanced {currency}: sent {transfer_amount:.4f} from {richest[0]} to {poorest[0]} "
+            f"(network fee {network_fee:.4f}), net received {net_received:.4f}"
+        )
+
+    # ---------- Core arbitrage detection (simulator + live) ----------
     async def detect_arbitrage_between(
         self,
         db: AsyncSession,
@@ -237,12 +378,13 @@ class ArbitrageService:
 
         async def compute_max_trade(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee):
             vol = cost = rev = 0.0
+            reason = "Unknown"
             avail_base = await get_base_balance(db, sell_exch, common_symbol)
             if avail_base <= 0:
-                return 0,0,0,0
+                return 0, 0, 0, 0, f"Insufficient base balance on {sell_exch} ({avail_base})"
             avail_quote = await get_quote_balance(db, buy_exch, quote_currency)
             if avail_quote <= 0:
-                return 0,0,0,0
+                return 0, 0, 0, 0, f"Insufficient quote balance on {buy_exch} ({avail_quote} {quote_currency})"
 
             i_buy = i_sell = 0
             buy_cpy = [l[:] for l in buy_levels]
@@ -254,6 +396,7 @@ class ArbitrageService:
                 cost_unit = bprice * (1 + buy_fee)
                 rev_unit = sprice * (1 - sell_fee)
                 if rev_unit <= cost_unit:
+                    reason = f"No profit: buy {cost_unit:.2f} vs sell {rev_unit:.2f}"
                     break
                 take = min(bvol, svol, avail_base - vol, avail_quote / cost_unit)
                 if take <= 0:
@@ -268,19 +411,29 @@ class ArbitrageService:
                 buy_cpy[i_buy][1] -= take
                 sell_cpy[i_sell][1] -= take
                 if vol >= avail_base or cost >= avail_quote:
+                    reason = f"Reached inventory limit (base={avail_base}, quote={avail_quote})"
                     break
-            return vol, cost, rev, rev - cost
+            else:
+                if i_buy >= len(buy_cpy):
+                    reason = "Buy order book exhausted"
+                elif i_sell >= len(sell_cpy):
+                    reason = "Sell order book exhausted"
+                else:
+                    reason = "No profitable levels found"
+            return vol, cost, rev, rev - cost, reason
+
 
         async def process_opp(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee,
                               buy_exch_obj, sell_exch_obj, prefix):
-            vol, cost, rev, gross_gain = await compute_max_trade(buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee)
+            vol, cost, rev, gross_gain, reason = await compute_max_trade(buy_exch, sell_exch, buy_levels, sell_levels,
+                                                                         buy_fee, sell_fee)
             trade_type_label = f"{prefix}_{buy_exch}_sell_on_{sell_exch}"
             if vol <= 0:
-                # await self.log_rejected_opportunity(
-                #     db, common_symbol, buy_exch, sell_exch, trade_type_label,
-                #     "No volume from order book (insufficient depth or inventory)",
-                #     {"vol": vol}
-                # )
+                await self.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                    f"No volume: {reason}",
+                    {"vol": vol, "reason": reason}
+                )
                 return
             vwap_buy = cost / vol
             vwap_sell = rev / vol
@@ -295,6 +448,14 @@ class ArbitrageService:
                 return
 
             actual_vol = vol * trade_pct
+            if actual_vol < 1e-6:
+                await self.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch, trade_type_label,
+                    f"Actual volume {actual_vol} below minimum threshold (1e-6)",
+                    {"actual_vol": actual_vol, "vol": vol, "trade_pct": trade_pct}
+                )
+                return
+
             actual_cost = cost * trade_pct
             actual_rev = rev * trade_pct
             gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
@@ -313,9 +474,9 @@ class ArbitrageService:
             is_live = (buy_mode == "live" and sell_mode == "live")
 
             if is_live:
-                # LIVE TRADING with two‑stage timeout
-                timeout_initial = 5.0  # seconds to wait for both to fill
-                timeout_extended = 60.0  # seconds to wait for the second leg after first fills
+                # LIVE TRADING with two‑stage timeout (unchanged)
+                timeout_initial = 5.0
+                timeout_extended = 60.0
                 poll_interval = 0.5
                 buy_client = get_exchange_client(buy_exch)
                 sell_client = get_exchange_client(sell_exch)
@@ -331,7 +492,6 @@ class ArbitrageService:
                 buy_order_id = f"buy_{short_uuid}"
                 sell_order_id = f"sell_{short_uuid}"
 
-                # Place orders concurrently
                 buy_task = asyncio.create_task(buy_client.place_market_order(
                     symbol=common_symbol, side="buy", amount=actual_vol, client_order_id=buy_order_id
                 ))
@@ -340,7 +500,6 @@ class ArbitrageService:
                 ))
                 buy_result, sell_result = await asyncio.gather(buy_task, sell_task)
 
-                # Initial check: if any order failed immediately (not filled), abort both
                 if buy_result.status != "filled" or sell_result.status != "filled":
                     if buy_result.status != "filled" and buy_result.order_id:
                         await buy_client.cancel_order(buy_result.client_order_id)
@@ -353,7 +512,6 @@ class ArbitrageService:
                     )
                     return
 
-                # Poll for fill statuses
                 start = asyncio.get_event_loop().time()
                 buy_filled = sell_filled = False
                 while (asyncio.get_event_loop().time() - start) < timeout_initial:
@@ -371,7 +529,6 @@ class ArbitrageService:
                         break
                     await asyncio.sleep(poll_interval)
 
-                # If both filled within initial timeout -> success
                 if buy_filled and sell_filled:
                     vwap_buy = buy_result.filled_price
                     vwap_sell = sell_result.filled_price
@@ -382,9 +539,8 @@ class ArbitrageService:
                     await self.sync_balances_from_exchange(db, buy_exch, buy_client)
                     await self.sync_balances_from_exchange(db, sell_exch, sell_client)
                 else:
-                    # One leg filled, the other not yet -> wait extended timeout for the remaining leg
+                    # Extended wait for missing leg
                     if buy_filled and not sell_filled:
-                        # Wait for sell order to fill
                         extended_start = asyncio.get_event_loop().time()
                         while (asyncio.get_event_loop().time() - extended_start) < timeout_extended:
                             sell_status = await sell_client.order_status(sell_result.client_order_id)
@@ -394,19 +550,14 @@ class ArbitrageService:
                                 break
                             await asyncio.sleep(poll_interval)
                         if not sell_filled:
-                            # Sell order still not filled – cancel it, but keep the buy (we now have a position)
                             await sell_client.cancel_order(sell_result.client_order_id)
                             await self.log_rejected_opportunity(
                                 db, common_symbol, buy_exch, sell_exch, trade_type_label,
-                                "Second leg (sell) did not fill within extended timeout – buy leg executed but sell leg cancelled",
+                                "Second leg (sell) did not fill within extended timeout",
                                 {"buy_filled": buy_filled, "sell_filled": sell_filled}
                             )
-                            # Do NOT rollback the buy order – it is already executed. We now have an unbalanced inventory.
-                            # This situation requires manual intervention or a hedging mechanism.
-                            # For now, we simply abort the opportunity.
                             return
                     elif sell_filled and not buy_filled:
-                        # Wait for buy order to fill
                         extended_start = asyncio.get_event_loop().time()
                         while (asyncio.get_event_loop().time() - extended_start) < timeout_extended:
                             buy_status = await buy_client.order_status(buy_result.client_order_id)
@@ -419,12 +570,11 @@ class ArbitrageService:
                             await buy_client.cancel_order(buy_result.client_order_id)
                             await self.log_rejected_opportunity(
                                 db, common_symbol, buy_exch, sell_exch, trade_type_label,
-                                "Second leg (buy) did not fill within extended timeout – sell leg executed but buy leg cancelled",
+                                "Second leg (buy) did not fill within extended timeout",
                                 {"buy_filled": buy_filled, "sell_filled": sell_filled}
                             )
                             return
                     else:
-                        # Neither filled – cancel both
                         await buy_client.cancel_order(buy_result.client_order_id)
                         await sell_client.cancel_order(sell_result.client_order_id)
                         await self.log_rejected_opportunity(
@@ -434,7 +584,7 @@ class ArbitrageService:
                         )
                         return
 
-                    # If we reached here, both are now filled (after extended wait)
+                    # Both now filled after extended wait
                     vwap_buy = buy_result.filled_price
                     vwap_sell = sell_result.filled_price
                     actual_vol = min(buy_result.filled_volume, sell_result.filled_volume)
@@ -450,7 +600,7 @@ class ArbitrageService:
                 await update_quote_balance(db, buy_exch, quote_currency, -actual_cost)
                 await update_quote_balance(db, sell_exch, quote_currency, actual_rev)
 
-            # Record opportunity (same for both modes)
+            # Record successful opportunity
             opp = ArbitrageOpportunity(
                 common_symbol=common_symbol,
                 exchange_a_id=buy_exch_obj.id,
@@ -462,6 +612,11 @@ class ArbitrageService:
                 traded_volume=actual_vol,
             )
             db.add(opp)
+
+            # Run rebalancers after successful trade (with threshold ratio 0.1)
+            await self.rebalance_symbol_if_needed(db, common_symbol, threshold_ratio=0.1)
+            await self.rebalance_quote_if_needed(db, quote_currency, threshold_ratio=0.1)
+
             logger.info(
                 f"✅ Executed {actual_vol:.4f} {common_symbol} (risk {trade_pct:.1%} of max {vol:.4f}) "
                 f"buy {buy_exch} @{vwap_buy:.2f} sell {sell_exch} @{vwap_sell:.2f} "
@@ -476,7 +631,7 @@ class ArbitrageService:
             await process_opp(exchange_b_name, exchange_a_name, b_ask_levels, a_bid_levels, b_fee, a_fee,
                               exch_b_obj, exch_a_obj, "buy_on")
 
-    # ---------- Main polling routine (unchanged) ----------
+    # ---------- Main polling routine ----------
     async def poll_and_store(self, db: AsyncSession):
         stmt = (
             select(ExchangeSymbol)

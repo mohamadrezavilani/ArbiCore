@@ -105,3 +105,15 @@ class RejectedOpportunity(Base, UUIDMixin, TimestampMixin):
     trade_type: Mapped[str] = mapped_column(String(50))  # e.g., "buy_on_wallex_sell_on_nobitex"
     rejection_reason: Mapped[str] = mapped_column(String(200))
     details: Mapped[dict] = mapped_column(JSON, nullable=True)  # store prices, fees, thresholds, etc.
+
+class RebalanceLog(Base, UUIDMixin, TimestampMixin):
+    __tablename__ = "rebalance_logs"
+
+    common_symbol: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # for base rebalance
+    currency: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)       # for quote rebalance
+    from_exchange: Mapped[str] = mapped_column(String(50))
+    to_exchange: Mapped[str] = mapped_column(String(50))
+    amount_sent: Mapped[float] = mapped_column(Numeric(20, 8))
+    network_fee: Mapped[float] = mapped_column(Numeric(20, 8))
+    net_received: Mapped[float] = mapped_column(Numeric(20, 8))
+    reason: Mapped[str] = mapped_column(String(200))   # e.g., "base_balance_below_threshold"

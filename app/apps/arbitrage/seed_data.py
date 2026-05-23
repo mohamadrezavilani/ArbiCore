@@ -39,14 +39,14 @@ async def seed():
 
         # ========== 2. Symbols ==========
         symbols = [
-            ExchangeSymbol(exchange_id=wallex.id, original_symbol="TONTMN", common_symbol="TONIRT", price_conversion_factor=10.0),
-            ExchangeSymbol(exchange_id=wallex.id, original_symbol="TONUSDT", common_symbol="TONUSDT", price_conversion_factor=1.0),
+            # ExchangeSymbol(exchange_id=wallex.id, original_symbol="TONTMN", common_symbol="TONIRT", price_conversion_factor=10.0),
+            # ExchangeSymbol(exchange_id=wallex.id, original_symbol="TONUSDT", common_symbol="TONUSDT", price_conversion_factor=1.0),
             ExchangeSymbol(exchange_id=wallex.id, original_symbol="USDTTMN", common_symbol="USDTIRT", price_conversion_factor=10.0),
-            ExchangeSymbol(exchange_id=nobitex.id, original_symbol="TONIRT", common_symbol="TONIRT", price_conversion_factor=1.0),
-            ExchangeSymbol(exchange_id=nobitex.id, original_symbol="TONUSDT", common_symbol="TONUSDT", price_conversion_factor=1.0),
+            # ExchangeSymbol(exchange_id=nobitex.id, original_symbol="TONIRT", common_symbol="TONIRT", price_conversion_factor=1.0),
+            # ExchangeSymbol(exchange_id=nobitex.id, original_symbol="TONUSDT", common_symbol="TONUSDT", price_conversion_factor=1.0),
             ExchangeSymbol(exchange_id=nobitex.id, original_symbol="USDTIRT", common_symbol="USDTIRT", price_conversion_factor=1.0),
-            ExchangeSymbol(exchange_id=bitpin.id, original_symbol="TON_USDT", common_symbol="TONUSDT", price_conversion_factor=1.0),
-            ExchangeSymbol(exchange_id=bitpin.id, original_symbol="TON_IRT", common_symbol="TONIRT", price_conversion_factor=10.0),
+            # ExchangeSymbol(exchange_id=bitpin.id, original_symbol="TON_USDT", common_symbol="TONUSDT", price_conversion_factor=1.0),
+            # ExchangeSymbol(exchange_id=bitpin.id, original_symbol="TON_IRT", common_symbol="TONIRT", price_conversion_factor=10.0),
             ExchangeSymbol(exchange_id=bitpin.id, original_symbol="USDT_IRT", common_symbol="USDTIRT", price_conversion_factor=10.0),
         ]
         session.add_all(symbols)
@@ -68,60 +68,60 @@ async def seed():
 
         # ========== 4. Inventories ==========
         for exchange in [wallex, nobitex, bitpin]:
-            for sym in ["TONIRT", "TONUSDT", "USDTIRT"]:
-                session.add(BaseInventory(exchange_id=exchange.id, common_symbol=sym, balance=100.0))
+            for sym in ["USDTIRT"]:
+                session.add(BaseInventory(exchange_id=exchange.id, common_symbol=sym, balance=10.0))
 
         for exchange in [wallex, nobitex, bitpin]:
             session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=10_000_000.0))
-            session.add(QuoteInventory(exchange_id=exchange.id, currency="USDT", balance=10_000.0))
+            session.add(QuoteInventory(exchange_id=exchange.id, currency="USDT", balance=10.0))
 
         await session.commit()
         print("✅ Inventories created.")
 
         # ========== 5. Networks ==========
         networks = [
-            Network(symbol="TONIRT", network_name="TON", fee_per_transfer=0.1),
-            Network(symbol="TONUSDT", network_name="TON", fee_per_transfer=0.1),
+            # Network(symbol="TONIRT", network_name="TON", fee_per_transfer=0.1),
+            # Network(symbol="TONUSDT", network_name="TON", fee_per_transfer=0.1),
             Network(symbol="USDTIRT", network_name="TRC20", fee_per_transfer=0.7),
-            Network(symbol="USDTIRT", network_name="BEP20", fee_per_transfer=0.7),
-            Network(symbol="USDTIRT", network_name="Polygon", fee_per_transfer=0.7),
-            Network(symbol="USDTIRT", network_name="ERC20", fee_per_transfer=5.0),
+            # Network(symbol="USDTIRT", network_name="BEP20", fee_per_transfer=0.7),
+            # Network(symbol="USDTIRT", network_name="Polygon", fee_per_transfer=0.7),
+            # Network(symbol="USDTIRT", network_name="ERC20", fee_per_transfer=5.0),
         ]
         session.add_all(networks)
         await session.commit()
         print("✅ Networks created.")
 
         # ========== 6. Symbol arbitrage settings (with default network IDs) ==========
-        ton_network = (await session.execute(
-            select(Network).where(Network.symbol == "TONIRT", Network.network_name == "TON"))).scalar_one()
+        # ton_network = (await session.execute(
+        #     select(Network).where(Network.symbol == "TONIRT", Network.network_name == "TON"))).scalar_one()
         trc20_network = (await session.execute(
             select(Network).where(Network.symbol == "USDTIRT", Network.network_name == "TRC20"))).scalar_one()
 
         settings_rows = [
-            SymbolArbitrageSettings(
-                common_symbol="TONIRT",
-                min_profit_percent=0.1,
-                cutoff_threshold=0.1,
-                min_trade_percent=0.20,
-                min_trade_factor=0.3,
-                valuability_factor=1.0,
-                default_network_id=ton_network.id,
-                is_active=True
-            ),
-            SymbolArbitrageSettings(
-                common_symbol="TONUSDT",
-                min_profit_percent=0.001,
-                cutoff_threshold=0.005,
-                min_trade_percent=0.20,
-                min_trade_factor=0.3,
-                valuability_factor=1.0,
-                default_network_id=ton_network.id,
-                is_active=True
-            ),
+            # SymbolArbitrageSettings(
+            #     common_symbol="TONIRT",
+            #     min_profit_percent=0.1,
+            #     cutoff_threshold=0.1,
+            #     min_trade_percent=0.20,
+            #     min_trade_factor=0.3,
+            #     valuability_factor=1.0,
+            #     default_network_id=ton_network.id,
+            #     is_active=True
+            # ),
+            # SymbolArbitrageSettings(
+            #     common_symbol="TONUSDT",
+            #     min_profit_percent=0.001,
+            #     cutoff_threshold=0.005,
+            #     min_trade_percent=0.20,
+            #     min_trade_factor=0.3,
+            #     valuability_factor=1.0,
+            #     default_network_id=ton_network.id,
+            #     is_active=True
+            # ),
             SymbolArbitrageSettings(
                 common_symbol="USDTIRT",
-                min_profit_percent=0.1,
-                cutoff_threshold=0.1,
+                min_profit_percent=0.001,
+                cutoff_threshold=0,
                 min_trade_percent=0.20,
                 min_trade_factor=0.3,
                 valuability_factor=1.0,
