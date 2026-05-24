@@ -8,6 +8,7 @@ from app.apps.arbitrage.models import (
 from app.apps.arbitrage.inventory import get_base_balance, get_quote_balance
 from app.exchanges.factory import get_exchange_client
 from .opportunity_logger import OpportunityLogger
+from .pair_weight import get_pair_weight, update_pair_weight
 from .risk_manager import RiskManager
 from .trade_executor import TradeExecutor
 from .rebalancer import Rebalancer
@@ -128,7 +129,11 @@ class ArbitrageDetector:
         vwap_buy = cost / vol
         vwap_sell = rev / vol
         network_fee_quote = network_fee_base * vwap_buy
-        trade_pct = self.risk_manager.calculate_trade_percent(gross_gain, network_fee_quote, settings)
+        # Inside _process_direction, before computing trade_pct
+        weight = await get_pair_weight(db, buy_exch, sell_exch)
+        trade_pct = self.risk_manager.calculate_trade_percent(
+            gross_gain, network_fee_quote, settings, vol, weight
+        )
         if trade_pct <= 0:
             await self.logger.log_rejected_opportunity(
                 db, common_symbol, buy_exch, sell_exch, trade_type,
@@ -212,10 +217,12 @@ class ArbitrageDetector:
             traded_volume=actual_vol,
         )
         db.add(opp)
-
+        # After the trade is recorded (opp = ArbitrageOpportunity...), and after balance updates:
+        await update_pair_weight(db, buy_exch, sell_exch)
+        await db.commit()
         # Run rebalancing after trade
         await self.rebalancer.rebalance_symbol_if_needed(db, common_symbol, threshold_ratio=0.1)
-        await self.rebalancer.rebalance_quote_if_needed(db, quote_currency, threshold_ratio=0.1)
+        # await self.rebalancer.rebalance_quote_if_needed(db, quote_currency, threshold_ratio=0.1)
 
         logger.info(
             f"✅ Executed {actual_vol:.4f} {common_symbol} (risk {trade_pct:.1%} of max {vol:.4f}) "

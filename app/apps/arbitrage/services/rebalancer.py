@@ -112,7 +112,7 @@ class Rebalancer:
         poorest = min(balances, key=lambda x: x[1])
         richest = max(balances, key=lambda x: x[1])
 
-        transfer_amount = richest[1] * 0.75
+        transfer_amount = richest[1] * 0.8
         if transfer_amount <= 0:
             return
 

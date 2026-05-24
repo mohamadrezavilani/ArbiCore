@@ -6,7 +6,7 @@ from app.models.base import Base  # Import your declarative base
 # Import all models so that Base.metadata knows about them
 from app.apps.arbitrage.models import (
     Exchange, ExchangeSymbol, BaseInventory, QuoteInventory, ExchangeFee,
-    SymbolArbitrageSettings, Network
+    SymbolArbitrageSettings, Network, ExchangePairWeight
 )
 
 async def seed():
@@ -71,11 +71,11 @@ async def seed():
         # ========== 4. Inventories ==========
         for exchange in [wallex, nobitex, bitpin]:
             for sym in ["USDTIRT"]:
-                session.add(BaseInventory(exchange_id=exchange.id, common_symbol=sym, balance=10.0))
+                session.add(BaseInventory(exchange_id=exchange.id, common_symbol=sym, balance=1000.0))
 
         for exchange in [wallex, nobitex, bitpin]:
-            session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=10_000_000.0))
-            session.add(QuoteInventory(exchange_id=exchange.id, currency="USDT", balance=10.0))
+            session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=1_000_000_000.0))
+            # session.add(QuoteInventory(exchange_id=exchange.id, currency="USDT", balance=10.0))
 
         await session.commit()
         print("✅ Inventories created.")
@@ -93,6 +93,33 @@ async def seed():
             select(Network).where(Network.symbol == "USDTIRT", Network.network_name == "TRC20")
         )).scalar_one()
 
+        # ========== 7. Exchange Pair Weights ==========
+        exchange_list = [wallex, nobitex, bitpin]
+        for i in range(len(exchange_list)):
+            for j in range(i + 1, len(exchange_list)):
+                a = exchange_list[i]
+                b = exchange_list[j]
+                # Ensure canonical order: exchange_a_id < exchange_b_id
+                if a.id < b.id:
+                    pair = ExchangePairWeight(
+                        exchange_a_id=a.id,
+                        exchange_b_id=b.id,
+                        weight=0.5,
+                        last_buy_exchange_id=None,
+                        last_sell_exchange_id=None
+                    )
+                else:
+                    pair = ExchangePairWeight(
+                        exchange_a_id=b.id,
+                        exchange_b_id=a.id,
+                        weight=0.5,
+                        last_buy_exchange_id=None,
+                        last_sell_exchange_id=None
+                    )
+                session.add(pair)
+        await session.commit()
+        print("✅ Exchange pair weights initialized (0.5 each).")
+
         settings_rows = [
             SymbolArbitrageSettings(
                 common_symbol="USDTIRT",
@@ -103,7 +130,7 @@ async def seed():
                 valuability_factor=1.0,
                 default_network_id=trc20_network.id,
                 is_active=True,
-                opportunistic_rebalance_enabled=True,
+                opportunistic_rebalance_enabled=False,
                 opportunistic_rebalance_max_loss_percent=50.0
             ),
         ]

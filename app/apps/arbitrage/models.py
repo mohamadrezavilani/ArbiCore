@@ -1,7 +1,7 @@
 import uuid
 from typing import Optional
 import enum
-from sqlalchemy import String, Numeric, ForeignKey, JSON
+from sqlalchemy import String, Numeric, ForeignKey, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, UUIDMixin, TimestampMixin
 
@@ -120,3 +120,22 @@ class RebalanceLog(Base, UUIDMixin, TimestampMixin):
     network_fee: Mapped[float] = mapped_column(Numeric(20, 8))
     net_received: Mapped[float] = mapped_column(Numeric(20, 8))
     reason: Mapped[str] = mapped_column(String(200))   # e.g., "base_balance_below_threshold"
+
+class ExchangePairWeight(Base, UUIDMixin, TimestampMixin):
+    __tablename__ = "exchange_pair_weights"
+
+    exchange_a_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"), nullable=False)
+    exchange_b_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"), nullable=False)
+    weight: Mapped[float] = mapped_column(Numeric(3, 2), default=0.5)   # range 0.5 - 1.0
+    last_buy_exchange_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("exchanges.id"), nullable=True)
+    last_sell_exchange_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("exchanges.id"), nullable=True)
+
+    # relationships (optional, but useful)
+    exchange_a: Mapped["Exchange"] = relationship(foreign_keys=[exchange_a_id])
+    exchange_b: Mapped["Exchange"] = relationship(foreign_keys=[exchange_b_id])
+    last_buy_exchange: Mapped[Optional["Exchange"]] = relationship(foreign_keys=[last_buy_exchange_id])
+    last_sell_exchange: Mapped[Optional["Exchange"]] = relationship(foreign_keys=[last_sell_exchange_id])
+
+    __table_args__ = (
+        UniqueConstraint('exchange_a_id', 'exchange_b_id', name='uq_exchange_pair'),
+    )

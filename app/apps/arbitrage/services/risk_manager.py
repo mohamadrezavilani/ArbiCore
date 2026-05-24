@@ -1,13 +1,19 @@
+import logging
 from app.apps.arbitrage.models import SymbolArbitrageSettings
+
 
 class RiskManager:
     @staticmethod
     def calculate_trade_percent(
         net_gain: float,
         network_commission_quote: float,
-        params: SymbolArbitrageSettings
+        params: SymbolArbitrageSettings,
+        vol: float,
+        weight: float = 1.0
     ) -> float:
-        cutoff = float(params.cutoff_threshold)
+        base_cutoff = float((vol * 1700000 * 0.7) / 800)   # your original formula
+        cutoff = base_cutoff * weight
+        logging.info(f"base_cutoff: {base_cutoff} = cutoff: {cutoff} * weight: {weight}")
         min_trade_pct = float(params.min_trade_percent)
         min_trade_factor = float(params.min_trade_factor)
         valuability_factor = float(params.valuability_factor)

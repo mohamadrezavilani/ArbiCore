@@ -113,7 +113,7 @@ async def get_realized_profit(
             )
             avg_price = (await db.execute(price_stmt)).scalar()
             if avg_price:
-                network_fees_base_converted += row.network_fee * float(avg_price)
+                network_fees_base_converted += float(row.network_fee) * float(avg_price)
             else:
                 # Fallback: last known price
                 last_price_stmt = select(OrderbookSnapshot.best_bid_price).join(
@@ -128,7 +128,7 @@ async def get_realized_profit(
                     network_fees_base_converted += row.network_fee * 50000  # fallback rate
 
     total_network_fees = network_fees_quote + network_fees_base_converted
-    net_profit = trade_profit - total_network_fees
+    net_profit = float(trade_profit) - float(total_network_fees)
 
     return {
         "currency": currency,
