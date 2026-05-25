@@ -8,6 +8,7 @@ Write-Host "🚀 Deploying code to server..." -ForegroundColor Cyan
 scp -r -o "Compression=yes" `
     *.py `
     requirements.txt `
+    index.html `
     pyproject.toml `
     app/ `
     tests/ `
