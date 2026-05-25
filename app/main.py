@@ -9,6 +9,7 @@ from app.core.logging import setup_logging
 from app.apps.arbitrage.api import router as arbitrage_router
 from app.apps.arbitrage.tasks import periodic_arbitrage_poll
 from app.apps.arbitrage.seed_data import seed
+from fastapi.responses import HTMLResponse
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -65,10 +66,10 @@ def create_app() -> FastAPI:
         tags=["arbitrage"]
     )
 
-    @app.get("/")
-    async def root():
-        return {"message": f"Welcome to {settings.APP_NAME}"}
-
+    @app.get("/", response_class=HTMLResponse)
+    async def get_root():
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
     return app
 
 
