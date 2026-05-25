@@ -190,6 +190,7 @@ class BitpinClient(ExchangeClient):
                     resp.raise_for_status()
                     return await resp.json()
         except Exception:
+            logging.info('bitpin failed')
             return None
 
     def extract_levels(self, raw_orderbook: Dict[str, Any]) -> Tuple[List[List[float]], List[List[float]]]:
