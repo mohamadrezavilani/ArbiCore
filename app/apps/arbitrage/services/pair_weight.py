@@ -61,10 +61,10 @@ async def update_pair_weight(db: AsyncSession, buy_exchange: str, sell_exchange:
     last_sell = pair.last_sell_exchange_id
     if last_buy == buy_id and last_sell == sell_id:
         # Same direction as last trade → increase weight (max 1.0)
-        new_weight = min(pair.weight + 0.1, 1.0)
+        new_weight = min(float(pair.weight) + 0.1, 1.0)
     else:
         # Opposite direction → decrease weight (min 0.5)
-        new_weight = max(pair.weight - 0.1, 0.5)
+        new_weight = max(float(pair.weight) - 0.1, 0.5)
 
     pair.weight = new_weight
     pair.last_buy_exchange_id = buy_id

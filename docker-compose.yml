@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   db:
     image: postgres:17
@@ -10,6 +12,37 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: arbicore_app
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:12345@db:5432/arbicore
+      # Add any other environment variables from .env that are needed
+      - WALLEX_API_KEY=${WALLEX_API_KEY}
+      - WALLEX_API_SECRET=${WALLEX_API_SECRET}
+      - NOBITEX_API_KEY=${NOBITEX_API_KEY}
+      - NOBITEX_API_SECRET=${NOBITEX_API_SECRET}
+      - BITPIN_API_KEY=${BITPIN_API_KEY}
+      - BITPIN_API_SECRET=${BITPIN_API_SECRET}
+      - SECRET_KEY=${SECRET_KEY}
+      - DEBUG=${DEBUG:-false}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+    env_file:
+      - .env   # optional: loads all variables from .env (overrides above if duplicates)
+    volumes:
+      - ./app:/app/app   # optional: for live code reload during development (remove in production)
+    restart: unless-stopped
 
 volumes:
   postgres_data:

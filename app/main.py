@@ -1,13 +1,14 @@
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware          # <-- added import
 from app.core.config import settings
 from app.core.database import engine
 from app.core.handlers import register_exception_handlers
 from app.core.logging import setup_logging
 from app.apps.arbitrage.api import router as arbitrage_router
 from app.apps.arbitrage.tasks import periodic_arbitrage_poll
-from app.apps.arbitrage.seed_data import seed   # import seed function
+from app.apps.arbitrage.seed_data import seed
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -44,6 +45,17 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # ========== CORS MIDDLEWARE – ALLOWS ANY ORIGIN ==========
+    # Use this only for development. For production, replace "*" with your actual frontend domains.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],           # Allows requests from any origin
+        allow_credentials=False,       # Must be False when allow_origins=["*"]
+        allow_methods=["*"],           # Allows all HTTP methods (GET, POST, PUT, DELETE, OPTIONS, etc.)
+        allow_headers=["*"],           # Allows all headers
+    )
+    # =========================================================
 
     register_exception_handlers(app)
 
