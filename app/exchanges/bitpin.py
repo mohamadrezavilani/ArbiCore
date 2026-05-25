@@ -1,3 +1,5 @@
+import logging
+
 import aiohttp
 import asyncio
 import time
@@ -80,6 +82,7 @@ class BitpinClient(ExchangeClient):
                     balances[asset] = balance
             return balances
         except Exception as e:
+            logging.info('bitpin failed')
             return {}
 
     async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str) -> OrderResult:
