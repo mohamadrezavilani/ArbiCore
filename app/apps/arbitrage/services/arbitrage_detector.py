@@ -129,7 +129,6 @@ class ArbitrageDetector:
         vwap_buy = cost / vol
         vwap_sell = rev / vol
         network_fee_quote = network_fee_base * vwap_buy
-        # Inside _process_direction, before computing trade_pct
         weight = await get_pair_weight(db, buy_exch, sell_exch)
         trade_pct = self.risk_manager.calculate_trade_percent(
             gross_gain, network_fee_quote, settings, vol, weight
@@ -162,6 +161,28 @@ class ArbitrageDetector:
                 {"gross_profit_pct": gross_profit_pct, "min_profit_percent": min_profit}
             )
             return
+
+        # ========== PRE‑EXECUTION BALANCE VALIDATION ==========
+        # 1. Check buyer's quote balance
+        buyer_quote_balance = await get_quote_balance(db, buy_exch, quote_currency)
+        if actual_cost > buyer_quote_balance + 1e-6:  # allow tiny floating error
+            await self.logger.log_rejected_opportunity(
+                db, common_symbol, buy_exch, sell_exch, trade_type,
+                f"Insufficient {quote_currency} on {buy_exch}: need {actual_cost:.2f}, have {buyer_quote_balance:.2f}",
+                {"actual_cost": actual_cost, "balance": buyer_quote_balance}
+            )
+            return
+
+        # 2. Check seller's base balance
+        seller_base_balance = await get_base_balance(db, sell_exch, common_symbol)
+        if actual_vol > seller_base_balance + 1e-6:
+            await self.logger.log_rejected_opportunity(
+                db, common_symbol, buy_exch, sell_exch, trade_type,
+                f"Insufficient {common_symbol} on {sell_exch}: need {actual_vol:.4f}, have {seller_base_balance:.4f}",
+                {"actual_vol": actual_vol, "balance": seller_base_balance}
+            )
+            return
+        # =====================================================
 
         # Execute trade
         buy_client = get_exchange_client(buy_exch)
@@ -217,7 +238,6 @@ class ArbitrageDetector:
             traded_volume=actual_vol,
         )
         db.add(opp)
-        # After the trade is recorded (opp = ArbitrageOpportunity...), and after balance updates:
         await update_pair_weight(db, buy_exch, sell_exch)
         await db.commit()
         # Run rebalancing after trade
