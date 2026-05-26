@@ -87,7 +87,8 @@ class ArbitrageDetector:
                         db, common_symbol, quote_currency,
                         name_a, a_asks, name_b, b_bids,
                         await get_taker_fee(name_a), await get_taker_fee(name_b),
-                        settings, network_fee_base
+                        settings, network_fee_base,
+                        exchange_orderbooks  # <-- pass for rebalancing
                     )
                 # Direction B -> A: buy on B, sell on A
                 if b_asks and a_bids:
@@ -95,7 +96,8 @@ class ArbitrageDetector:
                         db, common_symbol, quote_currency,
                         name_b, b_asks, name_a, a_bids,
                         await get_taker_fee(name_b), await get_taker_fee(name_a),
-                        settings, network_fee_base
+                        settings, network_fee_base,
+                        exchange_orderbooks
                     )
 
     async def _process_direction(
@@ -110,7 +112,8 @@ class ArbitrageDetector:
         buy_fee: float,
         sell_fee: float,
         settings: SymbolArbitrageSettings,
-        network_fee_base: float
+        network_fee_base: float,
+        exchange_orderbooks: Dict[str, Tuple[List[List[float]], List[List[float]]]]  # new
     ):
         # Compute max trade volume, cost, revenue
         vol, cost, rev, gross_gain, reason = await self._compute_max_trade(
@@ -165,7 +168,7 @@ class ArbitrageDetector:
         # ========== PRE‑EXECUTION BALANCE VALIDATION ==========
         # 1. Check buyer's quote balance
         buyer_quote_balance = await get_quote_balance(db, buy_exch, quote_currency)
-        if actual_cost > buyer_quote_balance + 1e-6:  # allow tiny floating error
+        if actual_cost > buyer_quote_balance + 1e-6:
             await self.logger.log_rejected_opportunity(
                 db, common_symbol, buy_exch, sell_exch, trade_type,
                 f"Insufficient {quote_currency} on {buy_exch}: need {actual_cost:.2f}, have {buyer_quote_balance:.2f}",
@@ -240,9 +243,10 @@ class ArbitrageDetector:
         db.add(opp)
         await update_pair_weight(db, buy_exch, sell_exch)
         await db.commit()
-        # Run rebalancing after trade
-        await self.rebalancer.rebalance_symbol_if_needed(db, common_symbol, threshold_ratio=0.1)
-        # await self.rebalancer.rebalance_quote_if_needed(db, quote_currency, threshold_ratio=0.1)
+
+        # ========== MARKET‑BASED REBALANCING ==========
+        # Rebalance using actual trades if necessary (now passes quote_currency and orderbooks)
+        _, _ = await self.rebalancer.rebalance_symbol_if_needed(db, common_symbol, quote_currency, exchange_orderbooks)
 
         logger.info(
             f"✅ Executed {actual_vol:.4f} {common_symbol} (risk {trade_pct:.1%} of max {vol:.4f}) "

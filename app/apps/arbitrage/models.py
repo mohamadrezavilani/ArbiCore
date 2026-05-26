@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 from typing import Optional
 import enum
 from sqlalchemy import String, Numeric, ForeignKey, JSON, UniqueConstraint
@@ -98,6 +99,14 @@ class SymbolArbitrageSettings(Base, UUIDMixin, TimestampMixin):
 
     opportunistic_rebalance_enabled: Mapped[bool] = mapped_column(default=False)
     opportunistic_rebalance_max_loss_percent: Mapped[float] = mapped_column(Numeric(10, 6), default=0.5)
+
+    # Market rebalancing (trades, not transfers)
+    market_rebalance_enabled: Mapped[bool] = mapped_column(default=True)
+    market_rebalance_amount_percent: Mapped[float] = mapped_column(Numeric(5,2), default=20.0)   # % of avg base balance
+    market_rebalance_max_spread_percent: Mapped[float] = mapped_column(Numeric(5,2), default=0.1) # max price diff %
+    market_rebalance_imbalance_ratio: Mapped[float] = mapped_column(Numeric(5,2), default=0.2)    # trigger when min < ratio * avg
+    market_rebalance_cooldown_seconds: Mapped[int] = mapped_column(default=300)                   # 5 minutes
+    last_rebalance_time: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
 class RejectedOpportunity(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "rejected_opportunities"

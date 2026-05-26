@@ -7,8 +7,8 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "production"
     API_V1_PREFIX: str = "/api/v1"
 
-    # Database - use str to allow any valid SQLAlchemy URL
-    DATABASE_URL: str = Field(..., description="PostgreSQL async URL (e.g., postgresql+asyncpg://...)")
+    # Database
+    DATABASE_URL: str = Field(..., description="PostgreSQL async URL")
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
 
@@ -21,12 +21,16 @@ class Settings(BaseSettings):
     ARBITRAGE_CHECK_INTERVAL_SECONDS: int = 10
     ARBITRAGE_MIN_PROFIT_PERCENT: float = 0.5
 
+    # Exchange API keys
     WALLEX_API_KEY: str = ""
     WALLEX_API_SECRET: str = ""
     NOBITEX_API_KEY: str = ""
     NOBITEX_API_SECRET: str = ""
     BITPIN_API_KEY: str = ""
     BITPIN_API_SECRET: str = ""
+
+    # Timezone (for display purposes)
+    TIMEZONE: str = "Asia/Tehran"
 
     class Config:
         env_file = ".env"

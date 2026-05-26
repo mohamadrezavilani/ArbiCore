@@ -71,10 +71,10 @@ async def seed():
         # ========== 4. Inventories ==========
         for exchange in [wallex, nobitex, bitpin]:
             for sym in ["USDTIRT"]:
-                session.add(BaseInventory(exchange_id=exchange.id, common_symbol=sym, balance=1000.0))
+                session.add(BaseInventory(exchange_id=exchange.id, common_symbol=sym, balance=100.0))
 
         for exchange in [wallex, nobitex, bitpin]:
-            session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=1_000_000_000.0))
+            session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=100_000_000.0))
             # session.add(QuoteInventory(exchange_id=exchange.id, currency="USDT", balance=10.0))
 
         await session.commit()
@@ -131,8 +131,15 @@ async def seed():
                 default_network_id=trc20_network.id,
                 is_active=True,
                 opportunistic_rebalance_enabled=False,
-                opportunistic_rebalance_max_loss_percent=50.0
-            ),
+                opportunistic_rebalance_max_loss_percent=50.0,
+                # New fields
+                market_rebalance_enabled=True,
+                market_rebalance_amount_percent=20.0,
+                market_rebalance_max_spread_percent=0.7,
+                market_rebalance_imbalance_ratio=0.2,
+                market_rebalance_cooldown_seconds=300,
+                last_rebalance_time=None
+            )
         ]
         session.add_all(settings_rows)
         await session.commit()

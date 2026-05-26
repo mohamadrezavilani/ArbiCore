@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from app.core.config import settings
 from app.exchanges.base import ExchangeClient, OrderResult
 
+
 class BitpinClient(ExchangeClient):
     def __init__(self):
         self.logger = logging.getLogger(__name__)
@@ -16,35 +17,35 @@ class BitpinClient(ExchangeClient):
         self.refresh_token = None
         self.token_expiry = 0
         self.base_url = "https://api.bitpin.ir"
-        self.session: Optional[aiohttp.ClientSession] = None
-        self._timeout = aiohttp.ClientTimeout(total=30)
+        # No persistent session, no timeout
 
     async def _ensure_token(self):
-        """Obtain or refresh access token. Logs errors on failure."""
+        """Obtain or refresh access token. Creates its own session."""
         if self.access_token and time.time() < self.token_expiry:
             return
-        if self.refresh_token:
-            try:
-                url = f"{self.base_url}/api/v1/usr/refresh_token/"
-                payload = {"refresh": self.refresh_token}
-                async with self.session.post(url, json=payload, timeout=self._timeout) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        self.access_token = data.get("access")
-                        self.token_expiry = time.time() + 900
-                        return
-                    else:
-                        self.logger.warning(f"Refresh token failed with status {resp.status}, clearing refresh_token")
-                        self.refresh_token = None
-            except Exception as e:
-                self.logger.exception("Exception during token refresh")
-                self.refresh_token = None
 
-        # Authenticate from scratch
-        url = f"{self.base_url}/api/v1/usr/authenticate/"
-        payload = {"api_key": self.api_key, "secret_key": self.secret_key}
-        try:
-            async with self.session.post(url, json=payload, timeout=self._timeout) as resp:
+        async with aiohttp.ClientSession() as session:
+            if self.refresh_token:
+                try:
+                    url = f"{self.base_url}/api/v1/usr/refresh_token/"
+                    payload = {"refresh": self.refresh_token}
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            self.access_token = data.get("access")
+                            self.token_expiry = time.time() + 900
+                            return
+                        else:
+                            self.logger.warning(f"Refresh token failed, clearing")
+                            self.refresh_token = None
+                except Exception:
+                    self.logger.exception("Token refresh exception")
+                    self.refresh_token = None
+
+            # Authenticate from scratch
+            url = f"{self.base_url}/api/v1/usr/authenticate/"
+            payload = {"api_key": self.api_key, "secret_key": self.secret_key}
+            async with session.post(url, json=payload) as resp:
                 if resp.status != 200:
                     text = await resp.text()
                     raise Exception(f"Bitpin login failed: {resp.status} {text}")
@@ -52,44 +53,23 @@ class BitpinClient(ExchangeClient):
                 self.access_token = data.get("access")
                 self.refresh_token = data.get("refresh")
                 self.token_expiry = time.time() + 900
-        except Exception:
-            self.logger.exception("Authentication failed")
-            raise
 
     async def _request(self, method: str, path: str, json_data: Optional[Dict] = None) -> Any:
-        """Make an authenticated request. Logs and retries token refresh on 401/403."""
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        try:
-            await self._ensure_token()
-            headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
-            url = f"{self.base_url}{path}"
-            async with self.session.request(method, url, headers=headers, json=json_data,
-                                            timeout=self._timeout) as resp:
+        """Make an authenticated request. Creates its own session."""
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
+        url = f"{self.base_url}{path}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.request(method, url, headers=headers, json=json_data) as resp:
                 if resp.status == 204:
                     return None
                 if resp.status != 200:
                     text = await resp.text()
                     raise Exception(f"Bitpin API error {resp.status}: {text}")
                 return await resp.json()
-        except aiohttp.ClientError as e:
-            self.logger.exception(f"Network error during {method} {path}")
-            raise
-        except asyncio.TimeoutError:
-            self.logger.error(f"Timeout during {method} {path}")
-            raise
-        except Exception as e:
-            # If unauthorised, retry once after clearing token
-            if "401" in str(e) or "403" in str(e):
-                self.logger.warning(f"Auth error, retrying after token reset: {e}")
-                self.access_token = None
-                await self._ensure_token()
-                return await self._request(method, path, json_data)
-            self.logger.exception(f"Unexpected error in {method} {path}")
-            raise
 
     async def get_balances(self) -> Dict[str, float]:
-        """Fetch wallet balances. Returns dict on success, {} on error (after logging)."""
         try:
             data = await self._request("GET", "/api/v1/wlt/wallets/")
             balances = {}
@@ -108,9 +88,7 @@ class BitpinClient(ExchangeClient):
             return {}
 
     async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str) -> OrderResult:
-        """Place a market order (implemented as limit at best price)."""
         try:
-            # Fetch orderbook to get best price
             ob_data = await self._request("GET", f"/api/v1/mth/orderbook/{symbol}/")
             if side.lower() == "buy":
                 best_price = float(ob_data["asks"][0][0])
@@ -140,7 +118,7 @@ class BitpinClient(ExchangeClient):
                 raw_response=response
             )
         except Exception:
-            self.logger.exception(f"Failed to place {side} order for {amount} {symbol}")
+            self.logger.exception(f"Failed to place {side} order")
             return OrderResult(
                 order_id="",
                 client_order_id=client_order_id,
@@ -152,7 +130,6 @@ class BitpinClient(ExchangeClient):
             )
 
     async def order_status(self, client_order_id: str) -> OrderResult:
-        """Check order status by client_order_id."""
         try:
             response = await self._request("GET", f"/api/v1/odr/orders/identifier/{client_order_id}/")
             state = response.get("state", "").lower()
@@ -176,7 +153,6 @@ class BitpinClient(ExchangeClient):
             )
         except Exception as e:
             if "404" in str(e):
-                self.logger.warning(f"Order {client_order_id} not found (assumed cancelled)")
                 return OrderResult(
                     order_id="",
                     client_order_id=client_order_id,
@@ -198,13 +174,11 @@ class BitpinClient(ExchangeClient):
             )
 
     async def cancel_order(self, client_order_id: str) -> bool:
-        """Cancel an order by client_order_id. Returns True if cancelled or already gone."""
         try:
             await self._request("DELETE", f"/api/v1/odr/orders/identifier/{client_order_id}/")
             return True
         except Exception as e:
             if "404" in str(e) or "406" in str(e):
-                self.logger.warning(f"Order {client_order_id} already cancelled or not found")
                 return True
             self.logger.exception(f"Failed to cancel order {client_order_id}")
             return False
@@ -213,13 +187,16 @@ class BitpinClient(ExchangeClient):
         raise NotImplementedError("Withdraw not implemented for Bitpin")
 
     async def fetch_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Fetch raw orderbook for a symbol. Returns None on error (after logging)."""
+        """Fetch raw orderbook – creates its own session, no timeout, no retry."""
         url = f"{self.base_url}/api/v1/mth/orderbook/{symbol}/"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=self._timeout) as resp:
+                async with session.get(url) as resp:
                     resp.raise_for_status()
                     return await resp.json()
+        except aiohttp.ClientConnectorDNSError as e:
+            self.logger.error(f"DNS error for {symbol}: {e}")
+            return None
         except Exception:
             self.logger.exception(f"Failed to fetch orderbook for {symbol}")
             return None
