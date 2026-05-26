@@ -1,9 +1,9 @@
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from typing import Dict, List, Tuple
 from app.apps.arbitrage.models import (
-    Exchange, ExchangeFee, SymbolArbitrageSettings, Network, ArbitrageOpportunity
+    Exchange, ExchangeFee, SymbolArbitrageSettings, Network, ArbitrageOpportunity, QuoteInventory, BaseInventory
 )
 from app.apps.arbitrage.inventory import get_base_balance, get_quote_balance
 from app.exchanges.factory import get_exchange_client
@@ -14,6 +14,16 @@ from .trade_executor import TradeExecutor
 from .rebalancer import Rebalancer
 
 logger = logging.getLogger(__name__)
+
+async def get_max_base_pool(db: AsyncSession, common_symbol: str) -> float:
+    """Return the maximum base inventory balance for a common symbol across active exchanges."""
+    stmt = select(func.max(BaseInventory.balance)).join(Exchange).where(
+        BaseInventory.common_symbol == common_symbol,
+        Exchange.is_active == True
+    )
+    result = await db.execute(stmt)
+    max_bal = result.scalar()
+    return float(max_bal) if max_bal else 0.0
 
 class ArbitrageDetector:
     def __init__(
@@ -88,7 +98,7 @@ class ArbitrageDetector:
                         name_a, a_asks, name_b, b_bids,
                         await get_taker_fee(name_a), await get_taker_fee(name_b),
                         settings, network_fee_base,
-                        exchange_orderbooks  # <-- pass for rebalancing
+                        exchange_orderbooks
                     )
                 # Direction B -> A: buy on B, sell on A
                 if b_asks and a_bids:
@@ -113,7 +123,7 @@ class ArbitrageDetector:
         sell_fee: float,
         settings: SymbolArbitrageSettings,
         network_fee_base: float,
-        exchange_orderbooks: Dict[str, Tuple[List[List[float]], List[List[float]]]]  # new
+        exchange_orderbooks: Dict[str, Tuple[List[List[float]], List[List[float]]]]
     ):
         # Compute max trade volume, cost, revenue
         vol, cost, rev, gross_gain, reason = await self._compute_max_trade(
@@ -133,8 +143,20 @@ class ArbitrageDetector:
         vwap_sell = rev / vol
         network_fee_quote = network_fee_base * vwap_buy
         weight = await get_pair_weight(db, buy_exch, sell_exch)
+
+        # Get dynamic values for risk manager
+        current_price = vwap_buy
+        max_base_pool = await get_max_base_pool(db, common_symbol)   # <-- corrected
+
         trade_pct = self.risk_manager.calculate_trade_percent(
-            gross_gain, network_fee_quote, settings, vol, weight
+            net_gain=gross_gain,
+            network_commission_quote=network_fee_quote,
+            params=settings,
+            vol=vol,
+            weight=weight,
+            current_price=current_price,
+            network_fee_base=network_fee_base,
+            max_base_pool=max_base_pool      # <-- parameter name matches risk_manager
         )
         if trade_pct <= 0:
             await self.logger.log_rejected_opportunity(
@@ -165,8 +187,7 @@ class ArbitrageDetector:
             )
             return
 
-        # ========== PRE‑EXECUTION BALANCE VALIDATION ==========
-        # 1. Check buyer's quote balance
+        # Pre‑execution balance checks
         buyer_quote_balance = await get_quote_balance(db, buy_exch, quote_currency)
         if actual_cost > buyer_quote_balance + 1e-6:
             await self.logger.log_rejected_opportunity(
@@ -176,7 +197,6 @@ class ArbitrageDetector:
             )
             return
 
-        # 2. Check seller's base balance
         seller_base_balance = await get_base_balance(db, sell_exch, common_symbol)
         if actual_vol > seller_base_balance + 1e-6:
             await self.logger.log_rejected_opportunity(
@@ -185,9 +205,8 @@ class ArbitrageDetector:
                 {"actual_vol": actual_vol, "balance": seller_base_balance}
             )
             return
-        # =====================================================
 
-        # Execute trade
+        # Create clients and exchange objects
         buy_client = get_exchange_client(buy_exch)
         sell_client = get_exchange_client(sell_exch)
         if not buy_client or not sell_client:
@@ -203,7 +222,7 @@ class ArbitrageDetector:
         if not exch_a_obj or not exch_b_obj:
             return
 
-        # Determine if live or simulator
+        # Determine live mode
         buy_mode = (await db.execute(select(Exchange.mode).where(Exchange.name == buy_exch))).scalar_one_or_none()
         sell_mode = (await db.execute(select(Exchange.mode).where(Exchange.name == sell_exch))).scalar_one_or_none()
         is_live = (buy_mode == "live" and sell_mode == "live")
@@ -215,13 +234,11 @@ class ArbitrageDetector:
             )
             if not success:
                 return
-            # Use actual filled volume and prices
             actual_vol = filled_vol
             actual_cost = actual_vol * final_vwap_buy
             actual_rev = actual_vol * final_vwap_sell
             gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
         else:
-            # Simulator: just update balances directly
             await self.trade_executor.update_balances_simulator(
                 db, buy_exch, sell_exch, common_symbol, quote_currency,
                 actual_vol, actual_cost, actual_rev
@@ -229,7 +246,7 @@ class ArbitrageDetector:
             final_vwap_buy = vwap_buy
             final_vwap_sell = vwap_sell
 
-        # Record successful opportunity
+        # Record opportunity
         opp = ArbitrageOpportunity(
             common_symbol=common_symbol,
             exchange_a_id=exch_a_obj.id,
@@ -244,9 +261,10 @@ class ArbitrageDetector:
         await update_pair_weight(db, buy_exch, sell_exch)
         await db.commit()
 
-        # ========== MARKET‑BASED REBALANCING ==========
-        # Rebalance using actual trades if necessary (now passes quote_currency and orderbooks)
-        _, _ = await self.rebalancer.rebalance_symbol_if_needed(db, common_symbol, quote_currency, exchange_orderbooks)
+        # Rebalance
+        await self.rebalancer.rebalance_symbol_if_needed(
+            db, common_symbol, quote_currency, exchange_orderbooks
+        )
 
         logger.info(
             f"✅ Executed {actual_vol:.4f} {common_symbol} (risk {trade_pct:.1%} of max {vol:.4f}) "
