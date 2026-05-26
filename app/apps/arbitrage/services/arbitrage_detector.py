@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import Dict, List, Tuple
 from app.apps.arbitrage.models import (
-    Exchange, ExchangeFee, SymbolArbitrageSettings, Network, ArbitrageOpportunity, QuoteInventory, BaseInventory
+    Exchange, ExchangeFee, SymbolArbitrageSettings, Network, ArbitrageOpportunity, BaseInventory
 )
 from app.apps.arbitrage.inventory import get_base_balance, get_quote_balance
 from app.exchanges.factory import get_exchange_client
@@ -146,7 +146,7 @@ class ArbitrageDetector:
 
         # Get dynamic values for risk manager
         current_price = vwap_buy
-        max_base_pool = await get_max_base_pool(db, common_symbol)   # <-- corrected
+        max_base_pool = await get_max_base_pool(db, common_symbol)
 
         trade_pct = self.risk_manager.calculate_trade_percent(
             net_gain=gross_gain,
@@ -156,7 +156,7 @@ class ArbitrageDetector:
             weight=weight,
             current_price=current_price,
             network_fee_base=network_fee_base,
-            max_base_pool=max_base_pool      # <-- parameter name matches risk_manager
+            max_base_pool=max_base_pool
         )
         if trade_pct <= 0:
             await self.logger.log_rejected_opportunity(
@@ -230,7 +230,8 @@ class ArbitrageDetector:
         if is_live:
             success, filled_vol, final_vwap_buy, final_vwap_sell = await self.trade_executor.execute(
                 db, common_symbol, buy_exch, sell_exch, actual_vol, quote_currency,
-                buy_client, sell_client, exch_a_obj, exch_b_obj, buy_fee, sell_fee
+                buy_client, sell_client, exch_a_obj, exch_b_obj, buy_fee, sell_fee,
+                vwap_buy=None, vwap_sell=None  # live mode doesn't need pre‑computed VWAP
             )
             if not success:
                 return
@@ -239,6 +240,7 @@ class ArbitrageDetector:
             actual_rev = actual_vol * final_vwap_sell
             gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
         else:
+            # Simulator mode: use the legacy method that directly updates balances
             await self.trade_executor.update_balances_simulator(
                 db, buy_exch, sell_exch, common_symbol, quote_currency,
                 actual_vol, actual_cost, actual_rev

@@ -149,37 +149,97 @@ class Rebalancer:
             logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
-        # 6. Execute trade using the unified trade executor
-        # Create exchange clients (even for simulator, the executor handles it)
-        buy_client = get_exchange_client(poorest[0])
-        sell_client = get_exchange_client(richest[0])
-        if not buy_client or not sell_client:
-            reason = f"Client creation failed for {poorest[0]} or {richest[0]}"
-            logger.error(f"[REBALANCE] {reason}")
-            return False, reason
+        # 6. Execute trade – decide based on mode
+        mode_richest = exchange_modes.get(richest[0], "simulator")
+        mode_poorest = exchange_modes.get(poorest[0], "simulator")
+        is_live = (mode_richest == "live" and mode_poorest == "live")
 
-        exch_poorest = (await db.execute(select(Exchange).where(Exchange.name == poorest[0]))).scalar_one_or_none()
-        exch_richest = (await db.execute(select(Exchange).where(Exchange.name == richest[0]))).scalar_one_or_none()
-        if not exch_poorest or not exch_richest:
-            reason = f"Exchange objects not found for {poorest[0]} or {richest[0]}"
-            logger.error(f"[REBALANCE] {reason}")
-            return False, reason
+        if not is_live:
+            # Simulator mode: directly call the trade executor with simulator parameters
+            logger.info(f"[REBALANCE] Simulator mode: executing rebalance via TradeExecutor (no live APIs)")
+            # We need fees for simulation. Fetch from exchange_fees table.
+            from app.apps.arbitrage.models import ExchangeFee
+            buy_fee = 0.0
+            sell_fee = 0.0
+            fee_stmt = select(ExchangeFee.taker_fee).join(Exchange).where(
+                Exchange.name == poorest[0],
+                ExchangeFee.quote_currency == quote_currency
+            )
+            fee_res = await db.execute(fee_stmt)
+            buy_fee = float(fee_res.scalar() or 0.0)
+            fee_stmt = select(ExchangeFee.taker_fee).join(Exchange).where(
+                Exchange.name == richest[0],
+                ExchangeFee.quote_currency == quote_currency
+            )
+            fee_res = await db.execute(fee_stmt)
+            sell_fee = float(fee_res.scalar() or 0.0)
 
-        logger.info(f"[REBALANCE] Executing rebalance via TradeExecutor (will auto-detect simulator/live)")
-        success, filled_vol, vwap_buy, vwap_sell = await self.trade_executor.execute(
-            db=db,
-            common_symbol=common_symbol,
-            buy_exchange=poorest[0],
-            sell_exchange=richest[0],
-            volume=target_amount,
-            quote_currency=quote_currency,
-            buy_client=buy_client,
-            sell_client=sell_client,
-            buy_exch_obj=exch_poorest,
-            sell_exch_obj=exch_richest,
-            buy_fee_rate=0.0,   # fees will be fetched inside executor from ExchangeFee table
-            sell_fee_rate=0.0
-        )
+            success, filled_vol, vwap_buy, vwap_sell = await self.trade_executor.execute(
+                db=db,
+                common_symbol=common_symbol,
+                buy_exchange=poorest[0],
+                sell_exchange=richest[0],
+                volume=target_amount,
+                quote_currency=quote_currency,
+                buy_client=None,
+                sell_client=None,
+                buy_exch_obj=None,
+                sell_exch_obj=None,
+                buy_fee_rate=buy_fee,
+                sell_fee_rate=sell_fee,
+                vwap_buy=buy_price,
+                vwap_sell=sell_price
+            )
+        else:
+            # Live mode: create real clients and execute
+            buy_client = get_exchange_client(poorest[0])
+            sell_client = get_exchange_client(richest[0])
+            if not buy_client or not sell_client:
+                reason = f"Client creation failed for {poorest[0]} or {richest[0]}"
+                logger.error(f"[REBALANCE] {reason}")
+                return False, reason
+
+            exch_poorest = (await db.execute(select(Exchange).where(Exchange.name == poorest[0]))).scalar_one_or_none()
+            exch_richest = (await db.execute(select(Exchange).where(Exchange.name == richest[0]))).scalar_one_or_none()
+            if not exch_poorest or not exch_richest:
+                reason = f"Exchange objects not found for {poorest[0]} or {richest[0]}"
+                logger.error(f"[REBALANCE] {reason}")
+                return False, reason
+
+            # Fetch fees for live mode (though executor will also fetch, but pass anyway)
+            from app.apps.arbitrage.models import ExchangeFee
+            buy_fee = 0.0
+            sell_fee = 0.0
+            fee_stmt = select(ExchangeFee.taker_fee).join(Exchange).where(
+                Exchange.name == poorest[0],
+                ExchangeFee.quote_currency == quote_currency
+            )
+            fee_res = await db.execute(fee_stmt)
+            buy_fee = float(fee_res.scalar() or 0.0)
+            fee_stmt = select(ExchangeFee.taker_fee).join(Exchange).where(
+                Exchange.name == richest[0],
+                ExchangeFee.quote_currency == quote_currency
+            )
+            fee_res = await db.execute(fee_stmt)
+            sell_fee = float(fee_res.scalar() or 0.0)
+
+            logger.info(f"[REBALANCE] Live mode: executing rebalance via TradeExecutor")
+            success, filled_vol, vwap_buy, vwap_sell = await self.trade_executor.execute(
+                db=db,
+                common_symbol=common_symbol,
+                buy_exchange=poorest[0],
+                sell_exchange=richest[0],
+                volume=target_amount,
+                quote_currency=quote_currency,
+                buy_client=buy_client,
+                sell_client=sell_client,
+                buy_exch_obj=exch_poorest,
+                sell_exch_obj=exch_richest,
+                buy_fee_rate=buy_fee,
+                sell_fee_rate=sell_fee,
+                vwap_buy=None,   # not needed for live
+                vwap_sell=None
+            )
 
         if not success:
             reason = "Trade execution failed (see logs for details)"
@@ -194,7 +254,7 @@ class Rebalancer:
             from_exch=richest[0],
             to_exch=poorest[0],
             amount_sent=filled_vol,
-            fee=0.0,  # fees are already accounted in the trade executor's balance updates
+            fee=0.0,
             net=filled_vol,
             reason=f"market_rebalance_{common_symbol}_imbalance_{imbalance_ratio}"
         )

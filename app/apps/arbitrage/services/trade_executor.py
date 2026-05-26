@@ -4,7 +4,6 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Tuple, Optional
-from app.core.config import settings
 from app.apps.arbitrage.models import Exchange, ExchangeSymbol
 from app.apps.arbitrage.inventory import (
     update_base_balance, update_quote_balance, set_base_balance, set_quote_balance
@@ -40,18 +39,20 @@ class TradeExecutor:
         sell_exchange: str,
         volume: float,
         quote_currency: str,
-        buy_client,
-        sell_client,
+        buy_client,      # can be None in simulator mode
+        sell_client,     # can be None in simulator mode
         buy_exch_obj,
         sell_exch_obj,
         buy_fee_rate: float = 0.0,
-        sell_fee_rate: float = 0.0
+        sell_fee_rate: float = 0.0,
+        vwap_buy: Optional[float] = None,   # for simulator: pre‑computed VWAP buy price
+        vwap_sell: Optional[float] = None   # for simulator: pre‑computed VWAP sell price
     ) -> Tuple[bool, float, float, float]:
         """
         Execute a trade: buy on buy_exchange, sell on sell_exchange.
         Returns (success, filled_volume, vwap_buy, vwap_sell).
-        For simulator, updates database balances directly.
-        For live, places market orders with two-stage timeout.
+        For simulator: uses provided vwap_buy/vwap_sell and updates balances directly.
+        For live: places market orders and syncs balances.
         """
         # Determine mode
         buy_mode = (await db.execute(select(Exchange.mode).where(Exchange.name == buy_exchange))).scalar_one_or_none()
@@ -59,27 +60,34 @@ class TradeExecutor:
         is_live = (buy_mode == "live" and sell_mode == "live")
 
         if not is_live:
-            # Simulator mode
+            # Simulator mode: update balances directly using VWAP and fees
+            if vwap_buy is None or vwap_sell is None:
+                logger.error("Simulator mode requires vwap_buy and vwap_sell parameters")
+                return False, 0, 0, 0
+
+            # Apply fees to prices (as in real execution)
+            effective_buy_price = vwap_buy * (1 + buy_fee_rate)
+            effective_sell_price = vwap_sell * (1 - sell_fee_rate)
+
+            cost = volume * effective_buy_price
+            revenue = volume * effective_sell_price
+
+            # Update base balances
             await update_base_balance(db, buy_exchange, common_symbol, volume)
             await update_base_balance(db, sell_exchange, common_symbol, -volume)
-            # Cost and revenue are not known exactly without price, so assume caller has already computed them?
-            # Actually the caller (detector) will later record the opportunity with computed prices.
-            # For now, we just update balances; the caller will compute actual cost/revenue based on VWAP.
-            # But we need VWAPs – they are passed as arguments? We'll change signature to accept vwap_buy, vwap_sell.
-            # Let's adjust: the caller will provide the VWAPs it already computed from orderbook.
-            # We'll remove these dummy lines and rely on caller to update balances? No, we should update balances here.
-            # Better: the caller passes vwap_buy and vwap_sell, and we use those for balance updates.
-            # We'll add two more parameters: vwap_buy, vwap_sell.
-            # For simplicity, we'll assume the caller will call update functions after execution.
-            # Actually, the existing code in detect_arbitrage_between did the updates for simulator inside process_opp.
-            # We can keep that logic inside process_opp and not use this executor for simulator? That would break separation.
-            # Let's restructure: the executor will receive vwap_buy and vwap_sell and apply balance changes.
-            # But for simplicity, we'll leave simulator updates in the detector for now and only use executor for live trades.
-            # To keep this refactor minimal, we'll keep live execution here and leave simulator in detector.
-            # However, the goal is to move all trading logic into this class. So we'll implement both.
-            pass
+
+            # Update quote balances
+            await update_quote_balance(db, buy_exchange, quote_currency, -cost)
+            await update_quote_balance(db, sell_exchange, quote_currency, revenue)
+
+            logger.info(f"Simulator trade: {volume:.4f} {common_symbol} bought at {effective_buy_price:.2f}, sold at {effective_sell_price:.2f}")
+            return True, volume, vwap_buy, vwap_sell
 
         # Live trading
+        if buy_client is None or sell_client is None:
+            logger.error("Live mode requires valid exchange clients")
+            return False, 0, 0, 0
+
         timeout_initial = 5.0
         timeout_extended = 60.0
         poll_interval = 0.5
@@ -201,6 +209,7 @@ class TradeExecutor:
         cost: float,
         revenue: float
     ):
+        """Legacy method – kept for compatibility. Prefer using execute() with simulator mode."""
         await update_base_balance(db, buy_exch, common_symbol, volume)
         await update_base_balance(db, sell_exch, common_symbol, -volume)
         await update_quote_balance(db, buy_exch, quote_currency, -cost)
