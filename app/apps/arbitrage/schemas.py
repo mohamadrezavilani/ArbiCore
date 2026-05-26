@@ -88,6 +88,13 @@ class RiskSettingsResponse(BaseModel):
     is_active: bool
     opportunistic_rebalance_enabled: bool
     opportunistic_rebalance_max_loss_percent: float
+    # New market rebalance fields
+    market_rebalance_enabled: bool
+    market_rebalance_amount_percent: float
+    market_rebalance_max_spread_percent: float
+    market_rebalance_imbalance_ratio: float
+    market_rebalance_cooldown_seconds: int
+    last_rebalance_time: Optional[datetime]
 
 class RiskSettingsUpdate(BaseModel):
     min_profit_percent: Optional[float] = None
@@ -99,6 +106,13 @@ class RiskSettingsUpdate(BaseModel):
     is_active: Optional[bool] = None
     opportunistic_rebalance_enabled: Optional[bool] = None
     opportunistic_rebalance_max_loss_percent: Optional[float] = None
+    # New market rebalance fields
+    market_rebalance_enabled: Optional[bool] = None
+    market_rebalance_amount_percent: Optional[float] = None
+    market_rebalance_max_spread_percent: Optional[float] = None
+    market_rebalance_imbalance_ratio: Optional[float] = None
+    market_rebalance_cooldown_seconds: Optional[int] = None
+
 
 class SymbolSettingsResponse(SymbolSettingsCreate):
     id: UUID4

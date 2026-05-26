@@ -50,3 +50,13 @@ async def update_risk_settings(symbol: str, data: schemas.RiskSettingsUpdate, db
 async def get_networks(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Network))
     return result.scalars().all()
+
+@router.post("/risk/{symbol}/reset-cooldown")
+async def reset_rebalance_cooldown(symbol: str, db: AsyncSession = Depends(get_db)):
+    stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == symbol)
+    settings_obj = (await db.execute(stmt)).scalar_one_or_none()
+    if not settings_obj:
+        raise HTTPException(status_code=404, detail="Symbol not found")
+    settings_obj.last_rebalance_time = None
+    await db.commit()
+    return {"message": f"Cooldown reset for {symbol}", "symbol": symbol}
