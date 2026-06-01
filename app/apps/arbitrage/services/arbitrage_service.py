@@ -16,7 +16,7 @@ class ArbitrageService:
         self.logger = OpportunityLogger()
         self.risk_manager = RiskManager()
         self.trade_executor = TradeExecutor(self.logger)
-        self.rebalancer = Rebalancer(self.logger)
+        self.rebalancer = Rebalancer(self.logger, self.trade_executor)
         self.fetcher = OrderbookFetcher()
         self.detector = ArbitrageDetector(
             logger=self.logger,
@@ -26,13 +26,24 @@ class ArbitrageService:
         )
 
     async def poll_and_store(self, db: AsyncSession):
-        # Fetch orderbooks and store snapshots
         exchange_orderbooks = await self.fetcher.fetch_all(db)
         if not exchange_orderbooks:
             return
 
-        # Detect arbitrage for each common symbol
+        # Track which symbols had trades
+        traded_symbols = []
+
+        # Detect and execute arbitrage for each common symbol
         for common_symbol, orderbooks in exchange_orderbooks.items():
-            await self.detector.detect_for_symbol(db, common_symbol, orderbooks)
+            had_trades = await self.detector.detect_for_symbol(db, common_symbol, orderbooks)
+            if had_trades:
+                traded_symbols.append(common_symbol)
+
+        # Rebalance only those symbols that actually had trades
+        for common_symbol in traded_symbols:
+            orderbooks = exchange_orderbooks.get(common_symbol)
+            if orderbooks:
+                quote_currency = "IRT" if common_symbol.endswith("IRT") else "USDT"
+                await self.rebalancer.rebalance_symbol_if_needed(db, common_symbol, quote_currency, orderbooks)
 
         await db.commit()

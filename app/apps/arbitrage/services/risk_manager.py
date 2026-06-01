@@ -3,7 +3,6 @@ from app.apps.arbitrage.models import SymbolArbitrageSettings
 
 logger = logging.getLogger(__name__)
 
-
 class RiskManager:
     @staticmethod
     def calculate_trade_percent(
@@ -14,10 +13,11 @@ class RiskManager:
             weight: float,
             current_price: float,
             network_fee_base: float,
-            max_base_pool: float  # <-- renamed: max base inventory (USDTIRT balance)
+            max_base_pool: float
     ) -> float:
         """
         Dynamic cutoff: cutoff = (vol * current_price * network_fee_base) / (0.8 * max_base_pool)
+        Then multiplied by weight.
         """
         target_base_pool = max_base_pool * 0.8
         if target_base_pool <= 0:
@@ -27,9 +27,7 @@ class RiskManager:
             base_cutoff = (vol * current_price * network_fee_base) / target_base_pool
 
         cutoff = base_cutoff * weight
-        logger.info(f"base_cutoff: {base_cutoff:.6f} = cutoff: {cutoff:.6f} * weight: {weight}")
-        logger.info(
-            f"Params: vol={vol:.4f}, price={current_price:.2f}, fee_base={network_fee_base:.4f}, max_base={max_base_pool:.2f}")
+        logger.info(f"base_cutoff: {base_cutoff:.6f}, weight: {weight:.3f}, cutoff: {cutoff:.6f}")
 
         min_trade_pct = float(params.min_trade_percent)
         min_trade_factor = float(params.min_trade_factor)

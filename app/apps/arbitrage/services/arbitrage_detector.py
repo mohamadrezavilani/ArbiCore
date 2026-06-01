@@ -1,29 +1,21 @@
 import logging
+from typing import Dict, List, Tuple, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from typing import Dict, List, Tuple
 from app.apps.arbitrage.models import (
-    Exchange, ExchangeFee, SymbolArbitrageSettings, Network, ArbitrageOpportunity, BaseInventory
+    Exchange, ExchangeFee, SymbolArbitrageSettings, Network,
+    ArbitrageOpportunity, BaseInventory, QuoteInventory
 )
 from app.apps.arbitrage.inventory import get_base_balance, get_quote_balance
 from app.exchanges.factory import get_exchange_client
 from .opportunity_logger import OpportunityLogger
-from .pair_weight import get_pair_weight, update_pair_weight
 from .risk_manager import RiskManager
 from .trade_executor import TradeExecutor
 from .rebalancer import Rebalancer
+from .pair_weight import get_pair_weight, update_pair_weight
 
 logger = logging.getLogger(__name__)
 
-async def get_max_base_pool(db: AsyncSession, common_symbol: str) -> float:
-    """Return the maximum base inventory balance for a common symbol across active exchanges."""
-    stmt = select(func.max(BaseInventory.balance)).join(Exchange).where(
-        BaseInventory.common_symbol == common_symbol,
-        Exchange.is_active == True
-    )
-    result = await db.execute(stmt)
-    max_bal = result.scalar()
-    return float(max_bal) if max_bal else 0.0
 
 class ArbitrageDetector:
     def __init__(
@@ -43,30 +35,15 @@ class ArbitrageDetector:
         db: AsyncSession,
         common_symbol: str,
         exchange_orderbooks: Dict[str, Tuple[List[List[float]], List[List[float]]]]
-    ):
-        """
-        exchange_orderbooks: { exchange_name: (ask_levels, bid_levels) }
-        """
+    ) -> bool:
+        # Determine quote currency
         if common_symbol.endswith("IRT"):
             quote_currency = "IRT"
         elif common_symbol.endswith("USDT"):
             quote_currency = "USDT"
         else:
             logger.warning(f"Unknown quote currency for symbol {common_symbol}")
-            return
-
-        async def get_taker_fee(exchange_name: str) -> float:
-            exch = await db.execute(select(Exchange).where(Exchange.name == exchange_name))
-            exch_obj = exch.scalar_one_or_none()
-            if not exch_obj:
-                return 0.0
-            fee_stmt = select(ExchangeFee).where(
-                ExchangeFee.exchange_id == exch_obj.id,
-                ExchangeFee.quote_currency == quote_currency
-            )
-            fee_rec = await db.execute(fee_stmt)
-            fee = fee_rec.scalar_one_or_none()
-            return float(fee.taker_fee) if fee else 0.0
+            return False
 
         # Get global settings for this symbol
         settings_stmt = select(SymbolArbitrageSettings).where(
@@ -74,259 +51,297 @@ class ArbitrageDetector:
         )
         settings = (await db.execute(settings_stmt)).scalar_one_or_none()
         if not settings or not settings.is_active:
-            return
+            await self.logger.log_rejected_opportunity(
+                db, common_symbol, "", "", "global",
+                f"Symbol {common_symbol} not active or no settings",
+                {"settings_found": settings is not None}
+            )
+            return False
 
-        network_fee_base = 0.0
-        if settings.default_network_id:
-            net_stmt = select(Network).where(Network.id == settings.default_network_id)
-            net = (await db.execute(net_stmt)).scalar_one_or_none()
-            if net:
-                network_fee_base = float(net.fee_per_transfer)
+        # Fetch current balances and modes for all active exchanges
+        exchange_info = {}
+        stmt = select(Exchange.name, Exchange.mode).where(Exchange.is_active == True)
+        exchanges = await db.execute(stmt)
+        for exch_name, mode in exchanges.all():
+            quote_bal = await get_quote_balance(db, exch_name, quote_currency)
+            base_bal = await get_base_balance(db, exch_name, common_symbol)
+            exchange_info[exch_name] = {
+                "quote": float(quote_bal),
+                "base": float(base_bal),
+                "mode": mode
+            }
 
-        exchange_names = list(exchange_orderbooks.keys())
-        for i in range(len(exchange_names)):
-            for j in range(i + 1, len(exchange_names)):
-                name_a = exchange_names[i]
-                name_b = exchange_names[j]
-                a_asks, a_bids = exchange_orderbooks[name_a]
-                b_asks, b_bids = exchange_orderbooks[name_b]
+        # Build asks and bids lists with fees
+        asks = []   # (exchange, price, volume, effective_price, fee)
+        bids = []
+        for exch_name, (ask_levels, bid_levels) in exchange_orderbooks.items():
+            fee = await self._get_taker_fee(db, exch_name, quote_currency)
+            if fee is None:
+                continue
+            for price, vol in ask_levels:
+                effective = price * (1 + fee)
+                asks.append((exch_name, price, vol, effective, fee))
+            for price, vol in bid_levels:
+                effective = price * (1 - fee)
+                bids.append((exch_name, price, vol, effective, fee))
 
-                # Direction A -> B: buy on A, sell on B
-                if a_asks and b_bids:
-                    await self._process_direction(
-                        db, common_symbol, quote_currency,
-                        name_a, a_asks, name_b, b_bids,
-                        await get_taker_fee(name_a), await get_taker_fee(name_b),
-                        settings, network_fee_base,
-                        exchange_orderbooks
-                    )
-                # Direction B -> A: buy on B, sell on A
-                if b_asks and a_bids:
-                    await self._process_direction(
-                        db, common_symbol, quote_currency,
-                        name_b, b_asks, name_a, a_bids,
-                        await get_taker_fee(name_b), await get_taker_fee(name_a),
-                        settings, network_fee_base,
-                        exchange_orderbooks
-                    )
+        if not asks or not bids:
+            await self.logger.log_rejected_opportunity(
+                db, common_symbol, "", "", "global",
+                "No orderbook levels available for any exchange",
+                {"asks_count": len(asks), "bids_count": len(bids)}
+            )
+            return False
 
-    async def _process_direction(
+        asks.sort(key=lambda x: x[3])
+        bids.sort(key=lambda x: x[3], reverse=True)
+
+        avail_quote = {exch: exchange_info[exch]["quote"] for exch in exchange_info}
+        avail_base = {exch: exchange_info[exch]["base"] for exch in exchange_info}
+
+        i, j = 0, 0
+        matches = []
+        while i < len(asks) and j < len(bids):
+            buy_exch, ask_price, ask_vol, eff_ask, ask_fee = asks[i]
+            sell_exch, bid_price, bid_vol, eff_bid, bid_fee = bids[j]
+
+            if buy_exch == sell_exch:
+                i += 1
+                j += 1
+                continue
+
+            if eff_ask >= eff_bid:
+                reason = f"No profit: buy effective {eff_ask:.6f} >= sell effective {eff_bid:.6f}"
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    reason,
+                    {"ask_price": ask_price, "bid_price": bid_price, "buy_fee": ask_fee, "sell_fee": bid_fee}
+                )
+                break
+
+            weight = await get_pair_weight(db, buy_exch, sell_exch)
+
+            max_vol = min(ask_vol, bid_vol)
+            needed_quote = max_vol * ask_price
+            if needed_quote > avail_quote.get(buy_exch, 0):
+                max_vol = avail_quote[buy_exch] / ask_price
+            if max_vol > avail_base.get(sell_exch, 0):
+                max_vol = avail_base[sell_exch]
+
+            if max_vol <= 0:
+                reason = f"Insufficient balance: quote on {buy_exch}={avail_quote.get(buy_exch,0):.2f}, base on {sell_exch}={avail_base.get(sell_exch,0):.4f}"
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    reason,
+                    {"required_quote": needed_quote, "available_quote": avail_quote.get(buy_exch,0),
+                     "required_base": max_vol, "available_base": avail_base.get(sell_exch,0)}
+                )
+                if ask_vol <= 0:
+                    i += 1
+                if bid_vol <= 0:
+                    j += 1
+                continue
+
+            net_gain = max_vol * (eff_bid - eff_ask)
+            network_fee_base = await self._get_network_fee_base(db, settings)
+            max_base_pool = await self._get_max_base_pool(db, common_symbol)
+
+            trade_pct = self.risk_manager.calculate_trade_percent(
+                net_gain=net_gain,
+                network_commission_quote=0.0,
+                params=settings,
+                vol=max_vol,
+                weight=weight,
+                current_price=ask_price,
+                network_fee_base=network_fee_base,
+                max_base_pool=max_base_pool
+            )
+            if trade_pct <= 0:
+                reason = f"Risk manager rejected: trade_pct={trade_pct:.4f}, net_gain={net_gain:.6f}, weight={weight:.3f}"
+                # Convert Decimal settings to float before logging
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    reason,
+                    {
+                        "net_gain": net_gain,
+                        "trade_pct": trade_pct,
+                        "weight": weight,
+                        "cutoff_threshold": float(settings.cutoff_threshold),
+                        "min_trade_percent": float(settings.min_trade_percent)
+                    }
+                )
+                i += 1
+                j += 1
+                continue
+
+            volume = max_vol * trade_pct
+            if volume < 1e-6:
+                reason = f"Volume too small: {volume:.8f}"
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    reason,
+                    {"max_vol": max_vol, "trade_pct": trade_pct}
+                )
+                i += 1
+                j += 1
+                continue
+
+            matches.append((buy_exch, sell_exch, volume, ask_price, bid_price, ask_fee, bid_fee))
+            avail_quote[buy_exch] -= volume * ask_price
+            avail_base[sell_exch] -= volume
+            asks[i] = (buy_exch, ask_price, ask_vol - volume, eff_ask, ask_fee)
+            bids[j] = (sell_exch, bid_price, bid_vol - volume, eff_bid, bid_fee)
+            if asks[i][2] <= 0:
+                i += 1
+            if bids[j][2] <= 0:
+                j += 1
+
+        any_trade = False
+        for (buy_exch, sell_exch, volume, ask_price, bid_price, ask_fee, bid_fee) in matches:
+            success = await self._execute_match(
+                db, common_symbol, quote_currency,
+                buy_exch, sell_exch, volume, ask_price, bid_price,
+                ask_fee, bid_fee, settings, exchange_info, exchange_orderbooks
+            )
+            if success:
+                any_trade = True
+                await update_pair_weight(db, buy_exch, sell_exch)
+
+        return any_trade
+
+    async def _get_taker_fee(self, db: AsyncSession, exchange_name: str, quote_currency: str) -> Optional[float]:
+        exch = await db.execute(select(Exchange).where(Exchange.name == exchange_name))
+        exch_obj = exch.scalar_one_or_none()
+        if not exch_obj:
+            return None
+        fee_stmt = select(ExchangeFee.taker_fee).where(
+            ExchangeFee.exchange_id == exch_obj.id,
+            ExchangeFee.quote_currency == quote_currency
+        )
+        fee = await db.execute(fee_stmt)
+        fee_val = fee.scalar_one_or_none()
+        return float(fee_val) if fee_val is not None else 0.0
+
+    async def _get_network_fee_base(self, db: AsyncSession, settings: SymbolArbitrageSettings) -> float:
+        if not settings.default_network_id:
+            return 0.0
+        net_stmt = select(Network.fee_per_transfer).where(Network.id == settings.default_network_id)
+        net_fee = await db.execute(net_stmt)
+        fee = net_fee.scalar_one_or_none()
+        return float(fee) if fee else 0.0
+
+    async def _get_max_base_pool(self, db: AsyncSession, common_symbol: str) -> float:
+        stmt = select(func.max(BaseInventory.balance)).join(Exchange).where(
+            BaseInventory.common_symbol == common_symbol,
+            Exchange.is_active == True
+        )
+        result = await db.execute(stmt)
+        max_bal = result.scalar()
+        return float(max_bal) if max_bal else 0.0
+
+    async def _execute_match(
         self,
         db: AsyncSession,
         common_symbol: str,
         quote_currency: str,
         buy_exch: str,
-        buy_levels: List[List[float]],
         sell_exch: str,
-        sell_levels: List[List[float]],
+        volume: float,
+        ask_price: float,
+        bid_price: float,
         buy_fee: float,
         sell_fee: float,
         settings: SymbolArbitrageSettings,
-        network_fee_base: float,
-        exchange_orderbooks: Dict[str, Tuple[List[List[float]], List[List[float]]]]
-    ):
-        # Compute max trade volume, cost, revenue
-        vol, cost, rev, gross_gain, reason = await self._compute_max_trade(
-            db, common_symbol, quote_currency,
-            buy_exch, sell_exch, buy_levels, sell_levels, buy_fee, sell_fee
-        )
-        trade_type = f"buy_on_{buy_exch}_sell_on_{sell_exch}"
-        if vol <= 0:
-            await self.logger.log_rejected_opportunity(
-                db, common_symbol, buy_exch, sell_exch, trade_type,
-                f"No volume: {reason}",
-                {"vol": vol, "reason": reason}
-            )
-            return
-
-        vwap_buy = cost / vol
-        vwap_sell = rev / vol
-        network_fee_quote = network_fee_base * vwap_buy
-        weight = await get_pair_weight(db, buy_exch, sell_exch)
-
-        # Get dynamic values for risk manager
-        current_price = vwap_buy
-        max_base_pool = await get_max_base_pool(db, common_symbol)
-
-        trade_pct = self.risk_manager.calculate_trade_percent(
-            net_gain=gross_gain,
-            network_commission_quote=network_fee_quote,
-            params=settings,
-            vol=vol,
-            weight=weight,
-            current_price=current_price,
-            network_fee_base=network_fee_base,
-            max_base_pool=max_base_pool
-        )
-        if trade_pct <= 0:
-            await self.logger.log_rejected_opportunity(
-                db, common_symbol, buy_exch, sell_exch, trade_type,
-                "Trade percent <= 0 (risk threshold not met)",
-                {"trade_pct": trade_pct, "gross_gain": gross_gain, "network_fee_quote": network_fee_quote}
-            )
-            return
-
-        actual_vol = vol * trade_pct
-        if actual_vol < 1e-6:
-            await self.logger.log_rejected_opportunity(
-                db, common_symbol, buy_exch, sell_exch, trade_type,
-                f"Actual volume {actual_vol} below minimum threshold (1e-6)",
-                {"actual_vol": actual_vol, "vol": vol, "trade_pct": trade_pct}
-            )
-            return
-
-        actual_cost = cost * trade_pct
-        actual_rev = rev * trade_pct
-        gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
-        min_profit = float(settings.min_profit_percent)
-        if gross_profit_pct < min_profit:
-            await self.logger.log_rejected_opportunity(
-                db, common_symbol, buy_exch, sell_exch, trade_type,
-                f"Gross profit {gross_profit_pct:.2f}% below min {min_profit}%",
-                {"gross_profit_pct": gross_profit_pct, "min_profit_percent": min_profit}
-            )
-            return
-
-        # Pre‑execution balance checks
-        buyer_quote_balance = await get_quote_balance(db, buy_exch, quote_currency)
-        if actual_cost > buyer_quote_balance + 1e-6:
-            await self.logger.log_rejected_opportunity(
-                db, common_symbol, buy_exch, sell_exch, trade_type,
-                f"Insufficient {quote_currency} on {buy_exch}: need {actual_cost:.2f}, have {buyer_quote_balance:.2f}",
-                {"actual_cost": actual_cost, "balance": buyer_quote_balance}
-            )
-            return
-
-        seller_base_balance = await get_base_balance(db, sell_exch, common_symbol)
-        if actual_vol > seller_base_balance + 1e-6:
-            await self.logger.log_rejected_opportunity(
-                db, common_symbol, buy_exch, sell_exch, trade_type,
-                f"Insufficient {common_symbol} on {sell_exch}: need {actual_vol:.4f}, have {seller_base_balance:.4f}",
-                {"actual_vol": actual_vol, "balance": seller_base_balance}
-            )
-            return
-
-        # Create clients and exchange objects
+        exchange_info: Dict,
+        exchange_orderbooks: Dict
+    ) -> bool:
+        """Returns True if execution succeeded."""
         buy_client = get_exchange_client(buy_exch)
         sell_client = get_exchange_client(sell_exch)
         if not buy_client or not sell_client:
             await self.logger.log_rejected_opportunity(
-                db, common_symbol, buy_exch, sell_exch, trade_type,
+                db, common_symbol, buy_exch, sell_exch,
+                f"buy_on_{buy_exch}_sell_on_{sell_exch}",
                 "Could not create exchange clients",
-                {"buy_client": buy_client is not None, "sell_client": sell_client is not None}
+                {"buy_client_exists": buy_client is not None, "sell_client_exists": sell_client is not None}
             )
-            return
+            return False
 
-        exch_a_obj = (await db.execute(select(Exchange).where(Exchange.name == buy_exch))).scalar_one_or_none()
-        exch_b_obj = (await db.execute(select(Exchange).where(Exchange.name == sell_exch))).scalar_one_or_none()
-        if not exch_a_obj or not exch_b_obj:
-            return
+        exch_buy = (await db.execute(select(Exchange).where(Exchange.name == buy_exch))).scalar_one_or_none()
+        exch_sell = (await db.execute(select(Exchange).where(Exchange.name == sell_exch))).scalar_one_or_none()
+        if not exch_buy or not exch_sell:
+            return False
 
-        # Determine live mode
-        buy_mode = (await db.execute(select(Exchange.mode).where(Exchange.name == buy_exch))).scalar_one_or_none()
-        sell_mode = (await db.execute(select(Exchange.mode).where(Exchange.name == sell_exch))).scalar_one_or_none()
-        is_live = (buy_mode == "live" and sell_mode == "live")
+        is_live = (exchange_info.get(buy_exch, {}).get("mode") == "live" and
+                   exchange_info.get(sell_exch, {}).get("mode") == "live")
 
-        if is_live:
-            success, filled_vol, final_vwap_buy, final_vwap_sell = await self.trade_executor.execute(
-                db, common_symbol, buy_exch, sell_exch, actual_vol, quote_currency,
-                buy_client, sell_client, exch_a_obj, exch_b_obj, buy_fee, sell_fee,
-                vwap_buy=None, vwap_sell=None  # live mode doesn't need pre‑computed VWAP
+        if not is_live:
+            # Simulator
+            effective_buy = ask_price * (1 + buy_fee)
+            effective_sell = bid_price * (1 - sell_fee)
+            cost = volume * effective_buy
+            revenue = volume * effective_sell
+            from app.apps.arbitrage.inventory import update_base_balance, update_quote_balance
+            await update_base_balance(db, buy_exch, common_symbol, volume)
+            await update_base_balance(db, sell_exch, common_symbol, -volume)
+            await update_quote_balance(db, buy_exch, quote_currency, -cost)
+            await update_quote_balance(db, sell_exch, quote_currency, revenue)
+            opp = ArbitrageOpportunity(
+                common_symbol=common_symbol,
+                exchange_a_id=exch_buy.id,
+                exchange_b_id=exch_sell.id,
+                trade_type=f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                price_a=effective_buy,
+                price_b=effective_sell,
+                profit_percent=((revenue - cost) / cost) * 100 if cost else 0,
+                traded_volume=volume
             )
-            if not success:
-                return
-            actual_vol = filled_vol
-            actual_cost = actual_vol * final_vwap_buy
-            actual_rev = actual_vol * final_vwap_sell
-            gross_profit_pct = ((actual_rev - actual_cost) / actual_cost) * 100 if actual_cost else 0
+            db.add(opp)
+            await db.commit()
+            logger.info(f"✅ Simulator trade: {volume:.4f} {common_symbol} buy@{buy_exch} {effective_buy:.2f} sell@{sell_exch} {effective_sell:.2f}")
+            return True
         else:
-            # Simulator mode: use the legacy method that directly updates balances
-            await self.trade_executor.update_balances_simulator(
-                db, buy_exch, sell_exch, common_symbol, quote_currency,
-                actual_vol, actual_cost, actual_rev
+            # Live mode
+            success, filled_vol, vwap_buy, vwap_sell = await self.trade_executor.execute(
+                db=db,
+                common_symbol=common_symbol,
+                buy_exchange=buy_exch,
+                sell_exchange=sell_exch,
+                volume=volume,
+                quote_currency=quote_currency,
+                buy_client=buy_client,
+                sell_client=sell_client,
+                buy_exch_obj=exch_buy,
+                sell_exch_obj=exch_sell,
+                buy_fee_rate=buy_fee,
+                sell_fee_rate=sell_fee,
+                vwap_buy=ask_price,
+                vwap_sell=bid_price
             )
-            final_vwap_buy = vwap_buy
-            final_vwap_sell = vwap_sell
-
-        # Record opportunity
-        opp = ArbitrageOpportunity(
-            common_symbol=common_symbol,
-            exchange_a_id=exch_a_obj.id,
-            exchange_b_id=exch_b_obj.id,
-            trade_type=trade_type,
-            price_a=final_vwap_buy,
-            price_b=final_vwap_sell,
-            profit_percent=gross_profit_pct,
-            traded_volume=actual_vol,
-        )
-        db.add(opp)
-        await update_pair_weight(db, buy_exch, sell_exch)
-        await db.commit()
-
-        # Rebalance
-        await self.rebalancer.rebalance_symbol_if_needed(
-            db, common_symbol, quote_currency, exchange_orderbooks
-        )
-
-        logger.info(
-            f"✅ Executed {actual_vol:.4f} {common_symbol} (risk {trade_pct:.1%} of max {vol:.4f}) "
-            f"buy {buy_exch} @{final_vwap_buy:.2f} sell {sell_exch} @{final_vwap_sell:.2f} "
-            f"profit {gross_profit_pct:.2f}%"
-        )
-
-    async def _compute_max_trade(
-        self,
-        db: AsyncSession,
-        common_symbol: str,
-        quote_currency: str,
-        buy_exch: str,
-        sell_exch: str,
-        buy_levels: List[List[float]],
-        sell_levels: List[List[float]],
-        buy_fee: float,
-        sell_fee: float
-    ) -> Tuple[float, float, float, float, str]:
-        vol = cost = rev = 0.0
-        reason = "Unknown"
-        avail_base = await get_base_balance(db, sell_exch, common_symbol)
-        if avail_base <= 0:
-            return 0, 0, 0, 0, f"Insufficient base balance on {sell_exch} ({avail_base})"
-        avail_quote = await get_quote_balance(db, buy_exch, quote_currency)
-        if avail_quote <= 0:
-            return 0, 0, 0, 0, f"Insufficient quote balance on {buy_exch} ({avail_quote} {quote_currency})"
-
-        i_buy = i_sell = 0
-        buy_cpy = [l[:] for l in buy_levels]
-        sell_cpy = [l[:] for l in sell_levels]
-
-        while i_buy < len(buy_cpy) and i_sell < len(sell_cpy):
-            bprice, bvol = buy_cpy[i_buy]
-            sprice, svol = sell_cpy[i_sell]
-            cost_unit = bprice * (1 + buy_fee)
-            rev_unit = sprice * (1 - sell_fee)
-            if rev_unit <= cost_unit:
-                reason = f"No profit: buy {cost_unit:.2f} vs sell {rev_unit:.2f}"
-                break
-            take = min(bvol, svol, avail_base - vol, avail_quote / cost_unit)
-            if take <= 0:
-                if bvol <= 0:
-                    i_buy += 1
-                if svol <= 0:
-                    i_sell += 1
-                continue
-            vol += take
-            cost += take * cost_unit
-            rev += take * rev_unit
-            buy_cpy[i_buy][1] -= take
-            sell_cpy[i_sell][1] -= take
-            if vol >= avail_base or cost >= avail_quote:
-                reason = f"Reached inventory limit (base={avail_base}, quote={avail_quote})"
-                break
-        else:
-            if i_buy >= len(buy_cpy):
-                reason = "Buy order book exhausted"
-            elif i_sell >= len(sell_cpy):
-                reason = "Sell order book exhausted"
+            if success:
+                opp = ArbitrageOpportunity(
+                    common_symbol=common_symbol,
+                    exchange_a_id=exch_buy.id,
+                    exchange_b_id=exch_sell.id,
+                    trade_type=f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    price_a=vwap_buy,
+                    price_b=vwap_sell,
+                    profit_percent=((filled_vol * vwap_sell - filled_vol * vwap_buy) / (filled_vol * vwap_buy)) * 100,
+                    traded_volume=filled_vol
+                )
+                db.add(opp)
+                await db.commit()
+                logger.info(f"✅ Live trade: {filled_vol:.4f} {common_symbol} buy@{buy_exch} {vwap_buy:.2f} sell@{sell_exch} {vwap_sell:.2f}")
+                return True
             else:
-                reason = "No profitable levels found"
-        return vol, cost, rev, rev - cost, reason
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    "Live trade execution failed",
+                    {"volume": volume, "ask_price": ask_price, "bid_price": bid_price}
+                )
+                return False

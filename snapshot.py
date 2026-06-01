@@ -20,7 +20,7 @@ from datetime import datetime
 
 # ===== CONFIGURATION =====
 OUTPUT_FILE = "project_snapshot.txt"
-MAX_FILE_SIZE = 1024 * 1024  # 1 MB - skip files larger than this
+MAX_FILE_SIZE = 2024 * 1024  # 1 MB - skip files larger than this
 INDENT = "    "               # tree indentation string
 
 # Directories to ignore (common VCS, caches, build artifacts, virtual envs)
@@ -31,7 +31,7 @@ IGNORE_DIRS = {
     ".idea", ".vscode", ".vs", ".settings",
     "dist", "build", "target", "out", "bin", "obj",
     ".next", ".nuxt", ".svelte-kit", ".cache",
-    ".terraform", ".serverless",
+    ".terraform", ".serverless","test_images"
 }
 
 # File extensions that are definitely binary and should be skipped
@@ -45,7 +45,7 @@ BINARY_EXTENSIONS = {
     ".db", ".sqlite", ".sqlite3",
     ".pyc", ".pyo", ".pyd", ".so", ".dll",
     ".class", ".jar", ".war",
-    ".iso", ".img", ".vhd", ".vhdx",
+    ".iso", ".img", ".vhd", ".vhdx", ".jpg", ".txt", ".pdiparams", ".pdmodel", ".yml", ".pt", ".jpeg", ".png", ".ttf", ".TTF", ".json", ".log", ".config", ".csv", ".js"
 }
 
 # ===== HELPER FUNCTIONS =====
