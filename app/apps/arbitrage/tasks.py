@@ -9,8 +9,11 @@ async def periodic_arbitrage_poll():
     service = ArbitrageService()
     while True:
         try:
-            async with AsyncSessionLocal() as db:
-                await service.poll_and_store(db)
+            async with asyncio.timeout(30):   # Python 3.11+
+                async with AsyncSessionLocal() as db:
+                    await service.poll_and_store(db)
+        except asyncio.TimeoutError:
+            logging.error("Arbitrage poll timed out after 30 seconds – skipping this cycle")
         except Exception as e:
-            logger.exception(f"Error in arbitrage polling cycle: {e}")
+            logging.exception(f"Error in arbitrage polling cycle: {e}")
         await asyncio.sleep(service.poll_interval)
