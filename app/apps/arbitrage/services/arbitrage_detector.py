@@ -49,6 +49,29 @@ class ArbitrageDetector:
         else:
             return False, {}, {}, []
 
+        # ========== FORCE TRADE FOR TESTING (realistic profit) ==========
+        FORCE_TRADE = False                     # Set to False to disable
+        FORCE_SYMBOL = "USDTIRT"               # Symbol to force trades on
+        FORCE_MULTIPLIER = 0.998               # 0.2% cheaper ask
+        FORCE_BID_MULTIPLIER = 1.002           # 0.2% higher bid
+
+        if FORCE_TRADE and common_symbol == FORCE_SYMBOL:
+            exch_list = list(exchange_orderbooks.keys())
+            if len(exch_list) >= 2:
+                buy_ex = exch_list[0]          # e.g., wallex
+                sell_ex = exch_list[1]         # e.g., nobitex
+                buy_asks, buy_bids = exchange_orderbooks[buy_ex]
+                sell_asks, sell_bids = exchange_orderbooks[sell_ex]
+                if buy_asks and sell_bids:
+                    original_ask = buy_asks[0][0]
+                    buy_asks[0][0] = original_ask * FORCE_MULTIPLIER
+                    original_bid = sell_bids[0][0]
+                    sell_bids[0][0] = original_bid * FORCE_BID_MULTIPLIER
+                    exchange_orderbooks[buy_ex] = (buy_asks, buy_bids)
+                    exchange_orderbooks[sell_ex] = (sell_asks, sell_bids)
+                    logger.info(f"[TEST] Forced profitable spread: buy on {buy_ex} ask={buy_asks[0][0]:.2f}, sell on {sell_ex} bid={sell_bids[0][0]:.2f} (multipliers: {FORCE_MULTIPLIER}/{FORCE_BID_MULTIPLIER})")
+        # ========== END FORCE TRADE ==========
+
         # Get settings
         stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
         settings = (await db.execute(stmt)).scalar_one_or_none()
@@ -154,6 +177,8 @@ class ArbitrageDetector:
         opportunities = []
 
         i, j = 0, 0
+        SAFETY = 0.999999   # prevents rounding errors
+
         while i < len(asks) and j < len(bids):
             buy_exch, ask_price, ask_vol, eff_ask, ask_fee = asks[i]
             sell_exch, bid_price, bid_vol, eff_bid, bid_fee = bids[j]
@@ -171,25 +196,27 @@ class ArbitrageDetector:
                     reason,
                     {"ask_price": ask_price, "bid_price": bid_price, "buy_fee": ask_fee, "sell_fee": bid_fee}
                 )
-                break  # no further matches possible
+                break
 
             weight = pair_weights.get((buy_exch, sell_exch), 0.5)
 
-            max_vol = min(ask_vol, bid_vol)
-            needed_quote = max_vol * ask_price
-            if needed_quote > avail_quote.get(buy_exch, 0):
-                max_vol = avail_quote[buy_exch] / ask_price if ask_price else 0
-            if max_vol > avail_base.get(sell_exch, 0):
-                max_vol = avail_base[sell_exch]
+            # ----- Balance checks with safety margin -----
+            available_quote = avail_quote.get(buy_exch, 0.0)
+            max_vol_by_quote = (available_quote / ask_price) * SAFETY if ask_price and available_quote > 0 else float('inf')
+
+            available_base = avail_base.get(sell_exch, 0.0)
+            max_vol_by_base = available_base * SAFETY
+
+            max_vol = min(ask_vol, bid_vol, max_vol_by_quote, max_vol_by_base)
 
             if max_vol <= 0:
-                reason = f"Insufficient balance: quote on {buy_exch}={avail_quote.get(buy_exch,0):.2f}, base on {sell_exch}={avail_base.get(sell_exch,0):.4f}"
+                reason = f"Insufficient balance: quote on {buy_exch}={available_quote:.2f}, base on {sell_exch}={available_base:.4f}"
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
                     f"buy_on_{buy_exch}_sell_on_{sell_exch}",
                     reason,
-                    {"required_quote": needed_quote, "available_quote": avail_quote.get(buy_exch,0),
-                     "required_base": max_vol, "available_base": avail_base.get(sell_exch,0)}
+                    {"required_quote": max_vol * ask_price, "available_quote": available_quote,
+                     "required_base": max_vol, "available_base": available_base}
                 )
                 i += 1
                 j += 1
@@ -237,7 +264,7 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
-            # Execute trade (simulator or live) without committing
+            # Execute trade
             is_live = (exchange_modes.get(buy_exch) == "live" and exchange_modes.get(sell_exch) == "live")
             success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell = \
                 await self.trade_executor.execute_and_get_deltas(
@@ -253,13 +280,13 @@ class ArbitrageDetector:
                     sell_exch_obj_id=exchange_ids.get(sell_exch),
                     buy_fee_rate=ask_fee,
                     sell_fee_rate=bid_fee,
-                    vwap_buy=ask_price,   # raw price before fee
+                    vwap_buy=ask_price,
                     vwap_sell=bid_price,
                     is_live=is_live
                 )
 
             if success:
-                # Accumulate deltas for simulator (live already synced, deltas are zero)
+                # Accumulate deltas for simulator
                 if not is_live:
                     base_deltas[buy_exch] += base_delta_buy
                     base_deltas[sell_exch] += base_delta_sell
@@ -272,7 +299,7 @@ class ArbitrageDetector:
                 avail_quote[sell_exch] += quote_delta_sell
                 avail_base[sell_exch] += base_delta_sell
 
-                # Create opportunity record (will be added later)
+                # Create opportunity record
                 opp = ArbitrageOpportunity(
                     common_symbol=common_symbol,
                     exchange_a_id=exchange_ids[buy_exch],
@@ -293,9 +320,21 @@ class ArbitrageDetector:
                 if bids[j][2] <= 0:
                     j += 1
             else:
-                # On failure, skip this pair and move forward
                 i += 1
                 j += 1
+
+        # ========== OPTIONAL: Auto‑refill quote balance for forced test (comment out to disable) ==========
+        if FORCE_TRADE and common_symbol == FORCE_SYMBOL:
+            # Ensure Wallex has enough IRT for the next cycles
+            if quote_currency == "IRT":
+                target_exchange = "wallex"
+                min_balance = 100_000_000  # 100M IRT
+                current = quote_balances.get(target_exchange, 0) + quote_deltas.get(target_exchange, 0)
+                if current < min_balance:
+                    refill = min_balance - current
+                    quote_deltas[target_exchange] = quote_deltas.get(target_exchange, 0) + refill
+                    logger.warning(f"[TEST] Refilled {target_exchange} IRT by {refill:.0f} (now ~{min_balance})")
+        # ========== END REFILL ==========
 
         any_trade = len(opportunities) > 0
         return any_trade, base_deltas, quote_deltas, opportunities

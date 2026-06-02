@@ -16,17 +16,20 @@ class TradeExecutor:
 
     async def sync_balances_from_exchange(self, db: AsyncSession, exchange_name: str, client):
         """After a live trade, replace DB balances with real exchange balances."""
-        real_balances = await client.get_balances()
-        stmt = select(ExchangeSymbol).join(Exchange).where(Exchange.name == exchange_name)
-        result = await db.execute(stmt)
-        symbols = result.scalars().all()
-        asset_to_common = {sym.original_symbol: sym.common_symbol for sym in symbols}
-        for asset, balance in real_balances.items():
-            if asset in ("IRT", "USDT"):
-                await set_quote_balance(db, exchange_name, asset, balance)
-            else:
-                common = asset_to_common.get(asset, asset)
-                await set_base_balance(db, exchange_name, common, balance)
+        try:
+            real_balances = await client.get_balances()
+            stmt = select(ExchangeSymbol).join(Exchange).where(Exchange.name == exchange_name)
+            result = await db.execute(stmt)
+            symbols = result.scalars().all()
+            asset_to_common = {sym.original_symbol: sym.common_symbol for sym in symbols}
+            for asset, balance in real_balances.items():
+                if asset in ("IRT", "USDT"):
+                    await set_quote_balance(db, exchange_name, asset, balance)
+                else:
+                    common = asset_to_common.get(asset, asset)
+                    await set_base_balance(db, exchange_name, common, balance)
+        except Exception as e:
+            logger.error(f"Failed to sync balances for {exchange_name}: {e}")
 
     async def execute_and_get_deltas(
         self,
@@ -121,7 +124,6 @@ class TradeExecutor:
             filled_vol = min(buy_result.filled_volume, sell_result.filled_volume)
             await self.sync_balances_from_exchange(db, buy_exchange, buy_client)
             await self.sync_balances_from_exchange(db, sell_exchange, sell_client)
-            # For live, deltas are zero because we already synced the entire balance
             return True, filled_vol, vwap_buy_final, vwap_sell_final, 0.0, 0.0, 0.0, 0.0
 
         # Extended wait for missing leg

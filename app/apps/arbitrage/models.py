@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 import enum
-from sqlalchemy import String, Numeric, ForeignKey, JSON, UniqueConstraint
+from sqlalchemy import String, Numeric, ForeignKey, JSON, UniqueConstraint, CheckConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, UUIDMixin, TimestampMixin
 
@@ -66,6 +66,9 @@ class BaseInventory(Base, UUIDMixin, TimestampMixin):
     common_symbol: Mapped[str] = mapped_column(String(50), nullable=False)
     balance: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
     exchange: Mapped["Exchange"] = relationship(back_populates="base_inventories")
+    __table_args__ = (
+        CheckConstraint('balance >= 0', name='check_base_balance_non_negative'),
+    )
 
 class QuoteInventory(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "quote_inventories"
@@ -73,6 +76,9 @@ class QuoteInventory(Base, UUIDMixin, TimestampMixin):
     currency: Mapped[str] = mapped_column(String(10), nullable=False)  # 'IRT' or 'USDT'
     balance: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
     exchange: Mapped["Exchange"] = relationship(back_populates="quote_inventories")
+    __table_args__ = (
+        CheckConstraint('balance >= 0', name='check_quote_balance_non_negative'),
+    )
 
 class Network(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "networks"

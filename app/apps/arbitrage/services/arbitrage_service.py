@@ -27,18 +27,15 @@ class ArbitrageService:
         )
 
     async def poll_and_store(self, db: AsyncSession):
-        # Fetch orderbooks in parallel
         exchange_orderbooks = await self.fetcher.fetch_all(db)
         if not exchange_orderbooks:
             return
 
-        # Accumulators for all symbols
         all_base_deltas = {}
         all_quote_deltas = {}
         all_opportunities = []
         traded_symbols = []
 
-        # Detect and execute arbitrage for each symbol
         for common_symbol, orderbooks in exchange_orderbooks.items():
             any_trade, base_deltas, quote_deltas, opportunities = await self.detector.detect_for_symbol(
                 db, common_symbol, orderbooks
@@ -55,26 +52,20 @@ class ArbitrageService:
 
         # Apply all balance updates in bulk
         for (ex, sym), delta in all_base_deltas.items():
-            if delta != 0:
+            if abs(delta) > 1e-8:
                 await update_base_balance(db, ex, sym, delta)
         for (ex, cur), delta in all_quote_deltas.items():
-            if delta != 0:
+            if abs(delta) > 1e-8:
                 await update_quote_balance(db, ex, cur, delta)
 
-        # Add all opportunity records
         db.add_all(all_opportunities)
-
-        # Commit all changes in one transaction
         await db.commit()
 
-        # Rebalance only symbols that had trades (using fresh data after commit)
-        # Rebalancing may also modify balances – we do it in a separate transaction or same?
-        # To keep it simple, we'll do rebalancing now, but it will also commit.
-        # For better performance, you could collect rebalance deltas similarly, but we'll leave as is.
+        # Rebalance only symbols that had trades
         for common_symbol in traded_symbols:
             orderbooks = exchange_orderbooks.get(common_symbol)
             if orderbooks:
                 quote_currency = "IRT" if common_symbol.endswith("IRT") else "USDT"
                 await self.rebalancer.rebalance_symbol_if_needed(db, common_symbol, quote_currency, orderbooks)
 
-        await db.commit()   # final commit for rebalancing changes
+        await db.commit()
