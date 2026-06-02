@@ -635,7 +635,7 @@ async function triggerRefresh() {
 }
 
 async function loadEstimatedProfit() {
-  const opportunities = await apiFetch("/opportunities/?limit=100")
+  const opportunities = await apiFetch("/opportunities/?limit=1000000")
   let estimated = 0
   opportunities?.forEach(item => {
     estimated += toToman(item.profit_quote || 0)
