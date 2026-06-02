@@ -191,7 +191,7 @@ class BitpinClient(ExchangeClient):
         url = f"{self.base_url}/api/v1/mth/orderbook/{symbol}/"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     resp.raise_for_status()
                     return await resp.json()
         except aiohttp.ClientConnectorDNSError as e:
