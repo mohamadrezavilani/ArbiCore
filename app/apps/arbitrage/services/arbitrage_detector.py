@@ -79,12 +79,10 @@ class ArbitrageDetector:
             if fee is None:
                 continue
             for price, vol in ask_levels:
-                # effective = price * (1 + fee)
-                effective = price
+                effective = price * (1 + fee)
                 asks.append((exch_name, price, vol, effective, fee))
             for price, vol in bid_levels:
-                effective = price
-                # effective = price * (1 - fee)
+                effective = price * (1 - fee)
                 bids.append((exch_name, price, vol, effective, fee))
 
         if not asks or not bids:
@@ -283,10 +281,8 @@ class ArbitrageDetector:
 
         if not is_live:
             # Simulator
-            effective_buy = ask_price
-            # effective_buy = ask_price * (1 + buy_fee)
-            effective_sell = bid_price
-            # effective_sell = bid_price * (1 - sell_fee)
+            effective_buy = ask_price * (1 + buy_fee)
+            effective_sell = bid_price * (1 - sell_fee)
             cost = volume * effective_buy
             revenue = volume * effective_sell
             from app.apps.arbitrage.inventory import update_base_balance, update_quote_balance
