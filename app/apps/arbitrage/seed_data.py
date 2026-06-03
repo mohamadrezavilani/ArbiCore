@@ -123,7 +123,7 @@ async def seed():
         settings_rows = [
             SymbolArbitrageSettings(
                 common_symbol="USDTIRT",
-                min_profit_percent=0.001,
+                min_profit_percent=0.7,
                 cutoff_threshold=0,
                 min_trade_percent=0.20,
                 min_trade_factor=0.3,

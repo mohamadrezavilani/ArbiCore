@@ -209,6 +209,20 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
+            profit_percent = (eff_bid - eff_ask) / eff_ask * 100
+            min_profit = float(settings.min_profit_percent)
+            if profit_percent < min_profit:
+                reason = f"Profit {profit_percent:.4f}% below minimum {min_profit}%"
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    reason,
+                    {"eff_ask": eff_ask, "eff_bid": eff_bid, "min_profit": min_profit}
+                )
+                i += 1
+                j += 1
+                continue
+
             net_gain = max_vol * (eff_bid - eff_ask)
             trade_pct = self.risk_manager.calculate_trade_percent(
                 net_gain=net_gain,
