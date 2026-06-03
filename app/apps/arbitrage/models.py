@@ -59,6 +59,7 @@ class ArbitrageOpportunity(Base, UUIDMixin, TimestampMixin):
     price_b: Mapped[float] = mapped_column(Numeric(20, 10))
     profit_percent: Mapped[float] = mapped_column(Numeric(10, 4))
     traded_volume: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
+    profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)   # <-- new
 
 class BaseInventory(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "base_inventories"
@@ -92,27 +93,21 @@ class SymbolArbitrageSettings(Base, UUIDMixin, TimestampMixin):
     common_symbol: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     min_profit_percent: Mapped[float] = mapped_column(Numeric(10, 4), default=0.5)
     is_active: Mapped[bool] = mapped_column(default=True)
-
-    # Risk parameters
     cutoff_threshold: Mapped[float] = mapped_column(Numeric(10, 6), default=0.1)
     min_trade_percent: Mapped[float] = mapped_column(Numeric(10, 6), default=0.2)
     min_trade_factor: Mapped[float] = mapped_column(Numeric(10, 6), default=0.3)
     valuability_factor: Mapped[float] = mapped_column(Numeric(10, 6), default=1.0)
-
-    # Default network to use for transferring this symbol
     default_network_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("networks.id"), nullable=True)
     default_network: Mapped[Optional["Network"]] = relationship()
-
     opportunistic_rebalance_enabled: Mapped[bool] = mapped_column(default=False)
     opportunistic_rebalance_max_loss_percent: Mapped[float] = mapped_column(Numeric(10, 6), default=0.5)
-
-    # Market rebalancing (trades, not transfers)
     market_rebalance_enabled: Mapped[bool] = mapped_column(default=True)
-    market_rebalance_amount_percent: Mapped[float] = mapped_column(Numeric(5,2), default=20.0)   # % of avg base balance
-    market_rebalance_max_spread_percent: Mapped[float] = mapped_column(Numeric(5,2), default=0.1) # max price diff %
-    market_rebalance_imbalance_ratio: Mapped[float] = mapped_column(Numeric(5,2), default=0.2)    # trigger when min < ratio * avg
-    market_rebalance_cooldown_seconds: Mapped[int] = mapped_column(default=300)                   # 5 minutes
+    market_rebalance_amount_percent: Mapped[float] = mapped_column(Numeric(5,2), default=20.0)
+    market_rebalance_max_spread_percent: Mapped[float] = mapped_column(Numeric(5,2), default=0.6)
+    market_rebalance_imbalance_ratio: Mapped[float] = mapped_column(Numeric(5,2), default=0.25)
+    market_rebalance_cooldown_seconds: Mapped[int] = mapped_column(default=300)
     last_rebalance_time: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    rebalance_pending: Mapped[bool] = mapped_column(default=False)   # <-- new
 
 class RejectedOpportunity(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "rejected_opportunities"

@@ -21,7 +21,7 @@ async def get_opportunities(limit: int = 20, db: AsyncSession = Depends(get_db))
             ao.created_at,
             ea.name AS exchange_a_name,
             eb.name AS exchange_b_name,
-            (ao.traded_volume * (ao.price_b - ao.price_a)) AS profit_quote
+            ao.profit_quote
         FROM arbitrage_opportunities ao
         JOIN exchanges ea ON ao.exchange_a_id = ea.id
         JOIN exchanges eb ON ao.exchange_b_id = eb.id

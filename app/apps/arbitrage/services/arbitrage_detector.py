@@ -264,7 +264,7 @@ class ArbitrageDetector:
 
             # Execute trade
             is_live = (exchange_modes.get(buy_exch) == "live" and exchange_modes.get(sell_exch) == "live")
-            success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell = \
+            success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit = \
                 await self.trade_executor.execute_and_get_deltas(
                     db=db,
                     common_symbol=common_symbol,
@@ -303,8 +303,10 @@ class ArbitrageDetector:
                     trade_type=f"buy_on_{buy_exch}_sell_on_{sell_exch}",
                     price_a=vwap_buy,
                     price_b=vwap_sell,
-                    profit_percent=((filled_vol * vwap_sell - filled_vol * vwap_buy) / (filled_vol * vwap_buy)) * 100 if filled_vol > 0 else 0,
-                    traded_volume=filled_vol
+                    profit_percent=((filled_vol * vwap_sell - filled_vol * vwap_buy) / (
+                                filled_vol * vwap_buy)) * 100 if filled_vol > 0 else 0,
+                    traded_volume=filled_vol,
+                    profit_quote=net_profit  # <-- store net profit
                 )
                 opportunities.append(opp)
 

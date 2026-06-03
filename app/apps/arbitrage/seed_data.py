@@ -132,13 +132,13 @@ async def seed():
                 is_active=True,
                 opportunistic_rebalance_enabled=False,
                 opportunistic_rebalance_max_loss_percent=50.0,
-                # New fields
                 market_rebalance_enabled=True,
                 market_rebalance_amount_percent=20.0,
                 market_rebalance_max_spread_percent=0.6,
                 market_rebalance_imbalance_ratio=0.25,
                 market_rebalance_cooldown_seconds=60,
-                last_rebalance_time=None
+                last_rebalance_time=None,
+                rebalance_pending=False  # <-- new
             )
         ]
         session.add_all(settings_rows)

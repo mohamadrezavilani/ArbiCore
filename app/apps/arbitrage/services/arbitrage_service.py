@@ -1,5 +1,6 @@
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from .orderbook_fetcher import OrderbookFetcher
 from .arbitrage_detector import ArbitrageDetector
 from .opportunity_logger import OpportunityLogger
@@ -7,6 +8,7 @@ from .risk_manager import RiskManager
 from .trade_executor import TradeExecutor
 from .rebalancer import Rebalancer
 from app.apps.arbitrage.inventory import update_base_balance, update_quote_balance
+from app.apps.arbitrage.models import SymbolArbitrageSettings
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,6 @@ class ArbitrageService:
             )
             if any_trade:
                 traded_symbols.append(common_symbol)
-                # Merge deltas
                 for ex, delta in base_deltas.items():
                     all_base_deltas[(ex, common_symbol)] = all_base_deltas.get((ex, common_symbol), 0.0) + delta
                 for ex, delta in quote_deltas.items():
@@ -50,7 +51,7 @@ class ArbitrageService:
                     all_quote_deltas[(ex, quote_currency)] = all_quote_deltas.get((ex, quote_currency), 0.0) + delta
                 all_opportunities.extend(opportunities)
 
-        # Apply all balance updates in bulk
+        # Apply balance updates
         for (ex, sym), delta in all_base_deltas.items():
             if abs(delta) > 1e-8:
                 await update_base_balance(db, ex, sym, delta)
@@ -61,11 +62,25 @@ class ArbitrageService:
         db.add_all(all_opportunities)
         await db.commit()
 
-        # Rebalance only symbols that had trades
+        # Rebalance for symbols that had trades
         for common_symbol in traded_symbols:
             orderbooks = exchange_orderbooks.get(common_symbol)
             if orderbooks:
                 quote_currency = "IRT" if common_symbol.endswith("IRT") else "USDT"
                 await self.rebalancer.rebalance_symbol_if_needed(db, common_symbol, quote_currency, orderbooks)
+
+        # Also rebalance for any symbol that has rebalance_pending=True (even if no trades)
+        pending_stmt = select(SymbolArbitrageSettings.common_symbol).where(
+            SymbolArbitrageSettings.rebalance_pending == True,
+            SymbolArbitrageSettings.common_symbol.in_(exchange_orderbooks.keys())
+        )
+        pending_result = await db.execute(pending_stmt)
+        pending_symbols = pending_result.scalars().all()
+        for sym in pending_symbols:
+            if sym not in traded_symbols:
+                orderbooks = exchange_orderbooks.get(sym)
+                if orderbooks:
+                    quote_currency = "IRT" if sym.endswith("IRT") else "USDT"
+                    await self.rebalancer.rebalance_symbol_if_needed(db, sym, quote_currency, orderbooks)
 
         await db.commit()

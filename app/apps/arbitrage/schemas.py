@@ -45,8 +45,8 @@ class ArbitrageOpportunityResponse(BaseModel):
     price_a: float
     price_b: float
     profit_percent: float
-    traded_volume: float          # new
-    profit_quote: float           # new – actual profit in IRT or USDT
+    traded_volume: float
+    profit_quote: float           # now stored, not computed
     created_at: datetime
 
 class OpportunitySummaryItem(BaseModel):
@@ -95,6 +95,7 @@ class RiskSettingsResponse(BaseModel):
     market_rebalance_imbalance_ratio: float
     market_rebalance_cooldown_seconds: int
     last_rebalance_time: Optional[datetime]
+    rebalance_pending: bool
 
 class RiskSettingsUpdate(BaseModel):
     min_profit_percent: Optional[float] = None
@@ -112,6 +113,7 @@ class RiskSettingsUpdate(BaseModel):
     market_rebalance_max_spread_percent: Optional[float] = None
     market_rebalance_imbalance_ratio: Optional[float] = None
     market_rebalance_cooldown_seconds: Optional[int] = None
+    rebalance_pending: bool
 
 
 class SymbolSettingsResponse(SymbolSettingsCreate):

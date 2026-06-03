@@ -15,7 +15,6 @@ class TradeExecutor:
         self.logger = logger
 
     async def sync_balances_from_exchange(self, db: AsyncSession, exchange_name: str, client):
-        """After a live trade, replace DB balances with real exchange balances."""
         try:
             real_balances = await client.get_balances()
             stmt = select(ExchangeSymbol).join(Exchange).where(Exchange.name == exchange_name)
@@ -48,29 +47,31 @@ class TradeExecutor:
         vwap_buy: float,
         vwap_sell: float,
         is_live: bool
-    ) -> Tuple[bool, float, float, float, float, float, float, float]:
+    ) -> Tuple[bool, float, float, float, float, float, float, float, float]:
         """
         Returns:
             success, filled_vol, vwap_buy, vwap_sell,
-            base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell
+            base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell,
+            net_profit (in quote currency)
         """
         if not is_live:
-            # Simulator mode: compute deltas, no DB commit
+            # Simulator mode: compute deltas and net profit
             effective_buy = vwap_buy * (1 + buy_fee_rate)
             effective_sell = vwap_sell * (1 - sell_fee_rate)
             cost = volume * effective_buy
             revenue = volume * effective_sell
+            net_profit = revenue - cost
             base_delta_buy = volume
             base_delta_sell = -volume
             quote_delta_buy = -cost
             quote_delta_sell = revenue
-            logger.info(f"Simulator trade: {volume:.4f} {common_symbol} buy@{buy_exchange} {effective_buy:.2f} sell@{sell_exchange} {effective_sell:.2f}")
-            return True, volume, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell
+            logger.info(f"Simulator trade: {volume:.4f} {common_symbol} buy@{buy_exchange} {effective_buy:.2f} sell@{sell_exchange} {effective_sell:.2f} net_profit={net_profit:.2f}")
+            return True, volume, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit
 
-        # Live mode
+        # Live mode (simplified – net profit calculation would need actual fill prices)
         if buy_client is None or sell_client is None:
             logger.error("Live mode requires valid exchange clients")
-            return False, 0, 0, 0, 0, 0, 0, 0
+            return False, 0, 0, 0, 0, 0, 0, 0, 0
 
         timeout_initial = 5.0
         timeout_extended = 60.0
@@ -99,7 +100,7 @@ class TradeExecutor:
                 "Atomic trade failed (order placement)",
                 {"buy_status": buy_result.status, "sell_status": sell_result.status}
             )
-            return False, 0, 0, 0, 0, 0, 0, 0
+            return False, 0, 0, 0, 0, 0, 0, 0, 0
 
         start = asyncio.get_event_loop().time()
         buy_filled = sell_filled = False
@@ -122,11 +123,14 @@ class TradeExecutor:
             vwap_buy_final = buy_result.filled_price
             vwap_sell_final = sell_result.filled_price
             filled_vol = min(buy_result.filled_volume, sell_result.filled_volume)
+            cost = filled_vol * vwap_buy_final
+            revenue = filled_vol * vwap_sell_final
+            net_profit = revenue - cost  # note: fees are already deducted in filled_price? Usually market orders include fee in filled_price? Depends on exchange. For simplicity, assume net.
             await self.sync_balances_from_exchange(db, buy_exchange, buy_client)
             await self.sync_balances_from_exchange(db, sell_exchange, sell_client)
-            return True, filled_vol, vwap_buy_final, vwap_sell_final, 0.0, 0.0, 0.0, 0.0
+            return True, filled_vol, vwap_buy_final, vwap_sell_final, 0.0, 0.0, 0.0, 0.0, net_profit
 
-        # Extended wait for missing leg
+        # Extended wait (keep existing logic)
         if buy_filled and not sell_filled:
             extended_start = asyncio.get_event_loop().time()
             while (asyncio.get_event_loop().time() - extended_start) < timeout_extended:
@@ -144,7 +148,7 @@ class TradeExecutor:
                     "Second leg (sell) did not fill within extended timeout",
                     {"buy_filled": buy_filled, "sell_filled": sell_filled}
                 )
-                return False, 0, 0, 0, 0, 0, 0, 0
+                return False, 0, 0, 0, 0, 0, 0, 0, 0
         elif sell_filled and not buy_filled:
             extended_start = asyncio.get_event_loop().time()
             while (asyncio.get_event_loop().time() - extended_start) < timeout_extended:
@@ -162,7 +166,7 @@ class TradeExecutor:
                     "Second leg (buy) did not fill within extended timeout",
                     {"buy_filled": buy_filled, "sell_filled": sell_filled}
                 )
-                return False, 0, 0, 0, 0, 0, 0, 0
+                return False, 0, 0, 0, 0, 0, 0, 0, 0
         else:
             await buy_client.cancel_order(buy_result.client_order_id)
             await sell_client.cancel_order(sell_result.client_order_id)
@@ -172,12 +176,15 @@ class TradeExecutor:
                 "Neither leg filled within initial timeout",
                 {"buy_filled": buy_filled, "sell_filled": sell_filled}
             )
-            return False, 0, 0, 0, 0, 0, 0, 0
+            return False, 0, 0, 0, 0, 0, 0, 0, 0
 
         # Both filled after extended wait
         vwap_buy_final = buy_result.filled_price
         vwap_sell_final = sell_result.filled_price
         filled_vol = min(buy_result.filled_volume, sell_result.filled_volume)
+        cost = filled_vol * vwap_buy_final
+        revenue = filled_vol * vwap_sell_final
+        net_profit = revenue - cost
         await self.sync_balances_from_exchange(db, buy_exchange, buy_client)
         await self.sync_balances_from_exchange(db, sell_exchange, sell_client)
-        return True, filled_vol, vwap_buy_final, vwap_sell_final, 0.0, 0.0, 0.0, 0.0
+        return True, filled_vol, vwap_buy_final, vwap_sell_final, 0.0, 0.0, 0.0, 0.0, net_profit

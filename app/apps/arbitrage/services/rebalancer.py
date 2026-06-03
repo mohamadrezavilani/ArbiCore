@@ -29,6 +29,7 @@ class Rebalancer:
     ) -> Tuple[bool, str]:
         """
         Returns (success, reason).
+        If imbalance exists but cannot rebalance now, sets rebalance_pending=True.
         """
         logger.info(f"[REBALANCE] Checking {common_symbol} (quote={quote_currency})")
 
@@ -75,12 +76,22 @@ class Rebalancer:
         trigger_threshold = imbalance_ratio * avg_balance
         logger.info(f"[REBALANCE] Imbalance ratio = {imbalance_ratio} (trigger when min < {trigger_threshold:.2f})")
 
-        if poorest[1] >= trigger_threshold:
+        # 3. Check imbalance – set pending flag if needed
+        if poorest[1] < trigger_threshold:
+            settings.rebalance_pending = True
+            await db.flush()
+            logger.info(f"[REBALANCE] Imbalance detected, set pending flag for {common_symbol}")
+        else:
+            # No imbalance, clear pending if it was set
+            if settings.rebalance_pending:
+                settings.rebalance_pending = False
+                await db.flush()
+                logger.info(f"[REBALANCE] No imbalance, cleared pending flag for {common_symbol}")
             reason = f"No imbalance: poorest {poorest[0]} balance {poorest[1]:.2f} >= {trigger_threshold:.2f}"
             logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
-        # 3. Cooldown check
+        # 4. Cooldown check – only if pending, we still need to wait, but keep pending flag
         if settings.last_rebalance_time:
             cooldown_sec = settings.market_rebalance_cooldown_seconds
             next_allowed = settings.last_rebalance_time + timedelta(seconds=cooldown_sec)
@@ -89,13 +100,14 @@ class Rebalancer:
                 next_allowed_str = format_local_time(next_allowed)
                 reason = f"Cooldown active until {next_allowed_str} (Tehran time)"
                 logger.info(f"[REBALANCE] {reason}")
+                # Keep pending flag, but don't execute
                 return False, reason
             else:
                 logger.info(f"[REBALANCE] Cooldown passed (last rebalance at {format_local_time(settings.last_rebalance_time)})")
         else:
             logger.info("[REBALANCE] No previous rebalance time, proceeding")
 
-        # 4. Orderbook availability
+        # 5. Orderbook availability
         richest_ob = exchange_orderbooks.get(richest[0])
         poorest_ob = exchange_orderbooks.get(poorest[0])
         if not richest_ob or not poorest_ob:
@@ -104,6 +116,7 @@ class Rebalancer:
             if not poorest_ob: missing.append(poorest[0])
             reason = f"Missing orderbook for {', '.join(missing)}"
             logger.warning(f"[REBALANCE] {reason}")
+            # Keep pending flag, will retry later
             return False, reason
 
         richest_asks, _ = richest_ob
@@ -120,21 +133,20 @@ class Rebalancer:
         logger.info(f"[REBALANCE] Prices: sell@{richest[0]}={sell_price:.2f}, buy@{poorest[0]}={buy_price:.2f}, spread={spread_percent:.3f}%, max_spread={max_spread}%")
 
         if spread_percent > max_spread:
-            reason = f"Spread {spread_percent:.2f}% > {max_spread}%"
+            reason = f"Spread {spread_percent:.2f}% > {max_spread}% – will retry later (pending flag remains)"
             logger.info(f"[REBALANCE] {reason}")
+            # Keep pending flag, do not execute
             return False, reason
 
-        # 5. Target amount
+        # 6. Target amount
         target_amount = avg_balance * (float(settings.market_rebalance_amount_percent) / 100.0)
         logger.info(f"[REBALANCE] Target amount = {target_amount:.4f} ({settings.market_rebalance_amount_percent}% of avg)")
 
-        # Respect available base on richest
         if target_amount > richest[1]:
             old = target_amount
             target_amount = richest[1] * 0.9
             logger.info(f"[REBALANCE] Reduced target from {old:.4f} to {target_amount:.4f} due to richest balance {richest[1]:.2f}")
 
-        # Respect available quote on poorest
         poorest_quote_balance = await get_quote_balance(db, poorest[0], quote_currency)
         cost_estimate = target_amount * buy_price
         if cost_estimate > poorest_quote_balance:
@@ -147,16 +159,15 @@ class Rebalancer:
             logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
-        # 6. Execute trade – decide based on mode
+        # 7. Execute trade
         mode_richest = exchange_modes.get(richest[0], "simulator")
         mode_poorest = exchange_modes.get(poorest[0], "simulator")
         is_live = (mode_richest == "live" and mode_poorest == "live")
 
-        # Fetch exchange IDs and clients if live
-        buy_exch_obj_id = None
-        sell_exch_obj_id = None
         buy_client = None
         sell_client = None
+        buy_exch_obj_id = None
+        sell_exch_obj_id = None
         if is_live:
             buy_client = get_exchange_client(poorest[0])
             sell_client = get_exchange_client(richest[0])
@@ -189,7 +200,6 @@ class Rebalancer:
         fee_res = await db.execute(fee_stmt)
         sell_fee = float(fee_res.scalar() or 0.0)
 
-        # Call trade executor with new method
         success, filled_vol, vwap_buy, vwap_sell, _, _, _, _ = await self.trade_executor.execute_and_get_deltas(
             db=db,
             common_symbol=common_symbol,
@@ -211,9 +221,10 @@ class Rebalancer:
         if not success:
             reason = "Trade execution failed (see logs for details)"
             logger.error(f"[REBALANCE] {reason}")
+            # Keep pending flag
             return False, reason
 
-        # 7. Log rebalance
+        # 8. Log rebalance
         await self.logger.log_rebalance(
             db,
             common_symbol=common_symbol,
@@ -226,8 +237,9 @@ class Rebalancer:
             reason=f"market_rebalance_{common_symbol}_imbalance_{imbalance_ratio}"
         )
 
-        # 8. Update last rebalance time and commit
+        # 9. Update last rebalance time and clear pending flag
         settings.last_rebalance_time = datetime.utcnow()
+        settings.rebalance_pending = False
         await db.commit()
 
         reason = f"Rebalance executed: sold {filled_vol:.4f} on {richest[0]} at VWAP {vwap_sell:.2f}, bought on {poorest[0]} at VWAP {vwap_buy:.2f}"
