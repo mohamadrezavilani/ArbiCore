@@ -142,7 +142,7 @@ async def seed():
                 # NEW
                 quote_rebalance_enabled=True,
                 quote_rebalance_amount_percent=20.0,
-                quote_rebalance_max_spread_percent=0.4,
+                quote_rebalance_max_spread_percent=0.3,
                 quote_rebalance_imbalance_ratio=0.25,
                 quote_rebalance_cooldown_seconds=60,
                 last_quote_rebalance_time=None,
