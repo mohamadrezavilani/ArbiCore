@@ -13,6 +13,7 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
 class ArbitrageService:
     def __init__(self):
         self.poll_interval = settings.ARBITRAGE_CHECK_INTERVAL_SECONDS
@@ -29,6 +30,15 @@ class ArbitrageService:
         )
 
     async def poll_and_store(self, db: AsyncSession):
+        """
+        Main arbitrage cycle:
+        1. Fetch orderbooks for all symbols in parallel.
+        2. Run arbitrage detection and execution for each symbol.
+        3. Apply all balance updates and store opportunities in one transaction.
+        4. Rebalance base assets for symbols that had trades.
+        5. Rebalance base assets for symbols with pending flag.
+        6. Rebalance quote assets for symbols with pending quote flag.
+        """
         exchange_orderbooks = await self.fetcher.fetch_all(db)
         if not exchange_orderbooks:
             return
@@ -38,20 +48,23 @@ class ArbitrageService:
         all_opportunities = []
         traded_symbols = []
 
+        # ---- 1. Arbitrage detection for all symbols ----
         for common_symbol, orderbooks in exchange_orderbooks.items():
             any_trade, base_deltas, quote_deltas, opportunities = await self.detector.detect_for_symbol(
                 db, common_symbol, orderbooks
             )
             if any_trade:
                 traded_symbols.append(common_symbol)
+                # Merge base deltas
                 for ex, delta in base_deltas.items():
                     all_base_deltas[(ex, common_symbol)] = all_base_deltas.get((ex, common_symbol), 0.0) + delta
+                # Merge quote deltas
                 for ex, delta in quote_deltas.items():
                     quote_currency = "IRT" if common_symbol.endswith("IRT") else "USDT"
                     all_quote_deltas[(ex, quote_currency)] = all_quote_deltas.get((ex, quote_currency), 0.0) + delta
                 all_opportunities.extend(opportunities)
 
-        # Apply balance updates
+        # ---- 2. Apply all balance updates in bulk ----
         for (ex, sym), delta in all_base_deltas.items():
             if abs(delta) > 1e-8:
                 await update_base_balance(db, ex, sym, delta)
@@ -60,16 +73,16 @@ class ArbitrageService:
                 await update_quote_balance(db, ex, cur, delta)
 
         db.add_all(all_opportunities)
-        await db.commit()
+        await db.commit()   # commit arbitrage changes
 
-        # Rebalance for symbols that had trades
+        # ---- 3. Rebalance base asset for symbols that just traded ----
         for common_symbol in traded_symbols:
             orderbooks = exchange_orderbooks.get(common_symbol)
             if orderbooks:
                 quote_currency = "IRT" if common_symbol.endswith("IRT") else "USDT"
                 await self.rebalancer.rebalance_symbol_if_needed(db, common_symbol, quote_currency, orderbooks)
 
-        # Also rebalance for any symbol that has rebalance_pending=True (even if no trades)
+        # ---- 4. Rebalance base asset for symbols with pending flag (no new trades but imbalance exists) ----
         pending_stmt = select(SymbolArbitrageSettings.common_symbol).where(
             SymbolArbitrageSettings.rebalance_pending == True,
             SymbolArbitrageSettings.common_symbol.in_(exchange_orderbooks.keys())
@@ -77,10 +90,24 @@ class ArbitrageService:
         pending_result = await db.execute(pending_stmt)
         pending_symbols = pending_result.scalars().all()
         for sym in pending_symbols:
-            if sym not in traded_symbols:
+            if sym not in traded_symbols:   # avoid double rebalancing
                 orderbooks = exchange_orderbooks.get(sym)
                 if orderbooks:
                     quote_currency = "IRT" if sym.endswith("IRT") else "USDT"
                     await self.rebalancer.rebalance_symbol_if_needed(db, sym, quote_currency, orderbooks)
 
+        # ---- 5. Rebalance quote currency (IRT) for symbols with pending quote flag ----
+        pending_quote_stmt = select(SymbolArbitrageSettings.common_symbol).where(
+            SymbolArbitrageSettings.quote_rebalance_pending == True,
+            SymbolArbitrageSettings.common_symbol.in_(exchange_orderbooks.keys())
+        )
+        pending_quote_result = await db.execute(pending_quote_stmt)
+        pending_quote_symbols = pending_quote_result.scalars().all()
+        for sym in pending_quote_symbols:
+            orderbooks = exchange_orderbooks.get(sym)
+            if orderbooks:
+                quote_currency = "IRT" if sym.endswith("IRT") else "USDT"
+                await self.rebalancer.rebalance_quote_if_needed(db, sym, quote_currency, orderbooks)
+
+        # Final commit for all rebalancing changes
         await db.commit()

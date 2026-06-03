@@ -12,7 +12,7 @@ class Exchange(Base, UUIDMixin, TimestampMixin):
     base_url: Mapped[str] = mapped_column(String(200))
     orderbook_endpoint: Mapped[str] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(default=True)
-    mode: Mapped[str] = mapped_column(String(20), default="simulator")   # "simulator" or "live"
+    mode: Mapped[str] = mapped_column(String(20), default="simulator")
 
     symbols: Mapped[list["ExchangeSymbol"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
     base_inventories: Mapped[list["BaseInventory"]] = relationship(back_populates="exchange", cascade="all, delete-orphan")
@@ -23,10 +23,11 @@ class Exchange(Base, UUIDMixin, TimestampMixin):
 class ExchangeFee(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "exchange_fees"
     exchange_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"), nullable=False)
-    quote_currency: Mapped[str] = mapped_column(String(10), nullable=False)  # 'IRT' or 'USDT'
+    quote_currency: Mapped[str] = mapped_column(String(10), nullable=False)
     taker_fee: Mapped[float] = mapped_column(Numeric(10, 6), default=0.0)
     maker_fee: Mapped[float] = mapped_column(Numeric(10, 6), default=0.0)
     exchange: Mapped["Exchange"] = relationship(back_populates="fees")
+
 
 class ExchangeSymbol(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "exchange_symbols"
@@ -36,6 +37,7 @@ class ExchangeSymbol(Base, UUIDMixin, TimestampMixin):
     price_conversion_factor: Mapped[float] = mapped_column(Numeric(10, 5), default=1.0)
     is_active: Mapped[bool] = mapped_column(default=True)
     exchange: Mapped["Exchange"] = relationship(back_populates="symbols")
+
 
 class OrderbookSnapshot(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "orderbook_snapshots"
@@ -49,6 +51,7 @@ class OrderbookSnapshot(Base, UUIDMixin, TimestampMixin):
     bids: Mapped[list] = mapped_column(JSON, nullable=True)
     raw_data: Mapped[dict] = mapped_column(JSON, nullable=True)
 
+
 class ArbitrageOpportunity(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "arbitrage_opportunities"
     common_symbol: Mapped[str] = mapped_column(String(50), index=True)
@@ -59,7 +62,8 @@ class ArbitrageOpportunity(Base, UUIDMixin, TimestampMixin):
     price_b: Mapped[float] = mapped_column(Numeric(20, 10))
     profit_percent: Mapped[float] = mapped_column(Numeric(10, 4))
     traded_volume: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
-    profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)   # <-- new
+    profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
+
 
 class BaseInventory(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "base_inventories"
@@ -67,85 +71,93 @@ class BaseInventory(Base, UUIDMixin, TimestampMixin):
     common_symbol: Mapped[str] = mapped_column(String(50), nullable=False)
     balance: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
     exchange: Mapped["Exchange"] = relationship(back_populates="base_inventories")
-    __table_args__ = (
-        CheckConstraint('balance >= 0', name='check_base_balance_non_negative'),
-    )
+    __table_args__ = (CheckConstraint('balance >= 0', name='check_base_balance_non_negative'),)
+
 
 class QuoteInventory(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "quote_inventories"
     exchange_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"), nullable=False)
-    currency: Mapped[str] = mapped_column(String(10), nullable=False)  # 'IRT' or 'USDT'
+    currency: Mapped[str] = mapped_column(String(10), nullable=False)
     balance: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
     exchange: Mapped["Exchange"] = relationship(back_populates="quote_inventories")
-    __table_args__ = (
-        CheckConstraint('balance >= 0', name='check_quote_balance_non_negative'),
-    )
+    __table_args__ = (CheckConstraint('balance >= 0', name='check_quote_balance_non_negative'),)
+
 
 class Network(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "networks"
-    symbol: Mapped[str] = mapped_column(String(50), nullable=False)   # common_symbol
+    symbol: Mapped[str] = mapped_column(String(50), nullable=False)
     network_name: Mapped[str] = mapped_column(String(50), nullable=False)
-    fee_per_transfer: Mapped[float] = mapped_column(Numeric(20, 10), default=0.0)   # in base currency
+    fee_per_transfer: Mapped[float] = mapped_column(Numeric(20, 10), default=0.0)
     is_active: Mapped[bool] = mapped_column(default=True)
+
 
 class SymbolArbitrageSettings(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "symbol_arbitrage_settings"
     common_symbol: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     min_profit_percent: Mapped[float] = mapped_column(Numeric(10, 4), default=0.5)
     is_active: Mapped[bool] = mapped_column(default=True)
+
     cutoff_threshold: Mapped[float] = mapped_column(Numeric(10, 6), default=0.1)
     min_trade_percent: Mapped[float] = mapped_column(Numeric(10, 6), default=0.2)
     min_trade_factor: Mapped[float] = mapped_column(Numeric(10, 6), default=0.3)
     valuability_factor: Mapped[float] = mapped_column(Numeric(10, 6), default=1.0)
+
     default_network_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("networks.id"), nullable=True)
     default_network: Mapped[Optional["Network"]] = relationship()
+
     opportunistic_rebalance_enabled: Mapped[bool] = mapped_column(default=False)
     opportunistic_rebalance_max_loss_percent: Mapped[float] = mapped_column(Numeric(10, 6), default=0.5)
+
+    # Market rebalancing (base asset)
     market_rebalance_enabled: Mapped[bool] = mapped_column(default=True)
     market_rebalance_amount_percent: Mapped[float] = mapped_column(Numeric(5,2), default=20.0)
     market_rebalance_max_spread_percent: Mapped[float] = mapped_column(Numeric(5,2), default=0.6)
     market_rebalance_imbalance_ratio: Mapped[float] = mapped_column(Numeric(5,2), default=0.25)
     market_rebalance_cooldown_seconds: Mapped[int] = mapped_column(default=300)
     last_rebalance_time: Mapped[Optional[datetime]] = mapped_column(nullable=True)
-    rebalance_pending: Mapped[bool] = mapped_column(default=False)   # <-- new
+    rebalance_pending: Mapped[bool] = mapped_column(default=False)
+
+    # NEW: Quote rebalancing (IRT)
+    quote_rebalance_enabled: Mapped[bool] = mapped_column(default=True)
+    quote_rebalance_amount_percent: Mapped[float] = mapped_column(Numeric(5,2), default=20.0)
+    quote_rebalance_max_spread_percent: Mapped[float] = mapped_column(Numeric(5,2), default=0.6)
+    quote_rebalance_imbalance_ratio: Mapped[float] = mapped_column(Numeric(5,2), default=0.25)
+    quote_rebalance_cooldown_seconds: Mapped[int] = mapped_column(default=300)
+    last_quote_rebalance_time: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    quote_rebalance_pending: Mapped[bool] = mapped_column(default=False)
+
 
 class RejectedOpportunity(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "rejected_opportunities"
-
     common_symbol: Mapped[str] = mapped_column(String(50), index=True)
     exchange_a_name: Mapped[str] = mapped_column(String(50))
     exchange_b_name: Mapped[str] = mapped_column(String(50))
-    trade_type: Mapped[str] = mapped_column(String(50))  # e.g., "buy_on_wallex_sell_on_nobitex"
+    trade_type: Mapped[str] = mapped_column(String(50))
     rejection_reason: Mapped[str] = mapped_column(String(200))
-    details: Mapped[dict] = mapped_column(JSON, nullable=True)  # store prices, fees, thresholds, etc.
+    details: Mapped[dict] = mapped_column(JSON, nullable=True)
+
 
 class RebalanceLog(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "rebalance_logs"
-
-    common_symbol: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # for base rebalance
-    currency: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)       # for quote rebalance
+    common_symbol: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    currency: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     from_exchange: Mapped[str] = mapped_column(String(50))
     to_exchange: Mapped[str] = mapped_column(String(50))
     amount_sent: Mapped[float] = mapped_column(Numeric(20, 8))
     network_fee: Mapped[float] = mapped_column(Numeric(20, 8))
     net_received: Mapped[float] = mapped_column(Numeric(20, 8))
-    reason: Mapped[str] = mapped_column(String(200))   # e.g., "base_balance_below_threshold"
+    reason: Mapped[str] = mapped_column(String(200))
+
 
 class ExchangePairWeight(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "exchange_pair_weights"
-
     exchange_a_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"), nullable=False)
     exchange_b_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"), nullable=False)
-    weight: Mapped[float] = mapped_column(Numeric(3, 2), default=0.5)   # range 0.5 - 1.0
+    weight: Mapped[float] = mapped_column(Numeric(3, 2), default=0.5)
     last_buy_exchange_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("exchanges.id"), nullable=True)
     last_sell_exchange_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("exchanges.id"), nullable=True)
-
-    # relationships (optional, but useful)
     exchange_a: Mapped["Exchange"] = relationship(foreign_keys=[exchange_a_id])
     exchange_b: Mapped["Exchange"] = relationship(foreign_keys=[exchange_b_id])
     last_buy_exchange: Mapped[Optional["Exchange"]] = relationship(foreign_keys=[last_buy_exchange_id])
     last_sell_exchange: Mapped[Optional["Exchange"]] = relationship(foreign_keys=[last_sell_exchange_id])
-
-    __table_args__ = (
-        UniqueConstraint('exchange_a_id', 'exchange_b_id', name='uq_exchange_pair'),
-    )
+    __table_args__ = (UniqueConstraint('exchange_a_id', 'exchange_b_id', name='uq_exchange_pair'),)

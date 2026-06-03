@@ -76,6 +76,7 @@ class SymbolSettingsCreate(BaseModel):
     opportunistic_rebalance_enabled: bool = False
     opportunistic_rebalance_max_loss_percent: float = 0.5
 
+
 class RiskSettingsResponse(BaseModel):
     id: UUID4
     common_symbol: str
@@ -88,7 +89,6 @@ class RiskSettingsResponse(BaseModel):
     is_active: bool
     opportunistic_rebalance_enabled: bool
     opportunistic_rebalance_max_loss_percent: float
-    # New market rebalance fields
     market_rebalance_enabled: bool
     market_rebalance_amount_percent: float
     market_rebalance_max_spread_percent: float
@@ -96,6 +96,15 @@ class RiskSettingsResponse(BaseModel):
     market_rebalance_cooldown_seconds: int
     last_rebalance_time: Optional[datetime]
     rebalance_pending: bool
+    # New quote rebalancing fields
+    quote_rebalance_enabled: bool
+    quote_rebalance_amount_percent: float
+    quote_rebalance_max_spread_percent: float
+    quote_rebalance_imbalance_ratio: float
+    quote_rebalance_cooldown_seconds: int
+    last_quote_rebalance_time: Optional[datetime]
+    quote_rebalance_pending: bool
+
 
 class RiskSettingsUpdate(BaseModel):
     min_profit_percent: Optional[float] = None
@@ -107,13 +116,20 @@ class RiskSettingsUpdate(BaseModel):
     is_active: Optional[bool] = None
     opportunistic_rebalance_enabled: Optional[bool] = None
     opportunistic_rebalance_max_loss_percent: Optional[float] = None
-    # New market rebalance fields
     market_rebalance_enabled: Optional[bool] = None
     market_rebalance_amount_percent: Optional[float] = None
     market_rebalance_max_spread_percent: Optional[float] = None
     market_rebalance_imbalance_ratio: Optional[float] = None
     market_rebalance_cooldown_seconds: Optional[int] = None
-    rebalance_pending: bool
+    rebalance_pending: Optional[bool] = None
+    # New
+    quote_rebalance_enabled: Optional[bool] = None
+    quote_rebalance_amount_percent: Optional[float] = None
+    quote_rebalance_max_spread_percent: Optional[float] = None
+    quote_rebalance_imbalance_ratio: Optional[float] = None
+    quote_rebalance_cooldown_seconds: Optional[int] = None
+    last_quote_rebalance_time: Optional[datetime] = None
+    quote_rebalance_pending: Optional[bool] = None
 
 
 class SymbolSettingsResponse(SymbolSettingsCreate):

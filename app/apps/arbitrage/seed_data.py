@@ -138,7 +138,15 @@ async def seed():
                 market_rebalance_imbalance_ratio=0.25,
                 market_rebalance_cooldown_seconds=60,
                 last_rebalance_time=None,
-                rebalance_pending=False  # <-- new
+                rebalance_pending=False,
+                # NEW
+                quote_rebalance_enabled=True,
+                quote_rebalance_amount_percent=20.0,
+                quote_rebalance_max_spread_percent=0.6,
+                quote_rebalance_imbalance_ratio=0.25,
+                quote_rebalance_cooldown_seconds=300,
+                last_quote_rebalance_time=None,
+                quote_rebalance_pending=False
             )
         ]
         session.add_all(settings_rows)
