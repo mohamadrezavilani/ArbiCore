@@ -11,6 +11,7 @@ from app.apps.arbitrage import schemas
 
 router = APIRouter()
 
+
 @router.get("/", response_model=schemas.DashboardResponse)
 async def get_dashboard(db: AsyncSession = Depends(get_db)):
     now = datetime.utcnow()
@@ -31,7 +32,7 @@ async def get_dashboard(db: AsyncSession = Depends(get_db)):
         "quote": [{"exchange": r[0], "currency": r[1], "balance": float(r[2])} for r in quote_result.all()]
     }
 
-    # Opportunities
+    # Opportunities stats
     executed_today = await db.execute(
         select(func.count(ArbitrageOpportunity.id))
         .where(ArbitrageOpportunity.created_at >= today_start)
@@ -40,10 +41,13 @@ async def get_dashboard(db: AsyncSession = Depends(get_db)):
         select(func.count(RejectedOpportunity.id))
         .where(RejectedOpportunity.created_at >= today_start)
     )
+
+    # FIXED: Use stored profit_quote (includes fees)
     profit_24h = await db.execute(
-        select(func.sum(ArbitrageOpportunity.traded_volume * (ArbitrageOpportunity.price_b - ArbitrageOpportunity.price_a)))
+        select(func.sum(ArbitrageOpportunity.profit_quote))
         .where(ArbitrageOpportunity.created_at >= yesterday)
     )
+
     opportunities = {
         "executed_today": executed_today.scalar() or 0,
         "rejected_today": rejected_today.scalar() or 0,
@@ -73,6 +77,7 @@ async def get_dashboard(db: AsyncSession = Depends(get_db)):
     )
     last_scan_result = await db.execute(select(func.max(OrderbookSnapshot.created_at)))
     last_scan_val = last_scan_result.scalar()
+
     system_health = {
         "active_exchanges": active_ex.scalar() or 0,
         "active_symbols": active_sym.scalar() or 0,

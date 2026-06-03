@@ -3,6 +3,7 @@ from app.apps.arbitrage.models import SymbolArbitrageSettings
 
 logger = logging.getLogger(__name__)
 
+
 class RiskManager:
     @staticmethod
     def calculate_trade_percent(
@@ -15,19 +16,14 @@ class RiskManager:
             network_fee_base: float,
             max_base_pool: float
     ) -> float:
-        """
-        Dynamic cutoff: cutoff = (vol * current_price * network_fee_base) / (0.8 * max_base_pool)
-        Then multiplied by weight.
-        """
-        target_base_pool = max_base_pool * 0.8
-        if target_base_pool <= 0:
-            logger.warning("target_base_pool <= 0, cutoff set to 0")
+
+        if max_base_pool <= 0:
             base_cutoff = 0.0
         else:
-            base_cutoff = (vol * current_price * network_fee_base) / target_base_pool
+            # More conservative: multiply by 1.5
+            base_cutoff = (vol * current_price * network_fee_base * 1.5) / (max_base_pool * 0.8)
 
         cutoff = base_cutoff * weight
-        logger.info(f"base_cutoff: {base_cutoff:.6f}, weight: {weight:.3f}, cutoff: {cutoff:.6f}")
 
         min_trade_pct = float(params.min_trade_percent)
         min_trade_factor = float(params.min_trade_factor)
@@ -36,9 +32,7 @@ class RiskManager:
         min_threshold = min_trade_factor * network_commission_quote
         full_threshold = valuability_factor * network_commission_quote
 
-        if net_gain <= 0:
-            return 0.0
-        if net_gain < cutoff:
+        if net_gain <= 0 or net_gain < cutoff:
             return 0.0
         if net_gain <= min_threshold:
             return min_trade_pct
