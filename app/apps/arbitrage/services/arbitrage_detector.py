@@ -207,6 +207,12 @@ class ArbitrageDetector:
 
             max_vol = min(ask_vol, bid_vol, max_vol_by_quote, max_vol_by_base)
 
+            # --- LOGGING ---
+            logger.info(f"[BALANCE] buy={buy_exch} ask_price={ask_price:.2f} avail_quote={available_quote:.2f} max_vol_by_quote={max_vol_by_quote:.4f}")
+            logger.info(f"[BALANCE] sell={sell_exch} avail_base={available_base:.4f} max_vol_by_base={max_vol_by_base:.4f}")
+            logger.info(f"[BALANCE] max_vol={max_vol:.4f} (ask_vol={ask_vol:.4f}, bid_vol={bid_vol:.4f})")
+            # --- END LOGGING ---
+
             if max_vol <= 0:
                 reason = f"Insufficient balance: quote on {buy_exch}={available_quote:.2f}, base on {sell_exch}={available_base:.4f}"
                 await self.logger.log_rejected_opportunity(
@@ -262,6 +268,23 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
+            # --- LOGGING BEFORE EXECUTION ---
+            cost_needed = volume * ask_price
+            logger.info(f"[EXECUTE] volume={volume:.4f} cost_needed={cost_needed:.2f} available_quote={available_quote:.2f}")
+            if cost_needed > available_quote * 1.000001:
+                reason = f"Cost {cost_needed:.2f} exceeds available quote {available_quote:.2f} after safety"
+                logger.warning(reason)
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    reason,
+                    {"volume": volume, "ask_price": ask_price, "cost_needed": cost_needed, "available_quote": available_quote}
+                )
+                i += 1
+                j += 1
+                continue
+            # --- END LOGGING ---
+
             # Execute trade
             is_live = (exchange_modes.get(buy_exch) == "live" and exchange_modes.get(sell_exch) == "live")
             success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit = \
@@ -284,6 +307,10 @@ class ArbitrageDetector:
                 )
 
             if success:
+                # --- LOGGING AFTER SUCCESS ---
+                logger.info(f"[SUCCESS] filled_vol={filled_vol:.4f} net_profit={net_profit:.2f} quote_delta_buy={quote_delta_buy:.2f}")
+                # --- END LOGGING ---
+
                 if not is_live:
                     base_deltas[buy_exch] += base_delta_buy
                     base_deltas[sell_exch] += base_delta_sell
@@ -306,7 +333,7 @@ class ArbitrageDetector:
                     profit_percent=((filled_vol * vwap_sell - filled_vol * vwap_buy) / (
                                 filled_vol * vwap_buy)) * 100 if filled_vol > 0 else 0,
                     traded_volume=filled_vol,
-                    profit_quote=net_profit  # <-- store net profit
+                    profit_quote=net_profit
                 )
                 opportunities.append(opp)
 
