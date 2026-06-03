@@ -3,10 +3,11 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+
 from app.apps.arbitrage.models import (
     Exchange, BaseInventory, SymbolArbitrageSettings, ExchangeFee, QuoteInventory
 )
-from app.apps.arbitrage.inventory import get_quote_balance
+from app.apps.arbitrage.inventory import update_base_balance, update_quote_balance, get_quote_balance
 from app.exchanges.factory import get_exchange_client
 from app.apps.arbitrage.services.opportunity_logger import OpportunityLogger
 from app.apps.arbitrage.services.trade_executor import TradeExecutor
@@ -14,11 +15,15 @@ from app.core.timezone import format_local_time
 
 logger = logging.getLogger(__name__)
 
+
 class Rebalancer:
     def __init__(self, logger: OpportunityLogger, trade_executor: Optional[TradeExecutor] = None):
         self.logger = logger
         self.trade_executor = trade_executor or TradeExecutor(logger)
 
+    # ----------------------------------------------------------------------
+    # Base asset rebalancing (USDT)
+    # ----------------------------------------------------------------------
     async def rebalance_symbol_if_needed(
         self,
         db: AsyncSession,
@@ -26,10 +31,6 @@ class Rebalancer:
         quote_currency: str,
         exchange_orderbooks: Dict[str, Tuple[List[List[float]], List[List[float]]]],
     ) -> Tuple[bool, str]:
-        """
-        Returns (success, reason).
-        If imbalance exists but cannot rebalance now, sets rebalance_pending=True.
-        """
         logger.info(f"[REBALANCE] Checking {common_symbol} (quote={quote_currency})")
 
         # 1. Get balances and exchange modes
@@ -75,13 +76,11 @@ class Rebalancer:
         trigger_threshold = imbalance_ratio * avg_balance
         logger.info(f"[REBALANCE] Imbalance ratio = {imbalance_ratio} (trigger when min < {trigger_threshold:.2f})")
 
-        # 3. Check imbalance – set pending flag if needed
         if poorest[1] < trigger_threshold:
             settings.rebalance_pending = True
             await db.flush()
             logger.info(f"[REBALANCE] Imbalance detected, set pending flag for {common_symbol}")
         else:
-            # No imbalance, clear pending if it was set
             if settings.rebalance_pending:
                 settings.rebalance_pending = False
                 await db.flush()
@@ -90,23 +89,22 @@ class Rebalancer:
             logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
-        # 4. Cooldown check – only if pending, we still need to wait, but keep pending flag
+        # 3. Cooldown
         if settings.last_rebalance_time:
             cooldown_sec = settings.market_rebalance_cooldown_seconds
             next_allowed = settings.last_rebalance_time + timedelta(seconds=cooldown_sec)
             now = datetime.utcnow()
             if now < next_allowed:
                 next_allowed_str = format_local_time(next_allowed)
-                reason = f"Cooldown active until {next_allowed_str} (Tehran time)"
+                reason = f"Cooldown active until {next_allowed_str}"
                 logger.info(f"[REBALANCE] {reason}")
-                # Keep pending flag, but don't execute
                 return False, reason
             else:
                 logger.info(f"[REBALANCE] Cooldown passed (last rebalance at {format_local_time(settings.last_rebalance_time)})")
         else:
             logger.info("[REBALANCE] No previous rebalance time, proceeding")
 
-        # 5. Orderbook availability
+        # 4. Orderbook availability
         richest_ob = exchange_orderbooks.get(richest[0])
         poorest_ob = exchange_orderbooks.get(poorest[0])
         if not richest_ob or not poorest_ob:
@@ -115,7 +113,6 @@ class Rebalancer:
             if not poorest_ob: missing.append(poorest[0])
             reason = f"Missing orderbook for {', '.join(missing)}"
             logger.warning(f"[REBALANCE] {reason}")
-            # Keep pending flag, will retry later
             return False, reason
 
         richest_asks, _ = richest_ob
@@ -134,10 +131,9 @@ class Rebalancer:
         if spread_percent > max_spread:
             reason = f"Spread {spread_percent:.2f}% > {max_spread}% – will retry later (pending flag remains)"
             logger.info(f"[REBALANCE] {reason}")
-            # Keep pending flag, do not execute
             return False, reason
 
-        # 6. Target amount
+        # 5. Target amount
         target_amount = avg_balance * (float(settings.market_rebalance_amount_percent) / 100.0)
         logger.info(f"[REBALANCE] Target amount = {target_amount:.4f} ({settings.market_rebalance_amount_percent}% of avg)")
 
@@ -158,7 +154,7 @@ class Rebalancer:
             logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
-        # 7. Execute trade
+        # 6. Execute trade
         mode_richest = exchange_modes.get(richest[0], "simulator")
         mode_poorest = exchange_modes.get(poorest[0], "simulator")
         is_live = (mode_richest == "live" and mode_poorest == "live")
@@ -180,7 +176,6 @@ class Rebalancer:
             sell_exch_obj_id = (await db.execute(stmt)).scalar_one_or_none()
             if not buy_exch_obj_id or not sell_exch_obj_id:
                 reason = f"Exchange IDs not found for {poorest[0]} or {richest[0]}"
-                logger.error(f"[REBALANCE] {reason}")
                 return False, reason
 
         # Fetch fees
@@ -199,31 +194,38 @@ class Rebalancer:
         fee_res = await db.execute(fee_stmt)
         sell_fee = float(fee_res.scalar() or 0.0)
 
-        success, filled_vol, vwap_buy, vwap_sell, _, _, _, _, _ = await self.trade_executor.execute_and_get_deltas(
-            db=db,
-            common_symbol=common_symbol,
-            buy_exchange=poorest[0],
-            sell_exchange=richest[0],
-            volume=target_amount,
-            quote_currency=quote_currency,
-            buy_client=buy_client,
-            sell_client=sell_client,
-            buy_exch_obj_id=buy_exch_obj_id,
-            sell_exch_obj_id=sell_exch_obj_id,
-            buy_fee_rate=buy_fee,
-            sell_fee_rate=sell_fee,
-            vwap_buy=buy_price,
-            vwap_sell=sell_price,
-            is_live=is_live
-        )
+        # Execute and get deltas (9 values)
+        success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit = \
+            await self.trade_executor.execute_and_get_deltas(
+                db=db,
+                common_symbol=common_symbol,
+                buy_exchange=poorest[0],
+                sell_exchange=richest[0],
+                volume=target_amount,
+                quote_currency=quote_currency,
+                buy_client=buy_client,
+                sell_client=sell_client,
+                buy_exch_obj_id=buy_exch_obj_id,
+                sell_exch_obj_id=sell_exch_obj_id,
+                buy_fee_rate=buy_fee,
+                sell_fee_rate=sell_fee,
+                vwap_buy=buy_price,
+                vwap_sell=sell_price,
+                is_live=is_live
+            )
 
         if not success:
             reason = "Trade execution failed (see logs for details)"
             logger.error(f"[REBALANCE] {reason}")
-            # Keep pending flag
             return False, reason
 
-        # 8. Log rebalance
+        # Apply deltas to database
+        await update_base_balance(db, poorest[0], common_symbol, base_delta_buy)
+        await update_base_balance(db, richest[0], common_symbol, base_delta_sell)
+        await update_quote_balance(db, poorest[0], quote_currency, quote_delta_buy)
+        await update_quote_balance(db, richest[0], quote_currency, quote_delta_sell)
+
+        # 7. Log rebalance
         await self.logger.log_rebalance(
             db,
             common_symbol=common_symbol,
@@ -236,7 +238,7 @@ class Rebalancer:
             reason=f"market_rebalance_{common_symbol}_imbalance_{imbalance_ratio}"
         )
 
-        # 9. Update last rebalance time and clear pending flag
+        # 8. Update last rebalance time and clear pending flag
         settings.last_rebalance_time = datetime.utcnow()
         settings.rebalance_pending = False
         await db.commit()
@@ -245,6 +247,9 @@ class Rebalancer:
         logger.info(f"[REBALANCE] {reason}")
         return True, reason
 
+    # ----------------------------------------------------------------------
+    # Quote asset rebalancing (IRT)
+    # ----------------------------------------------------------------------
     async def rebalance_quote_if_needed(
         self,
         db: AsyncSession,
@@ -252,10 +257,6 @@ class Rebalancer:
         quote_currency: str,
         exchange_orderbooks: Dict[str, Tuple[List[List[float]], List[List[float]]]],
     ) -> Tuple[bool, str]:
-        """
-        Rebalance quote currency (IRT) by trading USDT in the opposite direction.
-        When an exchange has too little IRT, we sell USDT there (gain IRT) and buy USDT on the exchange with surplus IRT.
-        """
         logger.info(f"[QUOTE REBALANCE] Checking {common_symbol} quote={quote_currency}")
 
         # 1. Get current quote balances (IRT)
@@ -301,7 +302,6 @@ class Rebalancer:
         trigger_threshold = imbalance_ratio * avg_balance
         logger.info(f"[QUOTE REBALANCE] Imbalance ratio = {imbalance_ratio} (trigger when min < {trigger_threshold:.2f})")
 
-        # 3. Set pending flag if imbalance exists
         if poorest[1] < trigger_threshold:
             settings.quote_rebalance_pending = True
             await db.flush()
@@ -315,7 +315,7 @@ class Rebalancer:
             logger.info(f"[QUOTE REBALANCE] {reason}")
             return False, reason
 
-        # 4. Cooldown check
+        # 3. Cooldown
         if settings.last_quote_rebalance_time:
             cooldown_sec = settings.quote_rebalance_cooldown_seconds
             next_allowed = settings.last_quote_rebalance_time + timedelta(seconds=cooldown_sec)
@@ -330,7 +330,7 @@ class Rebalancer:
         else:
             logger.info("[QUOTE REBALANCE] No previous rebalance time, proceeding")
 
-        # 5. Orderbook availability
+        # 4. Orderbook availability
         poorest_ob = exchange_orderbooks.get(poorest[0])
         richest_ob = exchange_orderbooks.get(richest[0])
         if not poorest_ob or not richest_ob:
@@ -359,9 +359,9 @@ class Rebalancer:
             logger.info(f"[QUOTE REBALANCE] {reason}")
             return False, reason
 
-        # 6. Target amount in USDT
+        # 5. Target amount in USDT
         target_irt = avg_balance * (float(settings.quote_rebalance_amount_percent) / 100.0)
-        target_usdt = target_irt / buy_price   # amount of USDT to buy on richest (and sell on poorest)
+        target_usdt = target_irt / buy_price
         logger.info(f"[QUOTE REBALANCE] Target amount = {target_usdt:.4f} USDT ({settings.quote_rebalance_amount_percent}% of avg quote in IRT)")
 
         # Respect available USDT on the poorest exchange (need to sell there)
@@ -394,7 +394,7 @@ class Rebalancer:
             logger.info(f"[QUOTE REBALANCE] {reason}")
             return False, reason
 
-        # 7. Execute trade: buy USDT on richest exchange, sell USDT on poorest exchange
+        # 6. Execute trade
         mode_poorest = exchange_modes.get(poorest[0], "simulator")
         mode_richest = exchange_modes.get(richest[0], "simulator")
         is_live = (mode_poorest == "live" and mode_richest == "live")
@@ -434,8 +434,8 @@ class Rebalancer:
         fee_res = await db.execute(fee_stmt)
         sell_fee = float(fee_res.scalar() or 0.0)
 
-        # Execute
-        success, filled_vol, vwap_buy, vwap_sell, b_delta_buy, b_delta_sell, q_delta_buy, q_delta_sell, net_profit = \
+        # Execute and get deltas (9 values)
+        success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit = \
             await self.trade_executor.execute_and_get_deltas(
                 db=db,
                 common_symbol=common_symbol,
@@ -459,12 +459,18 @@ class Rebalancer:
             logger.error(f"[QUOTE REBALANCE] {reason}")
             return False, reason
 
-        # 8. Log rebalance
+        # Apply deltas to database
+        await update_base_balance(db, poorest[0], common_symbol, base_delta_sell)
+        await update_base_balance(db, richest[0], common_symbol, base_delta_buy)
+        await update_quote_balance(db, poorest[0], quote_currency, quote_delta_sell)
+        await update_quote_balance(db, richest[0], quote_currency, quote_delta_buy)
+
+        # 7. Log rebalance
         await self.logger.log_rebalance(
             db,
             common_symbol=None,
             currency=quote_currency,
-            from_exch=richest[0],   # IRT moves from rich to poor (actually via USDT trade)
+            from_exch=richest[0],   # IRT moves from rich to poor (via USDT trade)
             to_exch=poorest[0],
             amount_sent=filled_vol,
             fee=0.0,
@@ -472,11 +478,11 @@ class Rebalancer:
             reason=f"quote_rebalance_{common_symbol}_imbalance_{imbalance_ratio}"
         )
 
-        # 9. Update last rebalance time and clear pending flag
+        # 8. Update last rebalance time and clear pending flag
         settings.last_quote_rebalance_time = datetime.utcnow()
         settings.quote_rebalance_pending = False
         await db.commit()
 
-        reason = f"Quote rebalance executed: sold {filled_vol:.4f} {common_symbol} on {poorest[0]} at {vwap_sell:.2f}, bought on {richest[0]} at {vwap_buy:.2f}"
+        reason = f"Quote rebalance executed: sold {filled_vol:.4f} {common_symbol} on {poorest[0]} at VWAP {vwap_sell:.2f}, bought on {richest[0]} at VWAP {vwap_buy:.2f}"
         logger.info(f"[QUOTE REBALANCE] {reason}")
         return True, reason
