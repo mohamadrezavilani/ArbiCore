@@ -1,12 +1,16 @@
 import asyncio
 import uuid
 import logging
+from decimal import Decimal, getcontext
 from typing import Tuple, Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.apps.arbitrage.models import Exchange, ExchangeSymbol
 from app.apps.arbitrage.inventory import set_base_balance, set_quote_balance
 from .opportunity_logger import OpportunityLogger
+
+# Set high precision for Decimal
+getcontext().prec = 28
 
 logger = logging.getLogger(__name__)
 
@@ -55,20 +59,29 @@ class TradeExecutor:
             net_profit (in quote currency)
         """
         if not is_live:
-            # Simulator mode: compute deltas and net profit
-            effective_buy = vwap_buy * (1 + buy_fee_rate)
-            effective_sell = vwap_sell * (1 - sell_fee_rate)
-            cost = volume * effective_buy
-            revenue = volume * effective_sell
-            net_profit = revenue - cost
-            base_delta_buy = volume
-            base_delta_sell = -volume
-            quote_delta_buy = -cost
-            quote_delta_sell = revenue
-            logger.info(f"Simulator trade: {volume:.4f} {common_symbol} buy@{buy_exchange} {effective_buy:.2f} sell@{sell_exchange} {effective_sell:.2f} net_profit={net_profit:.2f}")
-            return True, volume, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit
+            # Use Decimal for exact arithmetic
+            vol_dec = Decimal(str(volume))
+            buy_price_dec = Decimal(str(vwap_buy))
+            sell_price_dec = Decimal(str(vwap_sell))
+            buy_fee_dec = Decimal(str(buy_fee_rate))
+            sell_fee_dec = Decimal(str(sell_fee_rate))
 
-        # Live mode (simplified – net profit calculation would need actual fill prices)
+            effective_buy = buy_price_dec * (1 + buy_fee_dec)
+            effective_sell = sell_price_dec * (1 - sell_fee_dec)
+
+            cost = vol_dec * effective_buy
+            revenue = vol_dec * effective_sell
+            net_profit = revenue - cost
+
+            base_delta_buy = float(vol_dec)
+            base_delta_sell = -float(vol_dec)
+            quote_delta_buy = -float(cost)
+            quote_delta_sell = float(revenue)
+
+            logger.info(f"Simulator trade: {volume:.4f} {common_symbol} buy@{buy_exchange} {effective_buy:.2f} sell@{sell_exchange} {effective_sell:.2f} net_profit={net_profit:.2f}")
+            return True, volume, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, float(net_profit)
+
+        # Live mode (simplified – keep as is, but net profit may be less accurate)
         if buy_client is None or sell_client is None:
             logger.error("Live mode requires valid exchange clients")
             return False, 0, 0, 0, 0, 0, 0, 0, 0
