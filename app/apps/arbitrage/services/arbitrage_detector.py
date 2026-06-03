@@ -1,4 +1,5 @@
 import logging
+from decimal import Decimal, ROUND_DOWN
 from typing import Dict, List, Tuple, Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -28,6 +29,29 @@ class ArbitrageDetector:
         self.trade_executor = trade_executor
         self.rebalancer = rebalancer
 
+    @staticmethod
+    def _max_volume_from_quote(available_quote: float, ask_price: float) -> float:
+        """Return the maximum volume that can be bought without exceeding available_quote."""
+        if available_quote <= 0 or ask_price <= 0:
+            return 0.0
+        # Use Decimal to avoid floating point errors
+        d_quote = Decimal(str(available_quote))
+        d_price = Decimal(str(ask_price))
+        # floor division: max volume = floor(quote / price)
+        max_vol_dec = (d_quote / d_price).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+        return float(max_vol_dec)
+
+    @staticmethod
+    def _max_volume_from_base(available_base: float) -> float:
+        """Return the maximum volume that can be sold without exceeding available_base."""
+        if available_base <= 0:
+            return 0.0
+        # For base, volume is directly limited by available_base (with tiny floor to be safe)
+        d_base = Decimal(str(available_base))
+        # Use same precision, round down
+        max_vol_dec = d_base.quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+        return float(max_vol_dec)
+
     async def detect_for_symbol(
         self,
         db: AsyncSession,
@@ -41,7 +65,7 @@ class ArbitrageDetector:
             - quote_deltas: {exchange: delta}
             - opportunities: list of ArbitrageOpportunity objects to add
         """
-        # Determine quote currency
+        # Quote currency
         if common_symbol.endswith("IRT"):
             quote_currency = "IRT"
         elif common_symbol.endswith("USDT"):
@@ -50,7 +74,7 @@ class ArbitrageDetector:
             return False, {}, {}, []
 
         # ========== FORCE TRADE FOR TESTING (set to False for production) ==========
-        FORCE_TRADE = False                     # Set to True to enable forced test
+        FORCE_TRADE = False
         FORCE_SYMBOL = "USDTIRT"
         FORCE_MULTIPLIER = 0.998
         FORCE_BID_MULTIPLIER = 1.002
@@ -85,9 +109,7 @@ class ArbitrageDetector:
 
         exchange_names = list(exchange_orderbooks.keys())
 
-        # ------------------------------------------------------------
         # Pre-fetch all static data
-        # ------------------------------------------------------------
         exchange_modes = {}
         for name in exchange_names:
             stmt = select(Exchange.mode).where(Exchange.name == name)
@@ -169,7 +191,6 @@ class ArbitrageDetector:
         opportunities = []
 
         i, j = 0, 0
-        SAFETY = 0.999999
 
         while i < len(asks) and j < len(bids):
             buy_exch, ask_price, ask_vol, eff_ask, ask_fee = asks[i]
@@ -192,26 +213,14 @@ class ArbitrageDetector:
 
             weight = pair_weights.get((buy_exch, sell_exch), 0.5)
 
-            # ----- Balance checks with safety margin -----
+            # ----- Exact balance checks using Decimal -----
             available_quote = avail_quote.get(buy_exch, 0.0)
-            if available_quote <= 0:
-                max_vol_by_quote = 0.0
-            else:
-                max_vol_by_quote = (available_quote / ask_price) * SAFETY
-
             available_base = avail_base.get(sell_exch, 0.0)
-            if available_base <= 0:
-                max_vol_by_base = 0.0
-            else:
-                max_vol_by_base = available_base * SAFETY
+
+            max_vol_by_quote = self._max_volume_from_quote(available_quote, ask_price)
+            max_vol_by_base = self._max_volume_from_base(available_base)
 
             max_vol = min(ask_vol, bid_vol, max_vol_by_quote, max_vol_by_base)
-
-            # --- LOGGING ---
-            logger.info(f"[BALANCE] buy={buy_exch} ask_price={ask_price:.2f} avail_quote={available_quote:.2f} max_vol_by_quote={max_vol_by_quote:.4f}")
-            logger.info(f"[BALANCE] sell={sell_exch} avail_base={available_base:.4f} max_vol_by_base={max_vol_by_base:.4f}")
-            logger.info(f"[BALANCE] max_vol={max_vol:.4f} (ask_vol={ask_vol:.4f}, bid_vol={bid_vol:.4f})")
-            # --- END LOGGING ---
 
             if max_vol <= 0:
                 reason = f"Insufficient balance: quote on {buy_exch}={available_quote:.2f}, base on {sell_exch}={available_base:.4f}"
@@ -268,22 +277,7 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
-            # --- LOGGING BEFORE EXECUTION ---
-            cost_needed = volume * ask_price
-            logger.info(f"[EXECUTE] volume={volume:.4f} cost_needed={cost_needed:.2f} available_quote={available_quote:.2f}")
-            if cost_needed > available_quote * 1.000001:
-                reason = f"Cost {cost_needed:.2f} exceeds available quote {available_quote:.2f} after safety"
-                logger.warning(reason)
-                await self.logger.log_rejected_opportunity(
-                    db, common_symbol, buy_exch, sell_exch,
-                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
-                    reason,
-                    {"volume": volume, "ask_price": ask_price, "cost_needed": cost_needed, "available_quote": available_quote}
-                )
-                i += 1
-                j += 1
-                continue
-            # --- END LOGGING ---
+            # No additional safety factor needed – the volume already respects the balance exactly.
 
             # Execute trade
             is_live = (exchange_modes.get(buy_exch) == "live" and exchange_modes.get(sell_exch) == "live")
@@ -307,17 +301,13 @@ class ArbitrageDetector:
                 )
 
             if success:
-                # --- LOGGING AFTER SUCCESS ---
-                logger.info(f"[SUCCESS] filled_vol={filled_vol:.4f} net_profit={net_profit:.2f} quote_delta_buy={quote_delta_buy:.2f}")
-                # --- END LOGGING ---
-
                 if not is_live:
                     base_deltas[buy_exch] += base_delta_buy
                     base_deltas[sell_exch] += base_delta_sell
                     quote_deltas[buy_exch] += quote_delta_buy
                     quote_deltas[sell_exch] += quote_delta_sell
 
-                # Update working balances with clamping to zero
+                # Update working balances with clamping to zero (still safe, but now rarely needed)
                 avail_quote[buy_exch] = max(0.0, avail_quote[buy_exch] + quote_delta_buy)
                 avail_base[buy_exch] = max(0.0, avail_base[buy_exch] + base_delta_buy)
                 avail_quote[sell_exch] = max(0.0, avail_quote[sell_exch] + quote_delta_sell)
@@ -330,8 +320,7 @@ class ArbitrageDetector:
                     trade_type=f"buy_on_{buy_exch}_sell_on_{sell_exch}",
                     price_a=vwap_buy,
                     price_b=vwap_sell,
-                    profit_percent=((filled_vol * vwap_sell - filled_vol * vwap_buy) / (
-                                filled_vol * vwap_buy)) * 100 if filled_vol > 0 else 0,
+                    profit_percent=((filled_vol * vwap_sell - filled_vol * vwap_buy) / (filled_vol * vwap_buy)) * 100 if filled_vol > 0 else 0,
                     traded_volume=filled_vol,
                     profit_quote=net_profit
                 )
