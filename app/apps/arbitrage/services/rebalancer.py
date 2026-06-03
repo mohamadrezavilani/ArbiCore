@@ -199,7 +199,7 @@ class Rebalancer:
         fee_res = await db.execute(fee_stmt)
         sell_fee = float(fee_res.scalar() or 0.0)
 
-        success, filled_vol, vwap_buy, vwap_sell, _, _, _, _ = await self.trade_executor.execute_and_get_deltas(
+        success, filled_vol, vwap_buy, vwap_sell, _, _, _, _, _ = await self.trade_executor.execute_and_get_deltas(
             db=db,
             common_symbol=common_symbol,
             buy_exchange=poorest[0],

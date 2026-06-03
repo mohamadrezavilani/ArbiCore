@@ -37,7 +37,8 @@ class ArbitrageService:
         3. Apply all balance updates and store opportunities in one transaction.
         4. Rebalance base assets for symbols that had trades.
         5. Rebalance base assets for symbols with pending flag.
-        6. Rebalance quote assets for symbols with pending quote flag.
+        6. Rebalance quote assets for symbols that had trades.
+        7. Rebalance quote assets for symbols with pending quote flag.
         """
         exchange_orderbooks = await self.fetcher.fetch_all(db)
         if not exchange_orderbooks:
@@ -96,7 +97,14 @@ class ArbitrageService:
                     quote_currency = "IRT" if sym.endswith("IRT") else "USDT"
                     await self.rebalancer.rebalance_symbol_if_needed(db, sym, quote_currency, orderbooks)
 
-        # ---- 5. Rebalance quote currency (IRT) for symbols with pending quote flag ----
+        # ---- 5. Rebalance quote currency (IRT) for symbols that just traded ----
+        for common_symbol in traded_symbols:
+            orderbooks = exchange_orderbooks.get(common_symbol)
+            if orderbooks:
+                quote_currency = "IRT" if common_symbol.endswith("IRT") else "USDT"
+                await self.rebalancer.rebalance_quote_if_needed(db, common_symbol, quote_currency, orderbooks)
+
+        # ---- 6. Rebalance quote currency for symbols with pending quote flag ----
         pending_quote_stmt = select(SymbolArbitrageSettings.common_symbol).where(
             SymbolArbitrageSettings.quote_rebalance_pending == True,
             SymbolArbitrageSettings.common_symbol.in_(exchange_orderbooks.keys())
@@ -104,10 +112,11 @@ class ArbitrageService:
         pending_quote_result = await db.execute(pending_quote_stmt)
         pending_quote_symbols = pending_quote_result.scalars().all()
         for sym in pending_quote_symbols:
-            orderbooks = exchange_orderbooks.get(sym)
-            if orderbooks:
-                quote_currency = "IRT" if sym.endswith("IRT") else "USDT"
-                await self.rebalancer.rebalance_quote_if_needed(db, sym, quote_currency, orderbooks)
+            if sym not in traded_symbols:
+                orderbooks = exchange_orderbooks.get(sym)
+                if orderbooks:
+                    quote_currency = "IRT" if sym.endswith("IRT") else "USDT"
+                    await self.rebalancer.rebalance_quote_if_needed(db, sym, quote_currency, orderbooks)
 
         # Final commit for all rebalancing changes
         await db.commit()
