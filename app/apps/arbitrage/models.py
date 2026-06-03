@@ -147,6 +147,7 @@ class RebalanceLog(Base, UUIDMixin, TimestampMixin):
     network_fee: Mapped[float] = mapped_column(Numeric(20, 8))
     net_received: Mapped[float] = mapped_column(Numeric(20, 8))
     reason: Mapped[str] = mapped_column(String(200))
+    profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)   # NEW
 
 
 class ExchangePairWeight(Base, UUIDMixin, TimestampMixin):

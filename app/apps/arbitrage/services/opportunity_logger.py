@@ -57,7 +57,8 @@ class OpportunityLogger:
         amount_sent: float,
         fee: float,
         net: float,
-        reason: str
+        reason: str,
+        profit_quote: float = 0.0   # NEW
     ):
         log = RebalanceLog(
             common_symbol=common_symbol if common_symbol else None,
@@ -67,7 +68,8 @@ class OpportunityLogger:
             amount_sent=amount_sent,
             network_fee=fee,
             net_received=net,
-            reason=reason
+            reason=reason,
+            profit_quote=profit_quote   # NEW
         )
         db.add(log)
         await db.flush()

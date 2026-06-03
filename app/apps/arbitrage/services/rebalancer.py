@@ -235,7 +235,8 @@ class Rebalancer:
             amount_sent=filled_vol,
             fee=0.0,
             net=filled_vol,
-            reason=f"market_rebalance_{common_symbol}_imbalance_{imbalance_ratio}"
+            reason=f"market_rebalance_{common_symbol}_imbalance_{imbalance_ratio}",
+            profit_quote=net_profit   # ADD THIS
         )
 
         # 8. Update last rebalance time and clear pending flag
@@ -470,12 +471,13 @@ class Rebalancer:
             db,
             common_symbol=None,
             currency=quote_currency,
-            from_exch=richest[0],   # IRT moves from rich to poor (via USDT trade)
+            from_exch=richest[0],
             to_exch=poorest[0],
             amount_sent=filled_vol,
             fee=0.0,
             net=filled_vol,
-            reason=f"quote_rebalance_{common_symbol}_imbalance_{imbalance_ratio}"
+            reason=f"quote_rebalance_{common_symbol}_imbalance_{imbalance_ratio}",
+            profit_quote=net_profit   # ADD THIS
         )
 
         # 8. Update last rebalance time and clear pending flag
