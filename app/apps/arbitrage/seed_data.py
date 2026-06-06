@@ -123,7 +123,7 @@ async def seed():
         settings_rows = [
             SymbolArbitrageSettings(
                 common_symbol="USDTIRT",
-                min_profit_percent=0.7,
+                min_profit_percent=0.9,
                 cutoff_threshold=0,
                 min_trade_percent=0.20,
                 min_trade_factor=0.3,
@@ -134,7 +134,7 @@ async def seed():
                 opportunistic_rebalance_max_loss_percent=50.0,
                 market_rebalance_enabled=True,
                 market_rebalance_amount_percent=20.0,
-                market_rebalance_max_spread_percent=0.6,
+                market_rebalance_max_spread_percent=0.1,
                 market_rebalance_imbalance_ratio=0.25,
                 market_rebalance_cooldown_seconds=60,
                 last_rebalance_time=None,
@@ -142,7 +142,7 @@ async def seed():
                 # NEW
                 quote_rebalance_enabled=True,
                 quote_rebalance_amount_percent=20.0,
-                quote_rebalance_max_spread_percent=0.3,
+                quote_rebalance_max_spread_percent=0.1,
                 quote_rebalance_imbalance_ratio=0.25,
                 quote_rebalance_cooldown_seconds=60,
                 last_quote_rebalance_time=None,
