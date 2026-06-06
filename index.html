@@ -6,7 +6,7 @@
   <title>ArbiCore Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    /* Your existing styles (keep as before) */
+    /* Your existing styles – unchanged */
     body { font-family: Inter, system-ui, sans-serif; background: #09090b; color: #fafafa; margin: 0; }
     .container { max-width: 1800px; margin: 0 auto; padding: 24px; }
     .header { border-bottom: 1px solid #27272a; background: #18181b; padding: 20px 24px; position: sticky; top: 0; z-index: 50; }
@@ -90,7 +90,7 @@
 </div>
 
 <div class="container">
-  <!-- Stats row: arbitrage profit, rebalancing cost, net profit -->
+  <!-- Stats row: 4 cards -->
   <div class="stats-row">
     <div class="card">
       <div class="card-label">📈 Arbitrage Profit (24h)</div>
@@ -104,11 +104,15 @@
       <div class="card-label">💰 Net Profit (24h)</div>
       <div id="net-profit" class="card-value cyan">0 TMN</div>
     </div>
+    <div class="card">
+      <div class="card-label">📊 Total Net Profit (All Time)</div>
+      <div id="total-net-profit" class="card-value purple">0 TMN</div>
+    </div>
   </div>
 
   <div id="api-status" style="margin-bottom: 20px;"></div>
 
-  <!-- Last Activity Panel -->
+  <!-- Last Activity Panel (unchanged) -->
   <div id="last-activity-container" class="last-activity">
     <div style="text-align: center; padding: 20px;">
       <div style="color: #a1a1aa; font-size: 14px;">Loading latest activity...</div>
@@ -161,7 +165,6 @@
         <div id="actions-feed" class="actions-feed" style="max-height: 200px;"></div>
       </div>
 
-      <!-- NEW: Rebalance Logs Panel -->
       <div class="panel" style="margin-top:24px;">
         <div class="panel-title">
           <span>🔄 Rebalance Logs</span>
@@ -275,31 +278,49 @@ async function triggerRefresh() {
   if (timerElement) timerElement.style.opacity = "1";
 }
 
-// Calculate arbitrage profit, rebalancing cost, net profit
+// Calculate all profit stats (24h and all-time)
 async function loadProfitStats() {
+  // Fetch all opportunities (no date limit)
   const opportunities = await apiFetch("/opportunities/?limit=1000000");
-  let arbitrageProfit = 0;
-  opportunities?.forEach(item => { arbitrageProfit += toToman(item.profit_quote || 0); });
-  document.getElementById("arbitrage-profit").innerHTML = formatNumber(arbitrageProfit) + " TMN";
+  let arbitrageProfit24h = 0;
+  let arbitrageProfitAll = 0;
+  const now = new Date();
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
-  const rebalanceLogs = await apiFetch("/rebalance-logs/");
-  let rebalancingCost = 0;
-  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  if (rebalanceLogs) {
-    rebalanceLogs.forEach(log => {
-      const logDate = new Date(log.created_at);
-      if (logDate >= yesterday) {
-        const loss = toToman(log.profit_quote || 0);
-        // profit_quote is negative for rebalancing losses; we sum as negative to subtract later
-        rebalancingCost += loss;
-      }
+  if (opportunities) {
+    opportunities.forEach(item => {
+      const profitToman = toToman(item.profit_quote || 0);
+      arbitrageProfitAll += profitToman;
+      const oppDate = new Date(item.created_at);
+      if (oppDate >= yesterday) arbitrageProfit24h += profitToman;
     });
   }
-  // display rebalancing cost as positive number (loss magnitude)
-  document.getElementById("rebalancing-cost").innerHTML = formatNumber(-rebalancingCost) + " TMN";
-  const netProfit = arbitrageProfit + rebalancingCost; // rebalancingCost is negative
-  document.getElementById("net-profit").innerHTML = formatNumber(netProfit) + " TMN";
+  document.getElementById("arbitrage-profit").innerHTML = formatNumber(arbitrageProfit24h) + " TMN";
+
+  // Fetch all rebalance logs
+  const rebalanceLogs = await apiFetch("/rebalance-logs/");
+  let rebalancingCost24h = 0;
+  let rebalancingCostAll = 0;
+  if (rebalanceLogs) {
+    rebalanceLogs.forEach(log => {
+      const lossToman = toToman(log.profit_quote || 0); // profit_quote is negative for losses
+      rebalancingCostAll += lossToman;
+      const logDate = new Date(log.created_at);
+      if (logDate >= yesterday) rebalancingCost24h += lossToman;
+    });
+  }
+  // Display cost as positive number (magnitude)
+  document.getElementById("rebalancing-cost").innerHTML = formatNumber(-rebalancingCost24h) + " TMN";
+  const netProfit24h = arbitrageProfit24h + rebalancingCost24h; // rebalancingCost24h is negative
+  document.getElementById("net-profit").innerHTML = formatNumber(netProfit24h) + " TMN";
+
+  // Total net profit (all time)
+  const totalNet = arbitrageProfitAll + rebalancingCostAll;
+  document.getElementById("total-net-profit").innerHTML = formatNumber(totalNet) + " TMN";
 }
+
+// ... (all other functions: loadLastActivity, loadOpportunities, loadRejectedOpportunities, loadPools, loadActions, loadRebalanceLogs remain exactly as before) ...
+// To keep the answer concise, I will repeat them below unchanged.
 
 async function loadLastActivity() {
   const [opportunities, rejections] = await Promise.all([
@@ -492,7 +513,6 @@ async function loadActions() {
   });
 }
 
-// NEW: load rebalance logs
 async function loadRebalanceLogs() {
   const data = await apiFetch("/rebalance-logs/");
   const container = document.getElementById("rebalance-container");
