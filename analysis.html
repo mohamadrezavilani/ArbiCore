@@ -13,15 +13,14 @@
         select, button { background: #27272a; border: 1px solid #3f3f46; color: white; padding: 8px 16px; border-radius: 12px; cursor: pointer; }
         button:hover { background: #3f3f46; }
         .recommendation-box { background: #0f0f12; border-left: 4px solid; padding: 12px; border-radius: 12px; margin-bottom: 12px; }
+        .error-text { color: #f87171; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-6">
             <h1 class="text-2xl font-bold">📊 Orderbook Analysis & Parameter Tuning</h1>
-            <div>
-                <a href="/" class="text-blue-400 hover:underline">← Back to Dashboard</a>
-            </div>
+            <a href="/" class="text-blue-400 hover:underline">← Back to Dashboard</a>
         </div>
 
         <!-- Controls -->
@@ -29,12 +28,10 @@
             <div class="flex gap-4 items-end flex-wrap">
                 <div>
                     <label class="block text-sm text-gray-400">Symbol</label>
-                    <select id="symbol" class="mt-1">
-                        <option value="USDTIRT">USDT/IRT</option>
-                    </select>
+                    <select id="symbol" class="mt-1"><option value="USDTIRT">USDT/IRT</option></select>
                 </div>
                 <div>
-                    <label class="block text-sm text-gray-400">Exchange (optional)</label>
+                    <label class="block text-sm text-gray-400">Exchange</label>
                     <select id="exchange">
                         <option value="">All Exchanges</option>
                         <option value="wallex">Wallex</option>
@@ -52,142 +49,101 @@
                         <option value="336">Last 14 days</option>
                     </select>
                 </div>
-                <div>
-                    <button id="refreshBtn" class="bg-blue-600 hover:bg-blue-700">Refresh</button>
-                </div>
+                <div><button id="refreshBtn" class="bg-blue-600">Refresh</button></div>
             </div>
         </div>
 
         <!-- Charts -->
-        <div class="card">
-            <div class="card-title">📈 Spread History (%)</div>
-            <canvas id="spreadChart" height="100"></canvas>
-        </div>
-
-        <div class="card">
-            <div class="card-title">💰 Maximum Arbitrage Profit (Cross-Exchange)</div>
-            <canvas id="profitChart" height="100"></canvas>
-        </div>
+        <div class="card"><div class="card-title">📈 Spread History (%)</div><canvas id="spreadChart" height="100"></canvas></div>
+        <div class="card"><div class="card-title">💰 Maximum Arbitrage Profit (Cross-Exchange)</div><canvas id="profitChart" height="100"></canvas></div>
 
         <!-- Volatility & Liquidity -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div class="card">
-                <div class="card-title">📉 Price Volatility</div>
-                <div id="volatilityStats" class="text-center text-2xl font-bold">--</div>
-                <div id="volatilityDetail" class="text-sm text-gray-400 mt-2"></div>
-            </div>
-            <div class="card">
-                <div class="card-title">💧 Liquidity Depth (Top 5 Levels)</div>
-                <div id="liquidityContainer" class="overflow-x-auto">
-                    <p class="text-gray-400">Loading...</p>
-                </div>
-            </div>
+            <div class="card"><div class="card-title">📉 Price Volatility</div><div id="volatilityStats" class="text-center text-2xl font-bold">--</div><div id="volatilityDetail" class="text-sm text-gray-400 mt-2"></div></div>
+            <div class="card"><div class="card-title">💧 Liquidity Depth (Top 5 Levels)</div><div id="liquidityContainer"><p class="text-gray-400">Loading...</p></div></div>
         </div>
 
-        <!-- Settings Recommender (new section) -->
-        <div class="card">
-            <div class="card-title">⚙️ Data-Driven Parameter Recommendations</div>
-            <div id="recommendations" class="space-y-3">
-                <p class="text-gray-400">Analyzing your data...</p>
-            </div>
-            <div class="mt-4 text-xs text-gray-500 border-t border-gray-800 pt-3">
-                💡 Based on historical orders, spreads, and rebalancing logs. Use SQL UPDATE to apply.
-            </div>
-        </div>
+        <!-- Recommendations -->
+        <div class="card"><div class="card-title">⚙️ Data-Driven Parameter Recommendations</div><div id="recommendations"><p class="text-gray-400">Analyzing your data...</p></div></div>
     </div>
 
     <script>
         const API_BASE = "/api/v1/arbitrage/analysis";
-        let spreadChart = null;
-        let profitChart = null;
+        let spreadChart = null, profitChart = null;
 
         async function fetchJSON(endpoint) {
             const res = await fetch(API_BASE + endpoint);
-            if (!res.ok) throw new Error(await res.text());
+            if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
             return res.json();
         }
 
         async function loadSpreadHistory() {
-            const symbol = document.getElementById("symbol").value;
-            const exchange = document.getElementById("exchange").value;
-            const hours = document.getElementById("hours").value;
-            const url = `/spread-history?symbol=${symbol}&hours=${hours}&interval_minutes=10${exchange ? `&exchange=${exchange}` : ''}`;
-            const data = await fetchJSON(url);
-            const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
-            const spreads = data.map(d => d.spread_percent);
-            if (spreadChart) spreadChart.destroy();
-            const ctx = document.getElementById('spreadChart').getContext('2d');
-            spreadChart = new Chart(ctx, {
-                type: 'line',
-                data: { labels, datasets: [{ label: 'Spread %', data: spreads, borderColor: '#facc15', tension: 0.1 }] },
-                options: { responsive: true, maintainAspectRatio: true }
-            });
+            try {
+                const symbol = document.getElementById("symbol").value;
+                const exchange = document.getElementById("exchange").value;
+                const hours = document.getElementById("hours").value;
+                const data = await fetchJSON(`/spread-history?symbol=${symbol}&hours=${hours}&interval_minutes=10${exchange ? `&exchange=${exchange}` : ''}`);
+                if (!data.length) throw new Error("No spread data");
+                const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
+                const spreads = data.map(d => d.spread_percent);
+                if (spreadChart) spreadChart.destroy();
+                spreadChart = new Chart(document.getElementById('spreadChart'), { type: 'line', data: { labels, datasets: [{ label: 'Spread %', data: spreads, borderColor: '#facc15' }] } });
+            } catch(e) { console.error(e); document.getElementById('spreadChart').getContext('2d').clearRect(0,0,800,400); }
         }
 
         async function loadProfitHistory() {
-            const symbol = document.getElementById("symbol").value;
-            const hours = document.getElementById("hours").value;
-            const data = await fetchJSON(`/cross-exchange-spread?symbol=${symbol}&hours=${hours}`);
-            const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
-            const profits = data.map(d => d.max_profit_percent);
-            if (profitChart) profitChart.destroy();
-            const ctx = document.getElementById('profitChart').getContext('2d');
-            profitChart = new Chart(ctx, {
-                type: 'line',
-                data: { labels, datasets: [{ label: 'Max Profit %', data: profits, borderColor: '#4ade80', tension: 0.1 }] },
-                options: { responsive: true, maintainAspectRatio: true }
-            });
+            try {
+                const symbol = document.getElementById("symbol").value;
+                const hours = document.getElementById("hours").value;
+                const data = await fetchJSON(`/cross-exchange-spread?symbol=${symbol}&hours=${hours}`);
+                if (!data.length) throw new Error("No profit data");
+                const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
+                const profits = data.map(d => d.max_profit_percent);
+                if (profitChart) profitChart.destroy();
+                profitChart = new Chart(document.getElementById('profitChart'), { type: 'line', data: { labels, datasets: [{ label: 'Max Profit %', data: profits, borderColor: '#4ade80' }] } });
+            } catch(e) { console.error(e); }
         }
 
         async function loadVolatility() {
-            const symbol = document.getElementById("symbol").value;
-            const exchange = document.getElementById("exchange").value;
-            const hours = document.getElementById("hours").value;
-            const url = `/volatility?symbol=${symbol}&hours=${hours}${exchange ? `&exchange=${exchange}` : ''}`;
-            const data = await fetchJSON(url);
-            if (Object.keys(data).length === 0) {
-                document.getElementById("volatilityStats").innerText = "No data";
-                document.getElementById("volatilityDetail").innerHTML = "";
-                return;
-            }
-            document.getElementById("volatilityStats").innerHTML = `${data.volatility_percent}%`;
-            document.getElementById("volatilityDetail").innerHTML = `Absolute: ${data.volatility_absolute} | Mean price: ${data.mean_price}`;
+            try {
+                const symbol = document.getElementById("symbol").value;
+                const exchange = document.getElementById("exchange").value;
+                const hours = document.getElementById("hours").value;
+                const data = await fetchJSON(`/volatility?symbol=${symbol}&hours=${hours}${exchange ? `&exchange=${exchange}` : ''}`);
+                if (Object.keys(data).length === 0) throw new Error("No volatility data");
+                document.getElementById("volatilityStats").innerHTML = `${data.volatility_percent}%`;
+                document.getElementById("volatilityDetail").innerHTML = `Absolute: ${data.volatility_absolute} | Mean: ${data.mean_price}`;
+            } catch(e) { document.getElementById("volatilityStats").innerHTML = "N/A"; }
         }
 
         async function loadLiquidity() {
-            const symbol = document.getElementById("symbol").value;
-            const exchange = document.getElementById("exchange").value;
-            const hours = document.getElementById("hours").value;
-            const url = `/liquidity-depth?symbol=${symbol}&hours=${hours}&depth_levels=5${exchange ? `&exchange=${exchange}` : ''}`;
-            const data = await fetchJSON(url);
-            const container = document.getElementById("liquidityContainer");
-            if (Object.keys(data).length === 0) {
-                container.innerHTML = "<p class='text-gray-400'>No liquidity data</p>";
-                return;
-            }
-            let html = '<div class="space-y-4">';
-            for (const [exch, depth] of Object.entries(data)) {
-                html += `<div><strong class="text-blue-400">${exch}</strong> (as of ${new Date(depth.timestamp).toLocaleString()})`;
-                html += '<div class="grid grid-cols-2 gap-4 mt-2">';
-                html += '<div><div class="text-sm font-semibold">Ask Depth</div><ul class="text-xs">';
-                for (const ask of depth.asks) {
-                    html += `<li>Lv${ask.level}: ${ask.price} (${ask.volume_at_level} vol, cum ${ask.cumulative_volume})</li>`;
+            try {
+                const symbol = document.getElementById("symbol").value;
+                const exchange = document.getElementById("exchange").value;
+                const hours = document.getElementById("hours").value;
+                const data = await fetchJSON(`/liquidity-depth?symbol=${symbol}&hours=${hours}&depth_levels=5${exchange ? `&exchange=${exchange}` : ''}`);
+                const container = document.getElementById("liquidityContainer");
+                if (Object.keys(data).length === 0) { container.innerHTML = "<p class='text-gray-400'>No liquidity data</p>"; return; }
+                let html = '<div class="space-y-4">';
+                for (const [exch, depth] of Object.entries(data)) {
+                    html += `<div><strong class="text-blue-400">${exch}</strong> <span class="text-xs text-gray-500">(${new Date(depth.timestamp).toLocaleString()})</span>`;
+                    html += '<div class="grid grid-cols-2 gap-2 mt-2">';
+                    html += '<div><div class="text-sm font-semibold">Ask Depth</div><ul class="text-xs">';
+                    for (const ask of depth.asks) html += `<li>Lv${ask.level}: ${ask.price} (vol ${ask.volume_at_level}, cum ${ask.cumulative_volume})</li>`;
+                    html += '</ul></div><div><div class="text-sm font-semibold">Bid Depth</div><ul class="text-xs">';
+                    for (const bid of depth.bids) html += `<li>Lv${bid.level}: ${bid.price} (vol ${bid.volume_at_level}, cum ${bid.cumulative_volume})</li>`;
+                    html += '</ul></div></div></div><hr class="border-gray-800 my-2"/>';
                 }
-                html += '</ul></div><div><div class="text-sm font-semibold">Bid Depth</div><ul class="text-xs">';
-                for (const bid of depth.bids) {
-                    html += `<li>Lv${bid.level}: ${bid.price} (${bid.volume_at_level} vol, cum ${bid.cumulative_volume})</li>`;
-                }
-                html += '</ul></div></div></div><hr class="border-gray-800 my-2"/>';
-            }
-            html += '</div>';
-            container.innerHTML = html;
+                html += '</div>';
+                container.innerHTML = html;
+            } catch(e) { document.getElementById("liquidityContainer").innerHTML = "<p class='text-red-400'>Failed to load</p>"; }
         }
 
         async function loadRecommendations() {
-            const symbol = document.getElementById("symbol").value;
-            const hours = document.getElementById("hours").value;
-            const exchange = document.getElementById("exchange").value || undefined;
             try {
+                const symbol = document.getElementById("symbol").value;
+                const hours = document.getElementById("hours").value;
+                const exchange = document.getElementById("exchange").value || undefined;
                 const [profitDist, spreadDist, imbalance, tradeSize, rebalanceLoss] = await Promise.all([
                     fetchJSON(`/profit-distribution?symbol=${symbol}&hours=${hours}`),
                     fetchJSON(`/spread-distribution?symbol=${symbol}&exchange=${exchange}&hours=${hours}`),
@@ -195,96 +151,39 @@
                     fetchJSON(`/trade-size-analysis?symbol=${symbol}&hours=${hours}`),
                     fetchJSON(`/rebalancing-loss-analysis?symbol=${symbol}&hours=${hours}`)
                 ]);
-
-                let html = `<div class="grid grid-cols-1 md:grid-cols-2 gap-4">`;
-
-                // min_profit_percent
+                let html = '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
                 if (profitDist.percentiles) {
                     const p90 = profitDist.percentiles.p90;
                     const suggested = Math.max(0.5, (p90 / 2).toFixed(2));
-                    html += `<div class="recommendation-box" style="border-left-color: #4ade80;">
-                                <div class="font-semibold text-green-400">💰 min_profit_percent</div>
-                                <div>90th percentile profit: <strong>${p90}%</strong></div>
-                                <div class="text-sm text-gray-300">Recommend: <code class="bg-black px-2 py-0.5 rounded">${suggested}%</code> (half of 90th percentile)</div>
-                                <div class="text-xs text-gray-500 mt-1">This will only take trades that are significantly profitable.</div>
-                             </div>`;
+                    html += `<div class="recommendation-box" style="border-left-color: #4ade80;"><div class="font-semibold text-green-400">💰 min_profit_percent</div><div>90th percentile profit: <strong>${p90}%</strong></div><div class="text-sm">Recommend: <code class="bg-black px-2 py-0.5 rounded">${suggested}%</code></div></div>`;
                 }
-
-                // rebalancing max spread (market and quote)
                 if (spreadDist.percentiles) {
                     const p90 = spreadDist.percentiles.p90;
                     const suggested = Math.min(0.5, p90).toFixed(2);
-                    html += `<div class="recommendation-box" style="border-left-color: #facc15;">
-                                <div class="font-semibold text-yellow-400">📊 rebalance_max_spread_percent</div>
-                                <div>90th percentile of orderbook spreads: <strong>${p90}%</strong></div>
-                                <div class="text-sm text-gray-300">Recommend: <code class="bg-black px-2 py-0.5 rounded">${suggested}%</code> (or 0.2% if market is volatile)</div>
-                                <div class="text-xs text-gray-500 mt-1">Tighter spread reduces rebalancing losses.</div>
-                             </div>`;
+                    html += `<div class="recommendation-box" style="border-left-color: #facc15;"><div class="font-semibold text-yellow-400">📊 rebalance_max_spread_percent</div><div>90th percentile spread: <strong>${p90}%</strong></div><div class="text-sm">Recommend: <code class="bg-black px-2 py-0.5 rounded">${suggested}%</code></div></div>`;
                 }
-
-                // imbalance ratio
                 if (imbalance.ratios_to_avg) {
-                    const ratios = Object.values(imbalance.ratios_to_avg);
-                    const minRatio = Math.min(...ratios);
+                    const minRatio = Math.min(...Object.values(imbalance.ratios_to_avg));
                     const suggested = Math.max(0.1, (minRatio * 0.5).toFixed(2));
-                    html += `<div class="recommendation-box" style="border-left-color: #60a5fa;">
-                                <div class="font-semibold text-blue-400">⚖️ rebalance_imbalance_ratio</div>
-                                <div>Current smallest balance ratio: <strong>${minRatio.toFixed(2)}</strong></div>
-                                <div class="text-sm text-gray-300">Recommend: <code class="bg-black px-2 py-0.5 rounded">${suggested}</code> (trigger when poorest < ${suggested*100}% of avg)</div>
-                                <div class="text-xs text-gray-500 mt-1">Lower value means less frequent rebalancing.</div>
-                             </div>`;
+                    html += `<div class="recommendation-box" style="border-left-color: #60a5fa;"><div class="font-semibold text-blue-400">⚖️ rebalance_imbalance_ratio</div><div>Smallest balance ratio: <strong>${minRatio.toFixed(2)}</strong></div><div class="text-sm">Recommend: <code class="bg-black px-2 py-0.5 rounded">${suggested}</code></div></div>`;
                 }
-
-                // trade size (min_trade_percent)
                 if (tradeSize.median_traded_volume) {
-                    html += `<div class="recommendation-box" style="border-left-color: #c084fc;">
-                                <div class="font-semibold text-purple-400">📈 min_trade_percent</div>
-                                <div>Median traded volume: <strong>${tradeSize.median_traded_volume} USDT</strong></div>
-                                <div class="text-sm text-gray-300">Recommend: <code class="bg-black px-2 py-0.5 rounded">0.1 - 0.2</code> (10-20% of available balance)</div>
-                                <div class="text-xs text-gray-500 mt-1">Also adjust min_trade_factor and valuability_factor if needed.</div>
-                             </div>`;
+                    html += `<div class="recommendation-box" style="border-left-color: #c084fc;"><div class="font-semibold text-purple-400">📈 min_trade_percent</div><div>Median traded volume: <strong>${tradeSize.median_traded_volume} USDT</strong></div><div class="text-sm">Recommend: <code class="bg-black px-2 py-0.5 rounded">0.1 - 0.2</code></div></div>`;
                 }
-
-                // rebalancing loss
                 if (rebalanceLoss.avg_loss_per_rebalance) {
-                    let lossSuggestion = "";
-                    if (Math.abs(rebalanceLoss.avg_loss_per_rebalance) > 100000) {
-                        lossSuggestion = "⚠️ Losses are high. Reduce <code>market_rebalance_amount_percent</code> to 5% and tighten spread to 0.1%.";
-                    } else if (Math.abs(rebalanceLoss.avg_loss_per_rebalance) > 50000) {
-                        lossSuggestion = "⚠️ Moderate losses. Consider lowering amount to 10% or increasing cooldown.";
-                    } else {
-                        lossSuggestion = "✅ Losses are under control. Keep current settings.";
-                    }
-                    html += `<div class="recommendation-box" style="border-left-color: #f87171;">
-                                <div class="font-semibold text-red-400">🔄 Rebalancing Impact</div>
-                                <div>Avg loss per rebalance: <strong>${Math.abs(rebalanceLoss.avg_loss_per_rebalance).toFixed(2)} IRT</strong> (Total: ${Math.abs(rebalanceLoss.total_loss_irt).toFixed(2)} IRT)</div>
-                                <div class="text-sm text-gray-300">${lossSuggestion}</div>
-                                <div class="text-xs text-gray-500 mt-1">${rebalanceLoss.suggestion || ""}</div>
-                             </div>`;
+                    let note = Math.abs(rebalanceLoss.avg_loss_per_rebalance) > 100000 ? "⚠️ High losses – reduce amount to 5%" : (Math.abs(rebalanceLoss.avg_loss_per_rebalance) > 50000 ? "⚠️ Moderate losses" : "✅ Losses under control");
+                    html += `<div class="recommendation-box" style="border-left-color: #f87171;"><div class="font-semibold text-red-400">🔄 Rebalancing Impact</div><div>Avg loss: ${Math.abs(rebalanceLoss.avg_loss_per_rebalance).toFixed(2)} IRT</div><div class="text-sm">${note}</div></div>`;
                 }
-
                 html += `</div>`;
                 document.getElementById("recommendations").innerHTML = html;
-            } catch (err) {
-                console.error(err);
-                document.getElementById("recommendations").innerHTML = `<p class="text-red-400">Error loading recommendations: ${err.message}</p>`;
-            }
+            } catch(e) { document.getElementById("recommendations").innerHTML = `<p class="text-red-400">Error: ${e.message}</p>`; }
         }
 
         async function refreshAll() {
-            await Promise.all([
-                loadSpreadHistory(),
-                loadProfitHistory(),
-                loadVolatility(),
-                loadLiquidity(),
-                loadRecommendations()
-            ]);
+            await Promise.allSettled([loadSpreadHistory(), loadProfitHistory(), loadVolatility(), loadLiquidity(), loadRecommendations()]);
         }
-
         document.getElementById("refreshBtn").addEventListener("click", refreshAll);
         refreshAll();
-
-        // Auto-refresh every 60 seconds (optional)
         setInterval(refreshAll, 60000);
     </script>
 </body>
