@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ArbiCore - Price Analysis</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background: #09090b; color: #fafafa; font-family: Inter, system-ui, sans-serif; }
+        .card { background: #18181b; border: 1px solid #27272a; border-radius: 18px; padding: 20px; margin-bottom: 24px; }
+        .card-title { font-size: 20px; font-weight: 700; margin-bottom: 16px; border-bottom: 1px solid #27272a; padding-bottom: 12px; }
+        select, button { background: #27272a; border: 1px solid #3f3f46; color: white; padding: 8px 16px; border-radius: 12px; }
+    </style>
+</head>
+<body class="p-6">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex justify-between items-center mb-6">
+            <h1 class="text-2xl font-bold">📊 Orderbook Analysis</h1>
+            <div>
+                <a href="/" class="text-blue-400 hover:underline">← Back to Dashboard</a>
+            </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="card">
+            <div class="flex gap-4 items-end flex-wrap">
+                <div>
+                    <label class="block text-sm text-gray-400">Symbol</label>
+                    <select id="symbol" class="mt-1">
+                        <option value="USDTIRT">USDT/IRT</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400">Exchange (optional)</label>
+                    <select id="exchange">
+                        <option value="">All Exchanges</option>
+                        <option value="wallex">Wallex</option>
+                        <option value="nobitex">Nobitex</option>
+                        <option value="bitpin">Bitpin</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400">Hours</label>
+                    <select id="hours">
+                        <option value="24">Last 24h</option>
+                        <option value="48">Last 48h</option>
+                        <option value="72">Last 72h</option>
+                        <option value="168">Last 7 days</option>
+                    </select>
+                </div>
+                <div>
+                    <button id="refreshBtn" class="bg-blue-600 hover:bg-blue-700">Refresh</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chart: Spread History -->
+        <div class="card">
+            <div class="card-title">📈 Spread History (%)</div>
+            <canvas id="spreadChart" height="100"></canvas>
+        </div>
+
+        <!-- Chart: Cross-Exchange Max Profit -->
+        <div class="card">
+            <div class="card-title">💰 Maximum Arbitrage Profit (Cross-Exchange)</div>
+            <canvas id="profitChart" height="100"></canvas>
+        </div>
+
+        <!-- Volatility & Liquidity (summary cards) -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="card">
+                <div class="card-title">📉 Price Volatility</div>
+                <div id="volatilityStats" class="text-center text-2xl font-bold">--</div>
+                <div id="volatilityDetail" class="text-sm text-gray-400 mt-2"></div>
+            </div>
+            <div class="card">
+                <div class="card-title">💧 Liquidity Depth (Top 5 Levels)</div>
+                <div id="liquidityContainer" class="overflow-x-auto">
+                    <p class="text-gray-400">Loading...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = "/api/v1/arbitrage/analysis";
+        let spreadChart = null;
+        let profitChart = null;
+
+        async function fetchJSON(endpoint) {
+            const res = await fetch(API_BASE + endpoint);
+            if (!res.ok) throw new Error(await res.text());
+            return res.json();
+        }
+
+        async function loadSpreadHistory() {
+            const symbol = document.getElementById("symbol").value;
+            const exchange = document.getElementById("exchange").value;
+            const hours = document.getElementById("hours").value;
+            const url = `/spread-history?symbol=${symbol}&hours=${hours}&interval_minutes=10${exchange ? `&exchange=${exchange}` : ''}`;
+            const data = await fetchJSON(url);
+            const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
+            const spreads = data.map(d => d.spread_percent);
+            if (spreadChart) spreadChart.destroy();
+            const ctx = document.getElementById('spreadChart').getContext('2d');
+            spreadChart = new Chart(ctx, {
+                type: 'line',
+                data: { labels, datasets: [{ label: 'Spread %', data: spreads, borderColor: '#facc15', tension: 0.1 }] },
+                options: { responsive: true, maintainAspectRatio: true }
+            });
+        }
+
+        async function loadProfitHistory() {
+            const symbol = document.getElementById("symbol").value;
+            const hours = document.getElementById("hours").value;
+            const data = await fetchJSON(`/cross-exchange-spread?symbol=${symbol}&hours=${hours}`);
+            const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
+            const profits = data.map(d => d.max_profit_percent);
+            if (profitChart) profitChart.destroy();
+            const ctx = document.getElementById('profitChart').getContext('2d');
+            profitChart = new Chart(ctx, {
+                type: 'line',
+                data: { labels, datasets: [{ label: 'Max Profit %', data: profits, borderColor: '#4ade80', tension: 0.1 }] },
+                options: { responsive: true, maintainAspectRatio: true }
+            });
+        }
+
+        async function loadVolatility() {
+            const symbol = document.getElementById("symbol").value;
+            const exchange = document.getElementById("exchange").value;
+            const hours = document.getElementById("hours").value;
+            const url = `/volatility?symbol=${symbol}&hours=${hours}${exchange ? `&exchange=${exchange}` : ''}`;
+            const data = await fetchJSON(url);
+            if (Object.keys(data).length === 0) {
+                document.getElementById("volatilityStats").innerText = "No data";
+                document.getElementById("volatilityDetail").innerHTML = "";
+                return;
+            }
+            document.getElementById("volatilityStats").innerHTML = `${data.volatility_percent}%`;
+            document.getElementById("volatilityDetail").innerHTML = `Absolute: ${data.volatility_absolute} | Mean price: ${data.mean_price}`;
+        }
+
+        async function loadLiquidity() {
+            const symbol = document.getElementById("symbol").value;
+            const exchange = document.getElementById("exchange").value;
+            const hours = document.getElementById("hours").value;
+            const url = `/liquidity-depth?symbol=${symbol}&hours=${hours}&depth_levels=5${exchange ? `&exchange=${exchange}` : ''}`;
+            const data = await fetchJSON(url);
+            const container = document.getElementById("liquidityContainer");
+            if (Object.keys(data).length === 0) {
+                container.innerHTML = "<p class='text-gray-400'>No liquidity data</p>";
+                return;
+            }
+            let html = '<div class="space-y-4">';
+            for (const [exch, depth] of Object.entries(data)) {
+                html += `<div><strong class="text-blue-400">${exch}</strong> (as of ${new Date(depth.timestamp).toLocaleString()})`;
+                html += '<div class="grid grid-cols-2 gap-4 mt-2">';
+                html += '<div><div class="text-sm font-semibold">Ask Depth</div><ul class="text-xs">';
+                for (const ask of depth.asks) {
+                    html += `<li>Lv${ask.level}: ${ask.price} (${ask.volume_at_level} vol, cum ${ask.cumulative_volume})</li>`;
+                }
+                html += '</ul></div><div><div class="text-sm font-semibold">Bid Depth</div><ul class="text-xs">';
+                for (const bid of depth.bids) {
+                    html += `<li>Lv${bid.level}: ${bid.price} (${bid.volume_at_level} vol, cum ${bid.cumulative_volume})</li>`;
+                }
+                html += '</ul></div></div></div><hr class="border-gray-800 my-2"/>';
+            }
+            html += '</div>';
+            container.innerHTML = html;
+        }
+
+        async function refreshAll() {
+            await Promise.all([
+                loadSpreadHistory(),
+                loadProfitHistory(),
+                loadVolatility(),
+                loadLiquidity()
+            ]);
+        }
+
+        document.getElementById("refreshBtn").addEventListener("click", refreshAll);
+        refreshAll();
+
+        // Auto-refresh every 30 seconds
+        setInterval(refreshAll, 30000);
+    </script>
+</body>
+</html>

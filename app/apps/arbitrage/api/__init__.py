@@ -10,6 +10,7 @@ from .rebalance_logs import router as rebalance_logs_router
 from .actions import router as actions_router
 from .pools import router as pools_router
 from .risk_context import router as risk_context_router
+from .analysis import router as analysis_router
 
 router = APIRouter(tags=["arbitrage"])
 
@@ -24,3 +25,4 @@ router.include_router(rebalance_logs_router, prefix="/rebalance-logs", tags=["re
 router.include_router(actions_router, prefix="/actions", tags=["actions"])
 router.include_router(pools_router, prefix="/pools", tags=["pools"])
 router.include_router(risk_context_router, prefix="/risk-context", tags=["risk context"])  # separate prefix
+router.include_router(analysis_router, prefix="/analysis", tags=["analysis"])
