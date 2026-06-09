@@ -1,15 +1,17 @@
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware          # <-- added import
+from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import engine
 from app.core.handlers import register_exception_handlers
 from app.core.logging import setup_logging
 from app.apps.arbitrage.api import router as arbitrage_router
+from app.apps.arbitrage.api.analysis import router as analysis_router   # NEW
 from app.apps.arbitrage.tasks import periodic_arbitrage_poll
 from app.apps.arbitrage.seed_data import seed
 from fastapi.responses import HTMLResponse
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -48,28 +50,43 @@ def create_app() -> FastAPI:
     )
 
     # ========== CORS MIDDLEWARE – ALLOWS ANY ORIGIN ==========
-    # Use this only for development. For production, replace "*" with your actual frontend domains.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],           # Allows requests from any origin
-        allow_credentials=False,       # Must be False when allow_origins=["*"]
-        allow_methods=["*"],           # Allows all HTTP methods (GET, POST, PUT, DELETE, OPTIONS, etc.)
-        allow_headers=["*"],           # Allows all headers
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     # =========================================================
 
     register_exception_handlers(app)
 
+    # Include main arbitrage API router
     app.include_router(
         arbitrage_router,
         prefix=f"{settings.API_V1_PREFIX}/arbitrage",
         tags=["arbitrage"]
     )
 
+    # Include analysis API router (under the same base path)
+    app.include_router(
+        analysis_router,
+        prefix=f"{settings.API_V1_PREFIX}/arbitrage/analysis",
+        tags=["analysis"]
+    )
+
+    # Serve main dashboard HTML
     @app.get("/", response_class=HTMLResponse)
     async def get_root():
         with open("index.html", "r", encoding="utf-8") as f:
             return f.read()
+
+    # Serve analysis HTML page
+    @app.get("/analysis", response_class=HTMLResponse)
+    async def get_analysis():
+        with open("analysis.html", "r", encoding="utf-8") as f:
+            return f.read()
+
     return app
 
 
