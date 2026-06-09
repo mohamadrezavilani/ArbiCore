@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
+import numpy as np
 from app.apps.arbitrage.models import OrderbookSnapshot, Exchange, ExchangeSymbol
 
 logger = logging.getLogger(__name__)
@@ -240,3 +241,192 @@ class AnalysisService:
                     "max_profit_percent": round(profit_percent, 4)
                 })
         return results
+
+    @staticmethod
+    async def get_profit_distribution(
+        db: AsyncSession,
+        common_symbol: str,
+        hours: int = 168  # last 7 days
+    ) -> Dict[str, Any]:
+        """
+        Returns histogram of profit_percent from executed arbitrage opportunities.
+        Helps choose min_profit_percent.
+        """
+        from app.apps.arbitrage.models import ArbitrageOpportunity
+        stmt = (
+            select(ArbitrageOpportunity.profit_percent)
+            .where(ArbitrageOpportunity.common_symbol == common_symbol)
+            .where(ArbitrageOpportunity.created_at >= datetime.utcnow() - timedelta(hours=hours))
+        )
+        result = await db.execute(stmt)
+        profits = [float(p) for p in result.scalars().all() if p is not None]
+        if not profits:
+            return {"message": "No profit data available", "bins": [], "counts": [], "percentiles": {}}
+        # Compute histogram (10 bins)
+        min_p = min(profits)
+        max_p = max(profits)
+        bins = 10
+        bin_width = (max_p - min_p) / bins
+        hist = [0] * bins
+        for p in profits:
+            idx = min(int((p - min_p) / bin_width), bins-1)
+            hist[idx] += 1
+        bin_edges = [min_p + i * bin_width for i in range(bins+1)]
+        percentiles = {
+            "p50": round(np.percentile(profits, 50), 2),
+            "p75": round(np.percentile(profits, 75), 2),
+            "p90": round(np.percentile(profits, 90), 2),
+            "p95": round(np.percentile(profits, 95), 2),
+            "mean": round(np.mean(profits), 2),
+            "max": round(max_p, 2),
+            "min": round(min_p, 2)
+        }
+        return {
+            "bins": [round(e, 2) for e in bin_edges],
+            "counts": hist,
+            "percentiles": percentiles,
+            "sample_count": len(profits)
+        }
+
+    @staticmethod
+    async def get_spread_distribution(
+        db: AsyncSession,
+        common_symbol: str,
+        exchange_name: str = None,
+        hours: int = 168
+    ) -> Dict[str, Any]:
+        """
+        Distribution of bid-ask spreads (in percent) from orderbook snapshots.
+        Helps choose market_rebalance_max_spread_percent.
+        """
+        stmt = (
+            select(OrderbookSnapshot.best_ask_price, OrderbookSnapshot.best_bid_price)
+            .join(ExchangeSymbol, OrderbookSnapshot.symbol_id == ExchangeSymbol.id)
+            .join(Exchange, OrderbookSnapshot.exchange_id == Exchange.id)
+            .where(ExchangeSymbol.common_symbol == common_symbol)
+            .where(OrderbookSnapshot.created_at >= datetime.utcnow() - timedelta(hours=hours))
+            .where(OrderbookSnapshot.best_ask_price.isnot(None))
+            .where(OrderbookSnapshot.best_bid_price.isnot(None))
+        )
+        if exchange_name:
+            stmt = stmt.where(Exchange.name == exchange_name)
+        result = await db.execute(stmt)
+        rows = result.all()
+        spreads = []
+        for ask, bid in rows:
+            if ask and bid and float(ask) > 0:
+                spread_pct = (float(ask) - float(bid)) / float(ask) * 100
+                spreads.append(spread_pct)
+        if not spreads:
+            return {"message": "No spread data available", "percentiles": {}}
+        import numpy as np
+        percentiles = {
+            "p50": round(np.percentile(spreads, 50), 3),
+            "p75": round(np.percentile(spreads, 75), 3),
+            "p90": round(np.percentile(spreads, 90), 3),
+            "p95": round(np.percentile(spreads, 95), 3),
+            "mean": round(np.mean(spreads), 3),
+            "max": round(max(spreads), 3)
+        }
+        return {"percentiles": percentiles, "sample_count": len(spreads)}
+
+    @staticmethod
+    async def get_imbalance_analysis(
+        db: AsyncSession,
+        common_symbol: str,
+        hours: int = 168
+    ) -> Dict[str, Any]:
+        """
+        Analyze how often each exchange's base balance falls below certain ratios of average.
+        Helps set market_rebalance_imbalance_ratio.
+        """
+        from app.apps.arbitrage.models import BaseInventory, Exchange
+        # Fetch historical balance snapshots? But balances are only current.
+        # Instead, we can compute current imbalance and simulate if historical trades had imbalance.
+        # Simpler: Return current distribution of base balances.
+        stmt = (
+            select(Exchange.name, BaseInventory.balance)
+            .join(Exchange, BaseInventory.exchange_id == Exchange.id)
+            .where(BaseInventory.common_symbol == common_symbol)
+        )
+        result = await db.execute(stmt)
+        rows = result.all()
+        balances = {name: float(bal) for name, bal in rows}
+        avg_balance = sum(balances.values()) / len(balances) if balances else 0
+        if avg_balance == 0:
+            return {"message": "No balance data"}
+        ratios = {name: bal / avg_balance for name, bal in balances.items()}
+        return {
+            "current_balances": balances,
+            "average": avg_balance,
+            "ratios_to_avg": ratios,
+            "imbalance_suggestion": "Set imbalance_ratio to 0.2 if you want to rebalance when any exchange falls below 20% of avg."
+        }
+
+    @staticmethod
+    async def get_trade_size_analysis(
+        db: AsyncSession,
+        common_symbol: str,
+        hours: int = 168
+    ) -> Dict[str, Any]:
+        """
+        Analyze relationship between traded volume and net profit.
+        Helps tune min_trade_percent, min_trade_factor, valuability_factor.
+        """
+        from app.apps.arbitrage.models import ArbitrageOpportunity
+        stmt = (
+            select(ArbitrageOpportunity.traded_volume, ArbitrageOpportunity.profit_quote)
+            .where(ArbitrageOpportunity.common_symbol == common_symbol)
+            .where(ArbitrageOpportunity.created_at >= datetime.utcnow() - timedelta(hours=hours))
+        )
+        result = await db.execute(stmt)
+        data = [(float(vol), float(profit)) for vol, profit in result.all() if vol and profit]
+        if not data:
+            return {"message": "No trade data"}
+        volumes = [d[0] for d in data]
+        profits = [d[1] for d in data]
+        # Compute profit per unit volume
+        profit_per_unit = [profits[i] / volumes[i] for i in range(len(volumes))]
+        avg_ppu = sum(profit_per_unit) / len(profit_per_unit)
+        median_vol = sorted(volumes)[len(volumes)//2]
+        # Recommend min_trade_percent as a fraction of median volume relative to average inventory
+        return {
+            "avg_profit_per_unit_volume": round(avg_ppu, 2),
+            "median_traded_volume": round(median_vol, 2),
+            "min_trade_percent_suggestion": "Set min_trade_percent to 0.1-0.2 (10-20% of max available)",
+            "valuability_factor_suggestion": "Keep at 1.0 unless profit per unit is very high",
+        }
+
+    @staticmethod
+    async def get_rebalancing_loss_analysis(
+        db: AsyncSession,
+        common_symbol: str,
+        hours: int = 168
+    ) -> Dict[str, Any]:
+        """
+        Analyze past rebalancing logs: average loss per trade, spread at execution, etc.
+        Helps adjust max_spread_percent and amount_percent.
+        """
+        from app.apps.arbitrage.models import RebalanceLog
+        stmt = (
+            select(RebalanceLog)
+            .where(RebalanceLog.common_symbol == common_symbol)
+            .where(RebalanceLog.created_at >= datetime.utcnow() - timedelta(hours=hours))
+        )
+        result = await db.execute(stmt)
+        logs = result.scalars().all()
+        if not logs:
+            return {"message": "No rebalance logs in period"}
+        losses = [log.profit_quote for log in logs if log.profit_quote < 0]  # negative
+        if not losses:
+            return {"message": "No loss-making rebalances (perhaps all were profitable)"}
+        avg_loss = sum(losses) / len(losses)
+        total_loss = sum(losses)
+        # Suggest tightening max_spread if losses are large
+        return {
+            "total_loss_irt": round(total_loss, 2),
+            "avg_loss_per_rebalance": round(avg_loss, 2),
+            "num_rebalances": len(logs),
+            "suggestion": "If avg_loss is high, reduce market_rebalance_amount_percent or tighten max_spread_percent.",
+            "current_max_spread": 0.1  # from user's settings
+        }

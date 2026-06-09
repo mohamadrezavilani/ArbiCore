@@ -49,3 +49,49 @@ async def get_cross_exchange_spread(
 ):
     data = await AnalysisService.get_cross_exchange_spread(db, symbol, hours)
     return data
+
+@router.get("/profit-distribution")
+async def get_profit_distribution(
+    symbol: str = Query("USDTIRT"),
+    hours: int = Query(168, ge=1, le=720),
+    db: AsyncSession = Depends(get_db)
+):
+    data = await AnalysisService.get_profit_distribution(db, symbol, hours)
+    return data
+
+@router.get("/spread-distribution")
+async def get_spread_distribution(
+    symbol: str = Query("USDTIRT"),
+    exchange: str = Query(None),
+    hours: int = Query(168, ge=1, le=720),
+    db: AsyncSession = Depends(get_db)
+):
+    data = await AnalysisService.get_spread_distribution(db, symbol, exchange, hours)
+    return data
+
+@router.get("/imbalance-analysis")
+async def get_imbalance_analysis(
+    symbol: str = Query("USDTIRT"),
+    hours: int = Query(168),
+    db: AsyncSession = Depends(get_db)
+):
+    data = await AnalysisService.get_imbalance_analysis(db, symbol, hours)
+    return data
+
+@router.get("/trade-size-analysis")
+async def get_trade_size_analysis(
+    symbol: str = Query("USDTIRT"),
+    hours: int = Query(168),
+    db: AsyncSession = Depends(get_db)
+):
+    data = await AnalysisService.get_trade_size_analysis(db, symbol, hours)
+    return data
+
+@router.get("/rebalancing-loss-analysis")
+async def get_rebalancing_loss_analysis(
+    symbol: str = Query("USDTIRT"),
+    hours: int = Query(168),
+    db: AsyncSession = Depends(get_db)
+):
+    data = await AnalysisService.get_rebalancing_loss_analysis(db, symbol, hours)
+    return data
