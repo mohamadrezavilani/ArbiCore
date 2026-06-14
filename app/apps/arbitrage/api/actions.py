@@ -111,16 +111,17 @@ async def get_actions(
 @router.post("/rebalance-smart")
 async def rebalance_smart(db: AsyncSession = Depends(get_db)):
     """
-    Moves all USDT to the exchange with the smallest USDT balance.
-    Moves all IRT to the exchange with the smallest IRT balance.
-    Deducts 200,000 IRT and 1.7 USDT (converted to IRT at cheapest ask) as network fees.
-    Logs fees as rebalancing losses.
+    - Moves ALL USDT to the exchange with the smallest USDT balance.
+    - Splits ALL IRT equally between the OTHER TWO exchanges (not the USDT target).
+    - Deducts 200,000 IRT and 1.7 USDT (converted to IRT at cheapest ask) as network fees.
+    - Logs fees as rebalancing losses.
     """
     stmt = select(Exchange.name, Exchange.id).where(Exchange.is_active == True)
     result = await db.execute(stmt)
     exchanges = result.all()
-    if len(exchanges) < 2:
-        raise HTTPException(400, "Need at least 2 active exchanges")
+    if len(exchanges) != 3:
+        raise HTTPException(400, "This endpoint assumes exactly 3 active exchanges")
+    exchange_names = [ex.name for ex in exchanges]
 
     # 1. Find target for USDT (smallest USDT balance)
     usdt_balances = []
@@ -140,38 +141,28 @@ async def rebalance_smart(db: AsyncSession = Depends(get_db)):
         await set_base_balance(db, ex_name, "USDTIRT", 0.0)
     await set_base_balance(db, target_usdt, "USDTIRT", total_usdt)
 
-    # 2. Find target for IRT (smallest IRT balance)
-    irt_balances = []
-    for ex_name, ex_id in exchanges:
-        bal = await get_quote_balance(db, ex_name, "IRT")
-        irt_balances.append((ex_name, bal))
-    irt_balances.sort(key=lambda x: x[1])
-    target_irt = irt_balances[0][0]
+    # 2. Identify the two exchanges that are NOT the USDT target
+    other_exchanges = [ex_name for ex_name in exchange_names if ex_name != target_usdt]
+    if len(other_exchanges) != 2:
+        raise HTTPException(500, "Could not find two other exchanges")
 
-    # Move all IRT to target_irt
+    # 3. Move all IRT to those two exchanges equally
     total_irt = 0.0
     for ex_name, _ in exchanges:
         bal = await get_quote_balance(db, ex_name, "IRT")
         total_irt += bal
-        if ex_name == target_irt:
-            continue
-        await set_quote_balance(db, ex_name, "IRT", 0.0)
-    await set_quote_balance(db, target_irt, "IRT", total_irt)
+        await set_quote_balance(db, ex_name, "IRT", 0.0)  # zero all first
+    # Split equally
+    irt_per_target = total_irt / 2
+    for ex_name in other_exchanges:
+        await set_quote_balance(db, ex_name, "IRT", irt_per_target)
 
-    # 3. Deduct fees from the receiving exchanges
-    # IRT fee: 200,000 IRT from target_irt
+    # 4. Deduct fees (200,000 IRT and 1.7 USDT converted to IRT)
+    #    Deduct proportionally from the two IRT receivers
     fee_irt = 200000.0
-    target_irt_bal = await get_quote_balance(db, target_irt, "IRT")
-    if target_irt_bal < fee_irt:
-        raise HTTPException(400, f"Target IRT exchange {target_irt} has insufficient IRT ({target_irt_bal}) for fee {fee_irt}")
-    await update_quote_balance(db, target_irt, "IRT", -fee_irt)
-
-    # USDT fee: 1.7 USDT from target_usdt, convert to IRT at cheapest ask
     fee_usdt = 1.7
-    target_usdt_bal = await get_base_balance(db, target_usdt, "USDTIRT")
-    if target_usdt_bal < fee_usdt:
-        raise HTTPException(400, f"Target USDT exchange {target_usdt} has insufficient USDT ({target_usdt_bal}) for fee {fee_usdt}")
-    # Find cheapest USDT ask across exchanges
+
+    # Find cheapest USDT ask price for conversion
     best_price = None
     for ex_name, ex_id in exchanges:
         fee_stmt = select(ExchangeFee.taker_fee).where(
@@ -197,15 +188,32 @@ async def rebalance_smart(db: AsyncSession = Depends(get_db)):
     if best_price is None:
         raise HTTPException(503, "Could not determine USDT price for fee conversion")
     fee_irt_from_usdt = fee_usdt * best_price
-    # Deduct the equivalent IRT from target_irt (since fee is paid in IRT)
-    target_irt_bal = await get_quote_balance(db, target_irt, "IRT")
-    if target_irt_bal < fee_irt_from_usdt:
-        raise HTTPException(400, f"Target IRT exchange {target_irt} has insufficient IRT to cover USDT fee (need {fee_irt_from_usdt})")
-    await update_quote_balance(db, target_irt, "IRT", -fee_irt_from_usdt)
-    # Also deduct the USDT from target_usdt
+
+    # Deduct IRT fee from the two IRT receivers equally
+    irt_fee_per_receiver = fee_irt / 2
+    for ex_name in other_exchanges:
+        bal = await get_quote_balance(db, ex_name, "IRT")
+        new_bal = bal - irt_fee_per_receiver
+        if new_bal < 0:
+            raise HTTPException(400, f"Insufficient IRT on {ex_name} for fee deduction")
+        await set_quote_balance(db, ex_name, "IRT", new_bal)
+
+    # Deduct USDT fee (converted to IRT) from the two IRT receivers equally
+    usdt_fee_irt_per_receiver = fee_irt_from_usdt / 2
+    for ex_name in other_exchanges:
+        bal = await get_quote_balance(db, ex_name, "IRT")
+        new_bal = bal - usdt_fee_irt_per_receiver
+        if new_bal < 0:
+            raise HTTPException(400, f"Insufficient IRT on {ex_name} to cover USDT fee")
+        await set_quote_balance(db, ex_name, "IRT", new_bal)
+
+    # Deduct the USDT amount from target_usdt
+    target_usdt_bal = await get_base_balance(db, target_usdt, "USDTIRT")
+    if target_usdt_bal < fee_usdt:
+        raise HTTPException(400, f"Target USDT exchange has insufficient USDT ({target_usdt_bal}) for fee {fee_usdt}")
     await update_base_balance(db, target_usdt, "USDTIRT", -fee_usdt)
 
-    # 4. Log fees as rebalancing losses
+    # 5. Log fees as rebalancing losses
     logger = OpportunityLogger()
     # IRT fee log
     await logger.log_rebalance(
@@ -235,13 +243,17 @@ async def rebalance_smart(db: AsyncSession = Depends(get_db)):
     )
     await db.commit()
 
+    # Get final balances for response
+    final_usdt = await get_base_balance(db, target_usdt, "USDTIRT")
+    final_irt_receivers = {ex: await get_quote_balance(db, ex, "IRT") for ex in other_exchanges}
+
     return {
         "success": True,
         "target_usdt_exchange": target_usdt,
-        "target_irt_exchange": target_irt,
-        "final_usdt_on_target": target_usdt_bal - fee_usdt,
-        "final_irt_on_target": target_irt_bal - fee_irt - fee_irt_from_usdt,
+        "irt_receiver_exchanges": other_exchanges,
+        "final_usdt_on_target": final_usdt,
+        "final_irt_on_receivers": final_irt_receivers,
         "irt_fee_deducted": fee_irt,
         "usdt_fee_converted_to_irt": round(fee_irt_from_usdt, 2),
-        "message": f"All USDT moved to {target_usdt} (needs USDT). All IRT moved to {target_irt} (needs IRT). Fees deducted."
+        "message": f"All USDT moved to {target_usdt}. IRT split equally between {other_exchanges}. Fees deducted."
     }
