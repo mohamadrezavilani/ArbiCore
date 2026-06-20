@@ -265,3 +265,9 @@ async def rebalance_smart(db: AsyncSession = Depends(get_db)):
         "usdt_fee_converted_to_irt": round(fee_irt_from_usdt, 2),
         "message": f"All USDT moved to {target_usdt} (highest bid price). IRT split equally between {other_exchanges}. Fees deducted."
     }
+
+@router.post("/sync-balances")
+async def sync_balances(db: AsyncSession = Depends(get_db)):
+    from app.apps.arbitrage.services.balance_sync import BalanceSyncService
+    result = await BalanceSyncService.sync_all_balances(db)
+    return {"status": "success", "result": result}

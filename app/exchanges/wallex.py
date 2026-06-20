@@ -14,18 +14,16 @@ class WallexClient(ExchangeClient):
         self.session = None
 
     async def _request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
-        """Make authenticated request to Wallex API."""
-        if not self.session:
-            self.session = aiohttp.ClientSession()
         headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
         if "headers" in kwargs:
             headers.update(kwargs.pop("headers"))
         url = f"{self.base_url}{path}"
-        async with self.session.request(method, url, headers=headers, **kwargs) as resp:
-            if resp.status not in (200, 201):
-                text = await resp.text()
-                raise Exception(f"Wallex API error {resp.status}: {text}")
-            return await resp.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.request(method, url, headers=headers, **kwargs) as resp:
+                if resp.status not in (200, 201):
+                    text = await resp.text()
+                    raise Exception(f"Wallex API error {resp.status}: {text}")
+                return await resp.json()
 
     async def get_balances(self) -> Dict[str, float]:
         data = await self._request("GET", "/v1/account/balances")
