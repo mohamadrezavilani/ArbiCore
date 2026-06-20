@@ -129,6 +129,8 @@ class BitpinClient(ExchangeClient):
                 raw_response=None
             )
 
+    # app/exchanges/bitpin.py – update order_status and cancel_order
+
     async def order_status(self, client_order_id: str) -> OrderResult:
         try:
             response = await self._request("GET", f"/api/v1/odr/orders/identifier/{client_order_id}/")
@@ -152,7 +154,8 @@ class BitpinClient(ExchangeClient):
                 raw_response=response
             )
         except Exception as e:
-            if "404" in str(e):
+            # If the order doesn't exist (404) or any other error, treat as cancelled/failed
+            if "404" in str(e) or "500" in str(e):
                 return OrderResult(
                     order_id="",
                     client_order_id=client_order_id,
@@ -178,7 +181,8 @@ class BitpinClient(ExchangeClient):
             await self._request("DELETE", f"/api/v1/odr/orders/identifier/{client_order_id}/")
             return True
         except Exception as e:
-            if "404" in str(e) or "406" in str(e):
+            if "404" in str(e) or "406" in str(e) or "500" in str(e):
+                # Order not found or already cancelled – consider it successful
                 return True
             self.logger.exception(f"Failed to cancel order {client_order_id}")
             return False

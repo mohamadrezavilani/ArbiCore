@@ -1,3 +1,5 @@
+# app/core/config.py
+
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
@@ -24,8 +26,16 @@ class Settings(BaseSettings):
     # Exchange API keys
     WALLEX_API_KEY: str = ""
     WALLEX_API_SECRET: str = ""
-    NOBITEX_API_KEY: str = ""
-    NOBITEX_API_SECRET: str = ""
+
+    # Nobitex – new separate fields
+    NOBITEX_API_TOKEN: str = ""          # for Authorization header
+    NOBITEX_API_PUBLIC_KEY: str = ""     # for Nobitex-Key header
+    NOBITEX_API_PRIVATE_KEY: str = ""    # for signing (hex)
+
+    # Old Nobitex fields (kept for backward compatibility, but not used)
+    NOBITEX_API_KEY: str = ""            # deprecated – use TOKEN instead
+    NOBITEX_API_SECRET: str = ""         # deprecated – use PRIVATE_KEY instead
+
     BITPIN_API_KEY: str = ""
     BITPIN_API_SECRET: str = ""
 
@@ -35,5 +45,6 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"
 
 settings = Settings()

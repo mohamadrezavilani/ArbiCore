@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.core.database import engine
+from app.core.database import engine, AsyncSessionLocal
 from app.core.handlers import register_exception_handlers
 from app.core.logging import setup_logging
 from app.apps.arbitrage.api import router as arbitrage_router
@@ -11,25 +11,30 @@ from app.apps.arbitrage.api.analysis import router as analysis_router   # NEW
 from app.apps.arbitrage.tasks import periodic_arbitrage_poll
 from app.apps.arbitrage.seed_data import seed
 from fastapi.responses import HTMLResponse
-
+from app.apps.arbitrage.services.balance_sync import BalanceSyncService
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     setup_logging()
-
-    # 1. Create all tables (if they don't exist)
     async with engine.begin() as conn:
         from app.models.base import Base
-        import app.apps.arbitrage.models   # registers models with Base
+        import app.apps.arbitrage.models
         await conn.run_sync(Base.metadata.create_all)
         print("✅ Database tables ensured.")
 
-    # 2. Seed initial data (exchanges, symbols, fees, etc.) – runs only once
     await seed()
     print("✅ Seeding completed (or skipped if already seeded).")
 
-    # 3. Start background arbitrage polling
+    # ---- NEW: Sync real balances immediately after startup ----
+    async with AsyncSessionLocal() as db:
+        try:
+            await BalanceSyncService.sync_all_balances(db)
+            print("✅ Initial balance sync completed.")
+        except Exception as e:
+            print(f"❌ Initial balance sync failed: {e}")
+
+    # Start background arbitrage polling
     poll_task = asyncio.create_task(periodic_arbitrage_poll())
     print("🚀 Arbitrage polling started.")
 
