@@ -28,15 +28,15 @@ async def seed():
         # ========== 1. Exchanges ==========
         wallex = Exchange(
             name="wallex", base_url="https://api.wallex.ir", orderbook_endpoint="/v1/depth",
-            is_active=True, mode="simulator"
+            is_active=True, mode="live"
         )
         nobitex = Exchange(
             name="nobitex", base_url="https://apiv2.nobitex.ir", orderbook_endpoint="/v3/orderbook/{symbol}",
-            is_active=True, mode="simulator"
+            is_active=False, mode="live"
         )
         bitpin = Exchange(
             name="bitpin", base_url="https://api.bitpin.org", orderbook_endpoint="/api/v1/mth/orderbook/{symbol}/",
-            is_active=True, mode="simulator"
+            is_active=True, mode="live"
         )
         session.add_all([wallex, nobitex, bitpin])
         await session.commit()
@@ -69,13 +69,12 @@ async def seed():
         print("✅ Fees created.")
 
         # ========== 4. Inventories ==========
-        for exchange in [wallex, nobitex, bitpin]:
-            for sym in ["USDTIRT"]:
-                session.add(BaseInventory(exchange_id=exchange.id, common_symbol=sym, balance=1000.0))
+        # for exchange in [wallex, nobitex, bitpin]:
+        #     for sym in ["USDTIRT"]:
+        #         session.add(BaseInventory(exchange_id=exchange.id, common_symbol=sym, balance=1000.0))
 
-        for exchange in [wallex, nobitex, bitpin]:
-            session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=1_000_000_000.0))
-            # session.add(QuoteInventory(exchange_id=exchange.id, currency="USDT", balance=10.0))
+        # for exchange in [wallex, nobitex, bitpin]:
+        #     session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=1_000_000_000.0))
 
         await session.commit()
         print("✅ Inventories created.")
@@ -123,7 +122,7 @@ async def seed():
         settings_rows = [
             SymbolArbitrageSettings(
                 common_symbol="USDTIRT",
-                min_profit_percent=0.9,
+                min_profit_percent=0.5,
                 cutoff_threshold=0,
                 min_trade_percent=0.20,
                 min_trade_factor=0.3,
@@ -132,7 +131,7 @@ async def seed():
                 is_active=True,
                 opportunistic_rebalance_enabled=False,
                 opportunistic_rebalance_max_loss_percent=50.0,
-                market_rebalance_enabled=True,
+                market_rebalance_enabled=False,
                 market_rebalance_amount_percent=20.0,
                 market_rebalance_max_spread_percent=0.1,
                 market_rebalance_imbalance_ratio=0.25,
@@ -140,7 +139,7 @@ async def seed():
                 last_rebalance_time=None,
                 rebalance_pending=False,
                 # NEW
-                quote_rebalance_enabled=True,
+                quote_rebalance_enabled=False,
                 quote_rebalance_amount_percent=20.0,
                 quote_rebalance_max_spread_percent=0.1,
                 quote_rebalance_imbalance_ratio=0.25,

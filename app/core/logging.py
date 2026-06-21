@@ -1,5 +1,8 @@
 import logging
 import sys
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 def setup_logging():
     logging.basicConfig(
