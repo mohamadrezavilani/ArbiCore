@@ -76,8 +76,8 @@ class BitpinClient(ExchangeClient):
             for wallet in data:
                 asset = wallet.get("asset")
                 balance = float(wallet.get("balance", 0))
-                if asset == "RIAL":
-                    balances["IRT"] = balance
+                if asset == "IRT":
+                    balances["IRT"] = balance * 10
                 elif asset == "USDT":
                     balances["USDT"] = balance
                 else:

@@ -240,7 +240,7 @@ class ArbitrageDetector:
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
                     f"buy_on_{buy_exch}_sell_on_{sell_exch}",
-                    reason, {"net_gain": net_gain, "trade_pct": trade_pct}
+                    reason, {"net_gain": net_gain, "trade_pct": trade_pct, "weight": weight}
                 )
                 i += 1
                 j += 1

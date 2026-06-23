@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 import logging
+import sys
 from decimal import Decimal, getcontext
 from typing import Tuple, Optional, Any, List, Dict
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,7 +13,22 @@ from .opportunity_logger import OpportunityLogger
 # Set high precision for Decimal
 getcontext().prec = 28
 
+# Force UTF‑8 for Windows console to avoid Unicode errors
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
+
 logger = logging.getLogger(__name__)
+
+# Minimum order size in USDT for live trading
+MIN_ORDER_SIZE = {
+    "wallex": 2.0,     # Wallex minimum order is 2 USDT
+    "bitpin": 2.0,     # Bitpin also requires at least 2 USDT (verify)
+    "nobitex": 2.0,    # adjust if needed
+}
 
 
 class TradeExecutor:
@@ -20,9 +36,7 @@ class TradeExecutor:
         self.logger = logger
 
     async def sync_balances_from_exchange(self, db: AsyncSession, exchange_name: str, client):
-        """
-        Fetch real balances from a live exchange and update local inventory.
-        """
+        """Fetch real balances from a live exchange and update local inventory."""
         try:
             real_balances = await client.get_balances()
             stmt = select(ExchangeSymbol).join(Exchange).where(Exchange.name == exchange_name)
@@ -59,9 +73,8 @@ class TradeExecutor:
     ) -> Tuple[bool, float, float, float, float, float, float, float, float]:
         """
         Atomic trade execution with robust partial fill handling.
-        Returns:
-            success, filled_vol, vwap_buy, vwap_sell,
-            base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit
+        Returns: success, filled_vol, vwap_buy, vwap_sell,
+                 base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit
         """
         # ---------- Simulator mode (unchanged) ----------
         if not is_live:
@@ -102,35 +115,60 @@ class TradeExecutor:
 
         # ---------- LIVE MODE WITH ROBUST ATOMIC EXECUTION ----------
         if buy_client is None or sell_client is None:
-            logger.error("[LIVE] Trade aborted: missing exchange client(s)")
+            logger.error("Live mode requires valid exchange clients")
+            return False, 0, 0, 0, 0, 0, 0, 0, 0
+
+        # Check minimum order size for both exchanges
+        min_buy = MIN_ORDER_SIZE.get(buy_exchange, 2.0)
+        min_sell = MIN_ORDER_SIZE.get(sell_exchange, 2.0)
+        if volume < min_buy or volume < min_sell:
+            logger.warning(
+                f"[LIVE] Volume {volume:.4f} is below minimum order size: "
+                f"{buy_exchange} needs {min_buy}, {sell_exchange} needs {min_sell}. Rejecting trade."
+            )
+            return False, 0, 0, 0, 0, 0, 0, 0, 0
+
+        # Fetch original symbols for the exchanges (critical fix)
+        stmt = select(ExchangeSymbol.original_symbol).where(
+            ExchangeSymbol.exchange_id == buy_exch_obj_id,
+            ExchangeSymbol.common_symbol == common_symbol
+        )
+        buy_original = (await db.execute(stmt)).scalar_one_or_none()
+
+        stmt = select(ExchangeSymbol.original_symbol).where(
+            ExchangeSymbol.exchange_id == sell_exch_obj_id,
+            ExchangeSymbol.common_symbol == common_symbol
+        )
+        sell_original = (await db.execute(stmt)).scalar_one_or_none()
+
+        if not buy_original or not sell_original:
+            logger.error(f"[LIVE] Missing original symbol for {common_symbol} on buy/sell exchanges")
             return False, 0, 0, 0, 0, 0, 0, 0, 0
 
         # Configuration
-        POLL_INTERVAL = 0.5          # seconds between status checks
-        MAX_DURATION = 300           # 5 minutes maximum
-        MIN_FILL_THRESHOLD = 0.01    # 1% tolerance for full fill
+        POLL_INTERVAL = 0.5
+        MAX_DURATION = 300
+        MIN_FILL_THRESHOLD = 0.01
 
         target_volume = volume
         start_time = asyncio.get_event_loop().time()
 
         logger.info(
-            f"[LIVE] STARTING ATOMIC TRADE | symbol={common_symbol} | "
+            f"[LIVE] STARTING ATOMIC TRADE | symbol={common_symbol} (buy_orig={buy_original}, sell_orig={sell_original}) | "
             f"buy={buy_exchange} (fee={buy_fee_rate:.4f}) | sell={sell_exchange} (fee={sell_fee_rate:.4f}) | "
             f"target_vol={target_volume:.4f} | max_duration={MAX_DURATION}s"
         )
         logger.info(f"[LIVE] Initial prices: buy_vwap={vwap_buy:.2f} | sell_vwap={vwap_sell:.2f}")
 
-        # We'll maintain a list of orders for each side
-        buy_orders: List[Dict] = []   # each: {'client_order_id': str, 'filled_vol': float, 'status': str, 'result': OrderResult}
+        buy_orders: List[Dict] = []
         sell_orders: List[Dict] = []
 
-        # Helper to place a new order and add to the list
-        async def place_order_side(side: str, amount: float, client: Any, orders_list: List[Dict]) -> str:
+        async def place_order_side(side: str, amount: float, client: Any, orders_list: List[Dict], orig_symbol: str) -> str:
             cid = f"{side}_{uuid.uuid4().hex[:8]}"
-            logger.info(f"[LIVE] Placing {side.upper()} order: cid={cid} | amount={amount:.4f} | exchange={client.__class__.__name__}")
+            logger.info(f"[LIVE] Placing {side.upper()} order: cid={cid} | amount={amount:.4f} | exchange={client.__class__.__name__} | symbol={orig_symbol}")
             try:
                 order_result = await client.place_market_order(
-                    symbol=common_symbol,
+                    symbol=orig_symbol,
                     side=side,
                     amount=amount,
                     client_order_id=cid
@@ -147,16 +185,17 @@ class TradeExecutor:
                 )
                 return cid
             except Exception as e:
-                logger.error(f"[LIVE] Failed to place {side} order: cid={cid} | error={e}")
+                error_msg = str(e).encode('ascii', errors='replace').decode()
+                logger.error(f"[LIVE] Failed to place {side} order: cid={cid} | error={error_msg}")
                 raise
 
-        # Place initial orders
+        # Place initial orders with correct original symbols
         try:
-            await place_order_side('buy', target_volume, buy_client, buy_orders)
-            await place_order_side('sell', target_volume, sell_client, sell_orders)
+            await place_order_side('buy', target_volume, buy_client, buy_orders, buy_original)
+            await place_order_side('sell', target_volume, sell_client, sell_orders, sell_original)
         except Exception as e:
-            logger.error(f"[LIVE] Initial order placement failed: {e}")
-            # Try to cancel any orders that might have been placed
+            sanitised = str(e).encode('ascii', errors='replace').decode()
+            logger.error(f"[LIVE] Initial order placement failed: {sanitised}")
             await self._cancel_orders(buy_orders, buy_client, "buy")
             await self._cancel_orders(sell_orders, sell_client, "sell")
             return False, 0, 0, 0, 0, 0, 0, 0, 0
@@ -164,7 +203,6 @@ class TradeExecutor:
         last_log_time = start_time
         iteration = 0
 
-        # Polling loop
         while (asyncio.get_event_loop().time() - start_time) < MAX_DURATION:
             iteration += 1
             now = asyncio.get_event_loop().time()
@@ -189,11 +227,9 @@ class TradeExecutor:
                     except Exception as e:
                         logger.warning(f"[LIVE] Status check failed for cid={order['client_order_id']}: {e}")
 
-            # Calculate total filled per side
             total_buy_filled = sum(o['filled_vol'] for o in buy_orders)
             total_sell_filled = sum(o['filled_vol'] for o in sell_orders)
 
-            # Log summary every 10 seconds
             if now - last_log_time >= 10:
                 logger.info(
                     f"[LIVE] Poll # {iteration} | elapsed={now - start_time:.1f}s | "
@@ -203,25 +239,24 @@ class TradeExecutor:
                 )
                 last_log_time = now
 
-            # Check if both sides are fully filled (within threshold)
+            # Both sides fully filled?
             if total_buy_filled >= target_volume * (1 - MIN_FILL_THRESHOLD) and \
                total_sell_filled >= target_volume * (1 - MIN_FILL_THRESHOLD):
                 filled_vol = min(total_buy_filled, total_sell_filled)
-                buy_vwap = self._compute_vwap(buy_orders)
-                sell_vwap = self._compute_vwap(sell_orders)
+                buy_vwap_final = self._compute_vwap(buy_orders)
+                sell_vwap_final = self._compute_vwap(sell_orders)
                 logger.info(
                     f"[LIVE] ✅ TRADE SUCCESS | filled={filled_vol:.4f} | "
-                    f"buy_vwap={buy_vwap:.2f} | sell_vwap={sell_vwap:.2f} | "
+                    f"buy_vwap={buy_vwap_final:.2f} | sell_vwap={sell_vwap_final:.2f} | "
                     f"elapsed={now - start_time:.1f}s | iterations={iteration}"
                 )
-                return True, filled_vol, buy_vwap, sell_vwap, 0.0, 0.0, 0.0, 0.0, 0.0
+                return True, filled_vol, buy_vwap_final, sell_vwap_final, 0.0, 0.0, 0.0, 0.0, 0.0
 
-            # Now handle imbalances
+            # Handle imbalances
             buy_fully_filled = total_buy_filled >= target_volume * (1 - MIN_FILL_THRESHOLD)
             sell_fully_filled = total_sell_filled >= target_volume * (1 - MIN_FILL_THRESHOLD)
 
             if buy_fully_filled and not sell_fully_filled:
-                # Buy side is complete, need to fill sell side to match buy amount
                 target_sell_volume = total_buy_filled - total_sell_filled
                 if target_sell_volume > 0.001:
                     logger.warning(
@@ -230,7 +265,7 @@ class TradeExecutor:
                     )
                     await self._cancel_orders(sell_orders, sell_client, "sell")
                     sell_orders.clear()
-                    await place_order_side('sell', target_sell_volume, sell_client, sell_orders)
+                    await place_order_side('sell', target_sell_volume, sell_client, sell_orders, sell_original)
                 else:
                     logger.info(f"[LIVE] Sell missing amount {target_sell_volume:.4f} is too small, skipping adjustment")
 
@@ -243,12 +278,11 @@ class TradeExecutor:
                     )
                     await self._cancel_orders(buy_orders, buy_client, "buy")
                     buy_orders.clear()
-                    await place_order_side('buy', target_buy_volume, buy_client, buy_orders)
+                    await place_order_side('buy', target_buy_volume, buy_client, buy_orders, buy_original)
                 else:
                     logger.info(f"[LIVE] Buy missing amount {target_buy_volume:.4f} is too small, skipping adjustment")
 
             else:
-                # Both partially filled (or not filled at all)
                 if total_buy_filled == 0 and total_sell_filled > 0:
                     logger.warning(
                         f"[LIVE] ⚠️ IMBALANCE: buy_filled=0, sell_filled={total_sell_filled:.4f}. "
@@ -256,7 +290,7 @@ class TradeExecutor:
                     )
                     await self._cancel_orders(buy_orders, buy_client, "buy")
                     buy_orders.clear()
-                    await place_order_side('buy', total_sell_filled, buy_client, buy_orders)
+                    await place_order_side('buy', total_sell_filled, buy_client, buy_orders, buy_original)
 
                 elif total_sell_filled == 0 and total_buy_filled > 0:
                     logger.warning(
@@ -265,14 +299,13 @@ class TradeExecutor:
                     )
                     await self._cancel_orders(sell_orders, sell_client, "sell")
                     sell_orders.clear()
-                    await place_order_side('sell', total_buy_filled, sell_client, sell_orders)
-
-                # else both have some but not fully filled – just wait
+                    await place_order_side('sell', total_buy_filled, sell_client, sell_orders, sell_original)
 
             await asyncio.sleep(POLL_INTERVAL)
 
-        # Timeout reached – cancel all open orders and report failure
         elapsed = asyncio.get_event_loop().time() - start_time
+        total_buy_filled = sum(o['filled_vol'] for o in buy_orders)
+        total_sell_filled = sum(o['filled_vol'] for o in sell_orders)
         logger.error(
             f"[LIVE] ❌ TRADE TIMEOUT after {elapsed:.1f}s | "
             f"buy_filled={total_buy_filled:.4f} | sell_filled={total_sell_filled:.4f} | "
@@ -298,9 +331,6 @@ class TradeExecutor:
                     logger.warning(f"[LIVE] Failed to cancel {side_label} order cid={cid}: {e}")
 
     def _compute_vwap(self, orders: List[Dict]) -> float:
-        """
-        Compute volume-weighted average price from all order results stored in the list.
-        """
         total_vol = 0.0
         total_value = 0.0
         for order in orders:
@@ -308,7 +338,4 @@ class TradeExecutor:
             if res and res.filled_volume > 0 and res.filled_price > 0:
                 total_vol += res.filled_volume
                 total_value += res.filled_volume * res.filled_price
-        vwap = total_value / total_vol if total_vol > 0 else 0.0
-        if total_vol > 0:
-            logger.debug(f"[VWAP] computed {vwap:.2f} from {total_vol:.4f} vol over {len(orders)} orders")
-        return vwap
+        return total_value / total_vol if total_vol > 0 else 0.0

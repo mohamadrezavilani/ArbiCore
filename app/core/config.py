@@ -20,8 +20,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 
     # Arbitrage
-    ARBITRAGE_CHECK_INTERVAL_SECONDS: int = 10
-    ARBITRAGE_MIN_PROFIT_PERCENT: float = 0.5
+    ARBITRAGE_CHECK_INTERVAL_SECONDS: int = 5
 
     # Exchange API keys
     WALLEX_API_KEY: str = ""
