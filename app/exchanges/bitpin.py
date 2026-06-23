@@ -87,48 +87,36 @@ class BitpinClient(ExchangeClient):
             self.logger.exception("Failed to fetch balances")
             return {}
 
-    async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str) -> OrderResult:
-        try:
+    async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str,
+                                 price: float = None) -> OrderResult:
+        if price is None:
             ob_data = await self._request("GET", f"/api/v1/mth/orderbook/{symbol}/")
             if side.lower() == "buy":
-                best_price = float(ob_data["asks"][0][0])
+                price = float(ob_data["asks"][0][0])
             else:
-                best_price = float(ob_data["bids"][0][0])
-
-            payload = {
-                "symbol": symbol,
-                "type": "limit",
-                "side": side.lower(),
-                "base_amount": str(amount),
-                "price": str(best_price),
-                "identifier": client_order_id
-            }
-            response = await self._request("POST", "/api/v1/odr/orders/", json_data=payload)
-            order_id = str(response.get("id"))
-            filled_vol = float(response.get("dealed_base_amount", 0))
-            fee = float(response.get("commission", 0))
-            status = "filled" if filled_vol >= amount else "pending"
-            return OrderResult(
-                order_id=order_id,
-                client_order_id=client_order_id,
-                status=status,
-                filled_price=best_price,
-                filled_volume=filled_vol,
-                fee=fee,
-                raw_response=response
-            )
-        except Exception:
-            self.logger.exception(f"Failed to place {side} order")
-            return OrderResult(
-                order_id="",
-                client_order_id=client_order_id,
-                status="failed",
-                filled_price=0,
-                filled_volume=0,
-                fee=0,
-                raw_response=None
-            )
-
+                price = float(ob_data["bids"][0][0])
+        payload = {
+            "symbol": symbol,
+            "type": "limit",
+            "side": side.lower(),
+            "base_amount": str(amount),
+            "price": str(price),
+            "identifier": client_order_id
+        }
+        response = await self._request("POST", "/api/v1/odr/orders/", json_data=payload)
+        order_id = str(response.get("id"))
+        filled_vol = float(response.get("dealed_base_amount", 0))
+        fee = float(response.get("commission", 0))
+        status = "filled" if filled_vol >= amount else "pending"
+        return OrderResult(
+            order_id=order_id,
+            client_order_id=client_order_id,
+            status=status,
+            filled_price=price,
+            filled_volume=filled_vol,
+            fee=fee,
+            raw_response=response
+        )
     # app/exchanges/bitpin.py – update order_status and cancel_order
 
     async def order_status(self, client_order_id: str) -> OrderResult:

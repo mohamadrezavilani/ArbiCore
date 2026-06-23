@@ -19,4 +19,4 @@ def setup_logging():
         ]
     )
     # Suppress verbose access logs
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)

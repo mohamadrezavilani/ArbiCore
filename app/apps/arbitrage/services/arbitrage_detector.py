@@ -16,6 +16,8 @@ from .pair_weight import get_pair_weight
 
 logger = logging.getLogger(__name__)
 
+MIN_ORDER_SIZE = 2.0   # USDT minimum for Wallex/Bitpin
+
 
 class ArbitrageDetector:
     def __init__(
@@ -29,6 +31,7 @@ class ArbitrageDetector:
         self.risk_manager = risk_manager
         self.trade_executor = trade_executor
         self.rebalancer = rebalancer
+        self.MAX_LEVELS = 20   # sweep up to 20 levels
 
     @staticmethod
     def _max_volume_from_quote(available_quote: float, ask_price: float) -> float:
@@ -46,6 +49,33 @@ class ArbitrageDetector:
         d_base = Decimal(str(available_base))
         return float(d_base.quantize(Decimal('0.00000001'), rounding=ROUND_DOWN))
 
+    def _get_cumulative_levels(self, levels: List[List[float]], max_volume: float, max_levels: int = None) -> Tuple[List[float], List[float], float, float]:
+        """
+        Sweep orderbook levels to accumulate up to max_volume.
+        Returns: (prices, volumes, total_volume, vwap)
+        """
+        if max_levels is None:
+            max_levels = self.MAX_LEVELS
+        cum_vol = 0.0
+        cum_value = 0.0
+        prices = []
+        vols = []
+        for price, vol in levels[:max_levels]:
+            if cum_vol >= max_volume:
+                break
+            remaining = max_volume - cum_vol
+            take = min(vol, remaining)
+            cum_vol += take
+            cum_value += take * price
+            prices.append(price)
+            vols.append(take)
+            if cum_vol >= max_volume:
+                break
+        if cum_vol == 0:
+            return [], [], 0.0, 0.0
+        vwap = cum_value / cum_vol
+        return prices, vols, cum_vol, vwap
+
     async def detect_for_symbol(
             self,
             db: AsyncSession,
@@ -59,29 +89,6 @@ class ArbitrageDetector:
             quote_currency = "USDT"
         else:
             return False, {}, {}, []
-
-        # FORCE TRADE FOR TESTING
-        FORCE_TRADE = False
-        FORCE_SYMBOL = "USDTIRT"
-        FORCE_MULTIPLIER = 0.998
-        FORCE_BID_MULTIPLIER = 1.002
-
-        if FORCE_TRADE and common_symbol == FORCE_SYMBOL:
-            exch_list = list(exchange_orderbooks.keys())
-            if len(exch_list) >= 2:
-                buy_ex = exch_list[0]
-                sell_ex = exch_list[1]
-                buy_asks, buy_bids = exchange_orderbooks[buy_ex]
-                sell_asks, sell_bids = exchange_orderbooks[sell_ex]
-                if buy_asks and sell_bids:
-                    original_ask = buy_asks[0][0]
-                    buy_asks[0][0] = original_ask * FORCE_MULTIPLIER
-                    original_bid = sell_bids[0][0]
-                    sell_bids[0][0] = original_bid * FORCE_BID_MULTIPLIER
-                    exchange_orderbooks[buy_ex] = (buy_asks, buy_bids)
-                    exchange_orderbooks[sell_ex] = (sell_asks, sell_bids)
-                    logger.info(
-                        f"[TEST] Forced profitable spread: buy on {buy_ex} ask={buy_asks[0][0]:.2f}, sell on {sell_ex} bid={sell_bids[0][0]:.2f}")
 
         # Get settings
         stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
@@ -176,61 +183,102 @@ class ArbitrageDetector:
                 continue
 
             if eff_ask >= eff_bid:
-                reason = f"No profit: buy effective {eff_ask:.6f} >= sell effective {eff_bid:.6f}"
-                await self.logger.log_rejected_opportunity(
-                    db, common_symbol, buy_exch, sell_exch,
-                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
-                    reason,
-                    {"ask_price": ask_price, "bid_price": bid_price, "buy_fee": ask_fee, "sell_fee": bid_fee}
-                )
-                break
+                break  # no profit possible further due to sorted order
 
             weight = pair_weights.get((buy_exch, sell_exch), 0.5)
 
+            # Determine maximum possible volume from balances
             available_quote = avail_quote.get(buy_exch, 0.0)
             available_base = avail_base.get(sell_exch, 0.0)
 
             max_vol_by_quote = self._max_volume_from_quote(available_quote, ask_price)
             max_vol_by_base = self._max_volume_from_base(available_base)
 
-            max_vol = min(ask_vol, bid_vol, max_vol_by_quote, max_vol_by_base)
+            # We want to trade at least MIN_ORDER_SIZE if possible
+            desired_vol = min(max_vol_by_quote, max_vol_by_base)
 
-            if max_vol <= 0:
-                reason = f"Insufficient balance: quote on {buy_exch}={available_quote:.2f}, base on {sell_exch}={available_base:.4f}"
+            # Safety: don't use more than 25% of quote balance to avoid draining
+            max_safe_quote = available_quote
+            max_vol_safe = self._max_volume_from_quote(max_safe_quote, ask_price)
+            desired_vol = min(desired_vol, max_vol_safe)
+
+            # logger.info(f"max_safe_quote : {max_safe_quote:.4f} , max_vol_safe: {max_vol_safe:.4f}")
+
+            if desired_vol < MIN_ORDER_SIZE:
+                reason = f"Desired volume {desired_vol:.4f} below minimum {MIN_ORDER_SIZE}"
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
                     f"buy_on_{buy_exch}_sell_on_{sell_exch}",
                     reason,
-                    {"required_quote": max_vol * ask_price if max_vol else 0,
-                     "available_quote": available_quote,
-                     "required_base": max_vol, "available_base": available_base}
+                    {"available_quote": available_quote, "available_base": available_base}
                 )
                 i += 1
                 j += 1
                 continue
 
-            profit_percent = (eff_bid - eff_ask) / eff_ask * 100
-            min_profit = float(settings.min_profit_percent)
-            if profit_percent < min_profit:
-                reason = f"Profit {profit_percent:.4f}% below minimum {min_profit}%"
+            # Now sweep orderbook to see how much we can get at VWAP
+            buy_original_levels = exchange_orderbooks[buy_exch][0]  # asks
+            sell_original_levels = exchange_orderbooks[sell_exch][1]  # bids
+
+            # Get cumulative up to desired_vol (or max levels)
+            buy_prices, buy_vols, total_buy_vol, vwap_buy = self._get_cumulative_levels(buy_original_levels, desired_vol, self.MAX_LEVELS)
+            sell_prices, sell_vols, total_sell_vol, vwap_sell = self._get_cumulative_levels(sell_original_levels, desired_vol, self.MAX_LEVELS)
+
+            if total_buy_vol < MIN_ORDER_SIZE or total_sell_vol < MIN_ORDER_SIZE:
+                reason = f"Insufficient depth: buy_depth={total_buy_vol:.4f}, sell_depth={total_sell_vol:.4f}"
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
                     f"buy_on_{buy_exch}_sell_on_{sell_exch}",
                     reason,
-                    {"eff_ask": eff_ask, "eff_bid": eff_bid, "min_profit": min_profit}
+                    {"buy_depth": total_buy_vol, "sell_depth": total_sell_vol}
                 )
                 i += 1
                 j += 1
                 continue
 
-            net_gain = max_vol * (eff_bid - eff_ask)
+            # The volume we can trade is the minimum of the two cumulative volumes
+            max_vol = min(total_buy_vol, total_sell_vol)
+
+            # Ensure we meet minimum order size
+            if max_vol < MIN_ORDER_SIZE:
+                reason = f"Max volume {max_vol:.4f} below minimum {MIN_ORDER_SIZE}"
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    reason,
+                    {"max_vol": max_vol, "min_order": MIN_ORDER_SIZE}
+                )
+                i += 1
+                j += 1
+                continue
+
+            # Apply profit check using VWAP prices
+            effective_buy = vwap_buy * (1 + ask_fee)
+            effective_sell = vwap_sell * (1 - bid_fee)
+            profit_percent = (effective_sell - effective_buy) / effective_buy * 100
+
+            if profit_percent < float(settings.min_profit_percent):
+                reason = f"Profit {profit_percent:.4f}% below minimum {settings.min_profit_percent}%"
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    reason,
+                    {"vwap_buy": vwap_buy, "vwap_sell": vwap_sell, "min_profit": settings.min_profit_percent}
+                )
+                i += 1
+                j += 1
+                continue
+
+            net_gain = max_vol * (effective_sell - effective_buy)
+
+            # Risk manager decides how much of max_vol to trade
             trade_pct = self.risk_manager.calculate_trade_percent(
                 net_gain=net_gain,
                 network_commission_quote=0.0,
                 params=settings,
                 vol=max_vol,
                 weight=weight,
-                current_price=ask_price,
+                current_price=vwap_buy,
                 network_fee_base=network_fee_base,
                 max_base_pool=max_base_pool
             )
@@ -240,7 +288,7 @@ class ArbitrageDetector:
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
                     f"buy_on_{buy_exch}_sell_on_{sell_exch}",
-                    reason, {"net_gain": net_gain, "trade_pct": trade_pct, "weight": weight}
+                    reason, {"net_gain": net_gain, "trade_pct": trade_pct}
                 )
                 i += 1
                 j += 1
@@ -248,24 +296,30 @@ class ArbitrageDetector:
 
             volume = max_vol * trade_pct
 
-            # SAFETY FIX: Prevent massive single trades that drain balance
-            if volume > 0:
-                max_safe_vol = self._max_volume_from_quote(available_quote * 0.25, ask_price)
-                volume = min(volume, max_safe_vol)
+            # Safety: ensure we don't exceed available balances
+            if volume > desired_vol:
+                volume = desired_vol
+            logger.info(f"volume : {volume:.4f} = max_vol: {max_vol} * trade_pct: {trade_pct}")
 
-            if volume < 1e-6:
+            if volume < MIN_ORDER_SIZE:
+                reason = f"Final volume {volume:.4f} below minimum {MIN_ORDER_SIZE}"
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
                     f"buy_on_{buy_exch}_sell_on_{sell_exch}",
-                    f"Volume too small: {volume:.8f}",
-                    {"max_vol": max_vol, "trade_pct": trade_pct}
+                    reason,
+                    {"volume": volume, "min_order": MIN_ORDER_SIZE}
                 )
                 i += 1
                 j += 1
                 continue
 
+            # Determine worst prices for limit orders
+            buy_limit_price = buy_prices[-1] if buy_prices else vwap_buy
+            sell_limit_price = sell_prices[-1] if sell_prices else vwap_sell
+
             is_live = (exchange_modes.get(buy_exch) == "live" and exchange_modes.get(sell_exch) == "live")
-            success, filled_vol, vwap_buy, vwap_sell, b_delta_buy, b_delta_sell, q_delta_buy, q_delta_sell, net_profit = \
+
+            success, filled_vol, vwap_buy_exec, vwap_sell_exec, b_delta_buy, b_delta_sell, q_delta_buy, q_delta_sell, net_profit = \
                 await self.trade_executor.execute_and_get_deltas(
                     db=db, common_symbol=common_symbol,
                     buy_exchange=buy_exch, sell_exchange=sell_exch,
@@ -275,7 +329,9 @@ class ArbitrageDetector:
                     buy_exch_obj_id=exchange_ids.get(buy_exch),
                     sell_exch_obj_id=exchange_ids.get(sell_exch),
                     buy_fee_rate=ask_fee, sell_fee_rate=bid_fee,
-                    vwap_buy=ask_price, vwap_sell=bid_price,
+                    vwap_buy=vwap_buy, vwap_sell=vwap_sell,
+                    limit_price_buy=buy_limit_price,
+                    limit_price_sell=sell_limit_price,
                     is_live=is_live
                 )
 
@@ -286,6 +342,7 @@ class ArbitrageDetector:
                     quote_deltas[buy_exch] += q_delta_buy
                     quote_deltas[sell_exch] += q_delta_sell
 
+                # Update available balances for future loops
                 avail_quote[buy_exch] = max(0.0, avail_quote[buy_exch] + q_delta_buy)
                 avail_base[buy_exch] = max(0.0, avail_base[buy_exch] + b_delta_buy)
                 avail_quote[sell_exch] = max(0.0, avail_quote[sell_exch] + q_delta_sell)
@@ -296,18 +353,17 @@ class ArbitrageDetector:
                     exchange_a_id=exchange_ids[buy_exch],
                     exchange_b_id=exchange_ids[sell_exch],
                     trade_type=f"buy_on_{buy_exch}_sell_on_{sell_exch}",
-                    price_a=vwap_buy, price_b=vwap_sell,
-                    profit_percent=((filled_vol * vwap_sell - filled_vol * vwap_buy) / (
-                                filled_vol * vwap_buy)) * 100 if filled_vol > 0 else 0,
+                    price_a=vwap_buy_exec,
+                    price_b=vwap_sell_exec,
+                    profit_percent=((filled_vol * vwap_sell_exec - filled_vol * vwap_buy_exec) / (filled_vol * vwap_buy_exec)) * 100 if filled_vol > 0 else 0,
                     traded_volume=filled_vol,
                     profit_quote=net_profit
                 )
                 opportunities.append(opp)
 
-                asks[i] = (buy_exch, ask_price, ask_vol - filled_vol, eff_ask, ask_fee)
-                bids[j] = (sell_exch, bid_price, bid_vol - filled_vol, eff_bid, bid_fee)
-                if asks[i][2] <= 0: i += 1
-                if bids[j][2] <= 0: j += 1
+                # Advance indices to avoid reusing same levels
+                i += 1
+                j += 1
             else:
                 i += 1
                 j += 1

@@ -124,8 +124,8 @@ async def seed():
                 common_symbol="USDTIRT",
                 min_profit_percent=0.5,
                 cutoff_threshold=0,
-                min_trade_percent=0.20,
-                min_trade_factor=0.3,
+                min_trade_percent=1.0, # change to 0.20
+                min_trade_factor=0, # change to 0.3
                 valuability_factor=1.0,
                 default_network_id=trc20_network.id,
                 is_active=True,

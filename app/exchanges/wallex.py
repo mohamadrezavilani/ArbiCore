@@ -39,18 +39,20 @@ class WallexClient(ExchangeClient):
                 mapped[asset] = float(info.get("value", 0))
         return mapped
 
-    async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str) -> OrderResult:
-        ob_data = await self._request("GET", f"/v1/depth", params={"symbol": symbol})
-        result = ob_data.get("result", {})
-        if not result:
-            raise Exception("Failed to fetch orderbook")
-        if side.lower() == "buy":
-            best_price = float(result["ask"][0]["price"])
-        else:
-            best_price = float(result["bid"][0]["price"])
+    async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str,
+                                 price: float = None) -> OrderResult:
+        if price is None:
+            ob_data = await self._request("GET", f"/v1/depth", params={"symbol": symbol})
+            result = ob_data.get("result", {})
+            if not result:
+                raise Exception("Failed to fetch orderbook")
+            if side.lower() == "buy":
+                price = float(result["ask"][0]["price"])
+            else:
+                price = float(result["bid"][0]["price"])
         payload = {
             "client_id": client_order_id,
-            "price": str(best_price),
+            "price": str(price),
             "quantity": str(amount),
             "side": side.upper(),
             "symbol": symbol,
@@ -59,7 +61,7 @@ class WallexClient(ExchangeClient):
         response = await self._request("POST", "/v1/account/orders", json=payload)
         order_data = response.get("result", {})
         executed_qty = float(order_data.get("executedQty", 0))
-        executed_price = float(order_data.get("executedPrice", best_price))
+        executed_price = float(order_data.get("executedPrice", price))
         fee = float(order_data.get("fee", 0))
         status = "filled" if executed_qty >= amount else "partial"
         return OrderResult(

@@ -100,17 +100,17 @@ class NobitexClient(ExchangeClient):
         return ask_levels, bid_levels
 
     # ---------- ORDER PLACEMENT ----------
-    async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str) -> OrderResult:
-        # Fetch best price from orderbook
-        ob = await self.fetch_orderbook(symbol)
-        if not ob:
-            raise Exception("Failed to fetch orderbook")
-        if side.lower() == "buy":
-            price = float(ob["asks"][0][0])
-        else:
-            price = float(ob["bids"][0][0])
-
-        # Determine src/dst based on symbol (e.g., "USDTIRT" -> src=usdt, dst=rls)
+    async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str,
+                                 price: float = None) -> OrderResult:
+        if price is None:
+            ob = await self.fetch_orderbook(symbol)
+            if not ob:
+                raise Exception("Failed to fetch orderbook")
+            if side.lower() == "buy":
+                price = float(ob["asks"][0][0])
+            else:
+                price = float(ob["bids"][0][0])
+        # Determine src/dst based on symbol
         symbol_lower = symbol.lower()
         if symbol_lower.endswith("irt"):
             base = symbol_lower.replace("irt", "")
@@ -122,9 +122,8 @@ class NobitexClient(ExchangeClient):
             dst = "usdt"
         else:
             raise ValueError(f"Unsupported symbol: {symbol}")
-
         payload = {
-            "type": side.lower(),       # "buy" or "sell"
+            "type": side.lower(),
             "srcCurrency": src,
             "dstCurrency": dst,
             "amount": str(amount),
@@ -136,7 +135,7 @@ class NobitexClient(ExchangeClient):
         order_id = str(order.get("id"))
         matched_amount = float(order.get("matchedAmount", 0))
         fee = float(order.get("fee", 0))
-        status = "filled" if matched_amount >= amount else "pending"
+        status = "filled" if matched_amount >= amount else "partial"
         return OrderResult(
             order_id=order_id,
             client_order_id=client_order_id,
@@ -146,7 +145,6 @@ class NobitexClient(ExchangeClient):
             fee=fee,
             raw_response=response
         )
-
     async def order_status(self, client_order_id: str) -> OrderResult:
         payload = {"clientOrderId": client_order_id}
         response = await self._signed_request("POST", "/market/orders/status", json_data=payload)
