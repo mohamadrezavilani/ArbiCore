@@ -86,44 +86,76 @@ class OrderbookFetcher:
                 max_timestamp = ts
 
         if max_timestamp > 0:
-            pass
-            # logger.info(f"[TIME] Symbol {common_symbol}: max timestamp = {max_timestamp:.2f}")
+            logger.debug(f"[TIME] Symbol {common_symbol}: max timestamp = {max_timestamp:.2f}")
         else:
             logger.warning(f"[TIME] No timestamp found for any exchange in symbol {common_symbol}")
 
         return common_symbol, exchange_data, max_timestamp
 
     async def _fetch_one(self, ex_sym: ExchangeSymbol, client, timeout: float):
+        """
+        Fetch orderbook with retry logic (exponential backoff).
+        Returns (exchange_name, ask_levels, bid_levels, snapshot, timestamp) or None.
+        """
         ex_name = ex_sym.exchange.name
         original_symbol = ex_sym.original_symbol
         factor = float(ex_sym.price_conversion_factor)
-        try:
-            raw_ob = await asyncio.wait_for(client.fetch_orderbook(original_symbol), timeout=timeout)
-            if not raw_ob:
-                return None
-            ts = self._extract_timestamp(raw_ob, ex_name)
-            ask_levels, bid_levels = client.extract_levels(raw_ob)
-            ask_levels = [[p * factor, v] for p, v in ask_levels] if ask_levels else []
-            bid_levels = [[p * factor, v] for p, v in bid_levels] if bid_levels else []
-            best_ask = ask_levels[0] if ask_levels else [None, None]
-            best_bid = bid_levels[0] if bid_levels else [None, None]
+        max_retries = 3
+        base_delay = 1.0
 
-            snapshot = OrderbookSnapshot(
-                exchange_id=ex_sym.exchange_id,
-                symbol_id=ex_sym.id,
-                best_ask_price=best_ask[0],
-                best_ask_volume=best_ask[1],
-                best_bid_price=best_bid[0],
-                best_bid_volume=best_bid[1],
-                asks=ask_levels,
-                bids=bid_levels,
-                raw_data=raw_ob
-            )
-            return (ex_name, ask_levels, bid_levels, snapshot, ts)
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout fetching orderbook for {ex_name} {original_symbol}")
-        except Exception as e:
-            logger.error(f"Error fetching {ex_name} {original_symbol}: {e}")
+        for attempt in range(max_retries):
+            try:
+                raw_ob = await asyncio.wait_for(client.fetch_orderbook(original_symbol), timeout=timeout)
+                if not raw_ob:
+                    # No data – retry after delay
+                    if attempt < max_retries - 1:
+                        wait = base_delay * (2 ** attempt)
+                        logger.warning(f"Empty orderbook for {ex_name} {original_symbol}, retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+                        await asyncio.sleep(wait)
+                        continue
+                    else:
+                        logger.error(f"Empty orderbook for {ex_name} {original_symbol} after {max_retries} attempts")
+                        return None
+
+                ts = self._extract_timestamp(raw_ob, ex_name)
+                ask_levels, bid_levels = client.extract_levels(raw_ob)
+                ask_levels = [[p * factor, v] for p, v in ask_levels] if ask_levels else []
+                bid_levels = [[p * factor, v] for p, v in bid_levels] if bid_levels else []
+
+                best_ask = ask_levels[0] if ask_levels else [None, None]
+                best_bid = bid_levels[0] if bid_levels else [None, None]
+
+                snapshot = OrderbookSnapshot(
+                    exchange_id=ex_sym.exchange_id,
+                    symbol_id=ex_sym.id,
+                    best_ask_price=best_ask[0],
+                    best_ask_volume=best_ask[1],
+                    best_bid_price=best_bid[0],
+                    best_bid_volume=best_bid[1],
+                    asks=ask_levels,
+                    bids=bid_levels,
+                    raw_data=raw_ob
+                )
+                return (ex_name, ask_levels, bid_levels, snapshot, ts)
+
+            except asyncio.TimeoutError:
+                if attempt < max_retries - 1:
+                    wait = base_delay * (2 ** attempt)
+                    logger.warning(f"Timeout fetching {ex_name} {original_symbol}, retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"Timeout fetching {ex_name} {original_symbol} after {max_retries} attempts")
+                    return None
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = base_delay * (2 ** attempt)
+                    logger.warning(f"Error fetching {ex_name} {original_symbol}: {e}, retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"Error fetching {ex_name} {original_symbol}: {e} after {max_retries} attempts")
+                    return None
+
         return None
 
     def _extract_timestamp(self, raw_ob: Dict[str, Any], exchange_name: str) -> float:

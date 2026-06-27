@@ -17,13 +17,10 @@ class BitpinClient(ExchangeClient):
         self.refresh_token = None
         self.token_expiry = 0
         self.base_url = "https://api.bitpin.ir"
-        # No persistent session, no timeout
 
     async def _ensure_token(self):
-        """Obtain or refresh access token. Creates its own session."""
         if self.access_token and time.time() < self.token_expiry:
             return
-
         async with aiohttp.ClientSession() as session:
             if self.refresh_token:
                 try:
@@ -42,7 +39,6 @@ class BitpinClient(ExchangeClient):
                     self.logger.exception("Token refresh exception")
                     self.refresh_token = None
 
-            # Authenticate from scratch
             url = f"{self.base_url}/api/v1/usr/authenticate/"
             payload = {"api_key": self.api_key, "secret_key": self.secret_key}
             async with session.post(url, json=payload) as resp:
@@ -55,11 +51,9 @@ class BitpinClient(ExchangeClient):
                 self.token_expiry = time.time() + 900
 
     async def _request(self, method: str, path: str, json_data: Optional[Dict] = None) -> Any:
-        """Make an authenticated request. Creates its own session."""
         await self._ensure_token()
         headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
         url = f"{self.base_url}{path}"
-
         async with aiohttp.ClientSession() as session:
             async with session.request(method, url, headers=headers, json=json_data) as resp:
                 if resp.status == 204:
@@ -105,44 +99,32 @@ class BitpinClient(ExchangeClient):
         }
         response = await self._request("POST", "/api/v1/odr/orders/", json_data=payload)
         order_id = str(response.get("id"))
+        # Bitpin may return "dealed_base_amount" and "commission"
         filled_vol = float(response.get("dealed_base_amount", 0))
         fee = float(response.get("commission", 0))
-        status = "filled" if filled_vol >= amount else "pending"
+        executions = []
+        if filled_vol > 0:
+            executions.append({
+                "price": price,
+                "volume": filled_vol,
+                "fee": fee
+            })
+        status = "filled" if filled_vol >= amount else "partial"
         return OrderResult(
             order_id=order_id,
             client_order_id=client_order_id,
             status=status,
-            filled_price=price,
-            filled_volume=filled_vol,
-            fee=fee,
-            raw_response=response
+            filled_price=0.0,
+            filled_volume=0.0,
+            fee=0.0,
+            raw_response=response,
+            executions=executions
         )
-    # app/exchanges/bitpin.py – update order_status and cancel_order
 
     async def order_status(self, client_order_id: str) -> OrderResult:
         try:
             response = await self._request("GET", f"/api/v1/odr/orders/identifier/{client_order_id}/")
-            state = response.get("state", "").lower()
-            if state == "active":
-                status = "pending"
-            elif state == "closed":
-                status = "filled"
-            else:
-                status = "partial"
-            filled_vol = float(response.get("dealed_base_amount", 0))
-            filled_price = float(response.get("price", 0))
-            fee = float(response.get("commission", 0))
-            return OrderResult(
-                order_id=str(response.get("id")),
-                client_order_id=client_order_id,
-                status=status,
-                filled_price=filled_price,
-                filled_volume=filled_vol,
-                fee=fee,
-                raw_response=response
-            )
         except Exception as e:
-            # If the order doesn't exist (404) or any other error, treat as cancelled/failed
             if "404" in str(e) or "500" in str(e):
                 return OrderResult(
                     order_id="",
@@ -151,7 +133,8 @@ class BitpinClient(ExchangeClient):
                     filled_price=0,
                     filled_volume=0,
                     fee=0,
-                    raw_response=None
+                    raw_response=None,
+                    executions=[]
                 )
             self.logger.exception(f"Failed to get status for order {client_order_id}")
             return OrderResult(
@@ -161,8 +144,36 @@ class BitpinClient(ExchangeClient):
                 filled_price=0,
                 filled_volume=0,
                 fee=0,
-                raw_response=None
+                raw_response=None,
+                executions=[]
             )
+        state = response.get("state", "").lower()
+        if state == "active":
+            status = "pending"
+        elif state == "closed":
+            status = "filled"
+        else:
+            status = "partial"
+        filled_vol = float(response.get("dealed_base_amount", 0))
+        price = float(response.get("price", 0))
+        fee = float(response.get("commission", 0))
+        executions = []
+        if filled_vol > 0 and price > 0:
+            executions.append({
+                "price": price,
+                "volume": filled_vol,
+                "fee": fee
+            })
+        return OrderResult(
+            order_id=str(response.get("id")),
+            client_order_id=client_order_id,
+            status=status,
+            filled_price=0.0,
+            filled_volume=0.0,
+            fee=0.0,
+            raw_response=response,
+            executions=executions
+        )
 
     async def cancel_order(self, client_order_id: str) -> bool:
         try:
@@ -170,7 +181,6 @@ class BitpinClient(ExchangeClient):
             return True
         except Exception as e:
             if "404" in str(e) or "406" in str(e) or "500" in str(e):
-                # Order not found or already cancelled – consider it successful
                 return True
             self.logger.exception(f"Failed to cancel order {client_order_id}")
             return False
@@ -179,7 +189,6 @@ class BitpinClient(ExchangeClient):
         raise NotImplementedError("Withdraw not implemented for Bitpin")
 
     async def fetch_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Fetch raw orderbook – creates its own session, no timeout, no retry."""
         url = f"{self.base_url}/api/v1/mth/orderbook/{symbol}/"
         try:
             async with aiohttp.ClientSession() as session:

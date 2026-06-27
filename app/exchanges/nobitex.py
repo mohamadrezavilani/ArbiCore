@@ -50,7 +50,6 @@ class NobitexClient(ExchangeClient):
     # ---------- SIGNED REQUESTS ----------
     def _sign(self, timestamp: int, method: str, path: str, body: str = "") -> str:
         """Generate Ed25519 signature using base64-decoded private key."""
-        # Decode the base64 private key to raw bytes
         private_key_bytes = base64.b64decode(self.private_key_base64)
         signing_key = SigningKey(private_key_bytes)
         message = f"{timestamp}{method}{path}{body}"
@@ -110,7 +109,6 @@ class NobitexClient(ExchangeClient):
                 price = float(ob["asks"][0][0])
             else:
                 price = float(ob["bids"][0][0])
-        # Determine src/dst based on symbol
         symbol_lower = symbol.lower()
         if symbol_lower.endswith("irt"):
             base = symbol_lower.replace("irt", "")
@@ -132,19 +130,29 @@ class NobitexClient(ExchangeClient):
         }
         response = await self._signed_request("POST", "/market/orders/add", json_data=payload)
         order = response.get("order", {})
-        order_id = str(order.get("id"))
+        # Nobitex may not return executions immediately; we'll get them via status later
+        # But we can extract from response if present
+        executions = []
+        # Sometimes they include "trades" or similar? For now we set one execution based on matchedAmount
         matched_amount = float(order.get("matchedAmount", 0))
-        fee = float(order.get("fee", 0))
+        if matched_amount > 0:
+            executions.append({
+                "price": float(order.get("price", price)),
+                "volume": matched_amount,
+                "fee": float(order.get("fee", 0))
+            })
         status = "filled" if matched_amount >= amount else "partial"
         return OrderResult(
-            order_id=order_id,
+            order_id=str(order.get("id")),
             client_order_id=client_order_id,
             status=status,
-            filled_price=price,
-            filled_volume=matched_amount,
-            fee=fee,
-            raw_response=response
+            filled_price=0.0,
+            filled_volume=0.0,
+            fee=0.0,
+            raw_response=response,
+            executions=executions
         )
+
     async def order_status(self, client_order_id: str) -> OrderResult:
         payload = {"clientOrderId": client_order_id}
         response = await self._signed_request("POST", "/market/orders/status", json_data=payload)
@@ -158,17 +166,27 @@ class NobitexClient(ExchangeClient):
             status = "filled"
         else:
             status = "partial"
+        # Extract executions from the order details if available
+        # Nobitex may have "trades" field? We'll use matchedAmount and price for simplicity
         matched_amount = float(order.get("matchedAmount", 0))
-        filled_price = float(order.get("price", 0))
+        price = float(order.get("price", 0))
         fee = float(order.get("fee", 0))
+        executions = []
+        if matched_amount > 0 and price > 0:
+            executions.append({
+                "price": price,
+                "volume": matched_amount,
+                "fee": fee
+            })
         return OrderResult(
             order_id=str(order.get("id", "")),
             client_order_id=client_order_id,
             status=status,
-            filled_price=filled_price,
-            filled_volume=matched_amount,
-            fee=fee,
-            raw_response=response
+            filled_price=0.0,
+            filled_volume=0.0,
+            fee=0.0,
+            raw_response=response,
+            executions=executions
         )
 
     async def cancel_order(self, client_order_id: str) -> bool:

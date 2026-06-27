@@ -63,7 +63,7 @@ class ArbitrageOpportunity(Base, UUIDMixin, TimestampMixin):
     profit_percent: Mapped[float] = mapped_column(Numeric(10, 4))
     traded_volume: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
     profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
-
+    executions: Mapped[list["OrderExecution"]] = relationship(back_populates="opportunity", cascade="all, delete-orphan")
 
 class BaseInventory(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "base_inventories"
@@ -162,3 +162,16 @@ class ExchangePairWeight(Base, UUIDMixin, TimestampMixin):
     last_buy_exchange: Mapped[Optional["Exchange"]] = relationship(foreign_keys=[last_buy_exchange_id])
     last_sell_exchange: Mapped[Optional["Exchange"]] = relationship(foreign_keys=[last_sell_exchange_id])
     __table_args__ = (UniqueConstraint('exchange_a_id', 'exchange_b_id', name='uq_exchange_pair'),)
+
+class OrderExecution(Base, UUIDMixin, TimestampMixin):
+    __tablename__ = "order_executions"
+    opportunity_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("arbitrage_opportunities.id", ondelete="CASCADE"), nullable=False, index=True)
+    exchange_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    side: Mapped[str] = mapped_column(String(10), nullable=False)  # "buy" or "sell"
+    price: Mapped[float] = mapped_column(Numeric(20, 10), nullable=False)
+    volume: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)
+    fee: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # for debugging
+
+    # Relationship back to opportunity (optional, for ORM ease)
+    opportunity: Mapped["ArbitrageOpportunity"] = relationship(back_populates="executions")

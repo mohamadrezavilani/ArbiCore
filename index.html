@@ -29,9 +29,9 @@
     .orange { color: #fb923c; }
     .cyan { color: #22d3ee; }
     .mono { font-family: monospace; }
-    .actions-feed, .rejected-feed, .rebalance-feed { max-height: 350px; overflow-y: auto; }
-    .action-item, .rejected-item, .rebalance-item { border: 1px solid #27272a; border-radius: 12px; padding: 12px; margin-bottom: 12px; background: #09090b; transition: all 0.2s ease; }
-    .action-item:hover, .rejected-item:hover, .rebalance-item:hover { background: #121215; border-color: #3f3f46; }
+    .actions-feed, .rejected-feed, .rebalance-feed, .executions-feed { max-height: 350px; overflow-y: auto; }
+    .action-item, .rejected-item, .rebalance-item, .execution-item { border: 1px solid #27272a; border-radius: 12px; padding: 12px; margin-bottom: 12px; background: #09090b; transition: all 0.2s ease; }
+    .action-item:hover, .rejected-item:hover, .rebalance-item:hover, .execution-item:hover { background: #121215; border-color: #3f3f46; }
     .last-activity { background: linear-gradient(135deg, #1a1a2e, #16213e); border-radius: 20px; padding: 20px; margin-bottom: 24px; position: relative; overflow: hidden; border-left: 4px solid; }
     .last-activity.profitable { border-left-color: #4ade80; }
     .last-activity.unprofitable { border-left-color: #f87171; }
@@ -61,10 +61,12 @@
     .status-online { background: #22c55e20; color: #4ade80; border: 1px solid #22c55e40; }
     .metric-value { font-size: 18px; font-weight: 600; }
     .total-value { font-size: 28px; font-weight: bold; background: linear-gradient(135deg, #4ade80, #22c55e); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
-    .rejected-feed::-webkit-scrollbar, .actions-feed::-webkit-scrollbar, .rebalance-feed::-webkit-scrollbar { width: 6px; }
-    .rejected-feed::-webkit-scrollbar-track, .actions-feed::-webkit-scrollbar-track, .rebalance-feed::-webkit-scrollbar-track { background: #18181b; border-radius: 10px; }
-    .rejected-feed::-webkit-scrollbar-thumb, .actions-feed::-webkit-scrollbar-thumb, .rebalance-feed::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 10px; }
+    .rejected-feed::-webkit-scrollbar, .actions-feed::-webkit-scrollbar, .rebalance-feed::-webkit-scrollbar, .executions-feed::-webkit-scrollbar { width: 6px; }
+    .rejected-feed::-webkit-scrollbar-track, .actions-feed::-webkit-scrollbar-track, .rebalance-feed::-webkit-scrollbar-track, .executions-feed::-webkit-scrollbar-track { background: #18181b; border-radius: 10px; }
+    .rejected-feed::-webkit-scrollbar-thumb, .actions-feed::-webkit-scrollbar-thumb, .rebalance-feed::-webkit-scrollbar-thumb, .executions-feed::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 10px; }
     @media (max-width: 1200px) { .layout { grid-template-columns: 1fr; } }
+    .execution-badge-buy { background: #22c55e20; color: #4ade80; border: 1px solid #22c55e40; padding: 2px 8px; border-radius: 12px; font-size: 11px; }
+    .execution-badge-sell { background: #ef444420; color: #f87171; border: 1px solid #ef444440; padding: 2px 8px; border-radius: 12px; font-size: 11px; }
   </style>
 </head>
 <body>
@@ -76,21 +78,20 @@
     </div>
     <div class="topbar">
       <div style="display: flex; align-items: center; gap: 16px;">
-    <!-- existing timer and last update -->
         <a href="/analysis" class="text-blue-400 hover:underline text-sm">📊 Analysis</a>
       </div>
-    <div style="display: flex; align-items: center; gap: 16px;">
-      <div class="refresh-indicator">
-        <span class="refresh-label">↻ refresh</span>
-        <span class="refresh-timer" id="timer-seconds">10</span>
-        <span class="refresh-label">s</span>
-      </div>
-      <div>
-        <div style="font-size:10px; color:#71717a;">Last Update</div>
-        <div id="last-update" class="mono" style="font-size:13px;">--</div>
+      <div style="display: flex; align-items: center; gap: 16px;">
+        <div class="refresh-indicator">
+          <span class="refresh-label">↻ refresh</span>
+          <span class="refresh-timer" id="timer-seconds">10</span>
+          <span class="refresh-label">s</span>
+        </div>
+        <div>
+          <div style="font-size:10px; color:#71717a;">Last Update</div>
+          <div id="last-update" class="mono" style="font-size:13px;">--</div>
+        </div>
       </div>
     </div>
-  </div>
 </div>
 
 <div class="container">
@@ -116,7 +117,7 @@
 
   <div id="api-status" style="margin-bottom: 20px;"></div>
 
-  <!-- Last Activity Panel (unchanged) -->
+  <!-- Last Activity Panel -->
   <div id="last-activity-container" class="last-activity">
     <div style="text-align: center; padding: 20px;">
       <div style="color: #a1a1aa; font-size: 14px;">Loading latest activity...</div>
@@ -174,7 +175,18 @@
           <span>🔄 Rebalance Logs</span>
           <span id="rebalance-count" style="font-size:12px; color:#60a5fa;"></span>
         </div>
-        <div id="rebalance-container" class="rebalance-feed" style="max-height: 200px; overflow-y: auto;"></div>
+        <div id="rebalance-container" class="rebalance-feed" style="max-height: 200px;"></div>
+      </div>
+
+      <!-- NEW: Executions Panel -->
+      <div class="panel" style="margin-top:24px;">
+        <div class="panel-title">
+          <span>📊 Order Executions (Fills)</span>
+          <span id="executions-count" style="font-size:12px; color:#a78bfa;"></span>
+        </div>
+        <div id="executions-container" class="executions-feed" style="max-height: 300px; overflow-y: auto;">
+          <div style="color: #a1a1aa; text-align:center; padding:20px;">Loading executions...</div>
+        </div>
       </div>
     </div>
   </div>
@@ -196,6 +208,7 @@ let lastOpportunitiesData = [];
 let lastRejectedData = [];
 let lastActionsData = [];
 let lastRebalanceData = [];
+let lastExecutionsData = [];
 let lastActivityId = null;
 
 function toToman(value) {
@@ -284,9 +297,8 @@ async function triggerRefresh() {
   if (timerElement) timerElement.style.opacity = "1";
 }
 
-// Calculate all profit stats (24h and all-time)
+// ===== Profit Stats =====
 async function loadProfitStats() {
-  // Fetch all opportunities (no date limit)
   const opportunities = await apiFetch("/opportunities/?limit=1000000");
   let arbitrageProfit24h = 0;
   let arbitrageProfitAll = 0;
@@ -303,31 +315,25 @@ async function loadProfitStats() {
   }
   document.getElementById("arbitrage-profit").innerHTML = formatNumber(arbitrageProfit24h) + " TMN";
 
-  // Fetch all rebalance logs
   const rebalanceLogs = await apiFetch("/rebalance-logs/");
   let rebalancingCost24h = 0;
   let rebalancingCostAll = 0;
   if (rebalanceLogs) {
     rebalanceLogs.forEach(log => {
-      const lossToman = toToman(log.profit_quote || 0); // profit_quote is negative for losses
+      const lossToman = toToman(log.profit_quote || 0);
       rebalancingCostAll += lossToman;
       const logDate = new Date(log.created_at);
       if (logDate >= yesterday) rebalancingCost24h += lossToman;
     });
   }
-  // Display cost as positive number (magnitude)
   document.getElementById("rebalancing-cost").innerHTML = formatNumber(-rebalancingCost24h) + " TMN";
-  const netProfit24h = arbitrageProfit24h + rebalancingCost24h; // rebalancingCost24h is negative
+  const netProfit24h = arbitrageProfit24h + rebalancingCost24h;
   document.getElementById("net-profit").innerHTML = formatNumber(netProfit24h) + " TMN";
-
-  // Total net profit (all time)
   const totalNet = arbitrageProfitAll + rebalancingCostAll;
   document.getElementById("total-net-profit").innerHTML = formatNumber(totalNet) + " TMN";
 }
 
-// ... (all other functions: loadLastActivity, loadOpportunities, loadRejectedOpportunities, loadPools, loadActions, loadRebalanceLogs remain exactly as before) ...
-// To keep the answer concise, I will repeat them below unchanged.
-
+// ===== Last Activity =====
 async function loadLastActivity() {
   const [opportunities, rejections] = await Promise.all([
     apiFetch("/opportunities/?limit=1"),
@@ -403,6 +409,7 @@ async function loadLastActivity() {
   }
 }
 
+// ===== Opportunities =====
 async function loadOpportunities() {
   const data = await apiFetch("/opportunities/?limit=30");
   const table = document.getElementById("opportunities-table");
@@ -424,6 +431,7 @@ async function loadOpportunities() {
   });
 }
 
+// ===== Rejected =====
 async function loadRejectedOpportunities() {
   const data = await apiFetch("/actions/?limit=30&action_type=rejection");
   const container = document.getElementById("rejected-container");
@@ -451,6 +459,7 @@ async function loadRejectedOpportunities() {
   });
 }
 
+// ===== Pools =====
 async function loadPools() {
   const data = await apiFetch("/pools/");
   const container = document.getElementById("pools-container");
@@ -501,6 +510,7 @@ async function loadPools() {
   }
 }
 
+// ===== Actions =====
 async function loadActions() {
   const data = await apiFetch("/actions/?limit=15&action_type=trade");
   const container = document.getElementById("actions-feed");
@@ -519,6 +529,7 @@ async function loadActions() {
   });
 }
 
+// ===== Rebalance Logs =====
 async function loadRebalanceLogs() {
   const data = await apiFetch("/rebalance-logs/");
   const container = document.getElementById("rebalance-container");
@@ -552,6 +563,58 @@ async function loadRebalanceLogs() {
   });
 }
 
+// ===== NEW: Executions =====
+async function loadExecutions() {
+  const data = await apiFetch("/executions/?limit=30");
+  const container = document.getElementById("executions-container");
+  const countSpan = document.getElementById("executions-count");
+  const hasNew = JSON.stringify(lastExecutionsData) !== JSON.stringify(data);
+  lastExecutionsData = data;
+  container.innerHTML = "";
+  if (!data || data.length === 0) {
+    container.innerHTML = '<div style="color:#a1a1aa; text-align:center; padding:20px;">No executions yet</div>';
+    countSpan.innerText = "";
+    return;
+  }
+  countSpan.innerHTML = `(${data.length} fills) ${hasNew ? '🆕' : ''}`;
+  // Build a table
+  const table = document.createElement("table");
+  table.style.width = "100%";
+  table.style.fontSize = "12px";
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Symbol</th>
+        <th>Exchange</th>
+        <th>Side</th>
+        <th>Price</th>
+        <th>Volume</th>
+        <th>Fee</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  `;
+  const tbody = table.querySelector("tbody");
+  data.slice(0, 20).forEach((exec, index) => {
+    const row = document.createElement("tr");
+    const sideClass = exec.side === "buy" ? "execution-badge-buy" : "execution-badge-sell";
+    row.innerHTML = `
+      <td>${toLocalTime(exec.created_at)}</td>
+      <td><b>${exec.common_symbol}</b></td>
+      <td>${exec.exchange_name}</td>
+      <td><span class="${sideClass}">${exec.side.toUpperCase()}</span></td>
+      <td class="mono">${formatNumber(exec.price, 2)}</td>
+      <td class="mono">${formatNumber(exec.volume, 2)}</td>
+      <td class="mono" style="color:#71717a;">${formatNumber(exec.fee, 2)}</td>
+    `;
+    if (hasNew && index < 3) row.style.animation = "fadeIn 0.3s ease-out";
+    tbody.appendChild(row);
+  });
+  container.appendChild(table);
+}
+
+// ===== Load All =====
 async function loadAll() {
   setLastUpdate();
   await Promise.allSettled([
@@ -561,7 +624,8 @@ async function loadAll() {
     loadRejectedOpportunities(),
     loadPools(),
     loadActions(),
-    loadRebalanceLogs()
+    loadRebalanceLogs(),
+    loadExecutions()   // new
   ]);
   updateApiStatus();
 }

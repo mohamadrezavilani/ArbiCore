@@ -5,7 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from app.apps.arbitrage.models import (
     Exchange, ExchangeFee, SymbolArbitrageSettings, Network,
-    ArbitrageOpportunity, BaseInventory, QuoteInventory
+    ArbitrageOpportunity, BaseInventory, QuoteInventory, OrderExecution,
+    ExchangeSymbol
 )
 from app.exchanges.factory import get_exchange_client
 from .opportunity_logger import OpportunityLogger
@@ -13,6 +14,7 @@ from .risk_manager import RiskManager
 from .trade_executor import TradeExecutor
 from .rebalancer import Rebalancer
 from .pair_weight import get_pair_weight
+from .balance_sync import BalanceSyncService
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,7 @@ class ArbitrageDetector:
         self.risk_manager = risk_manager
         self.trade_executor = trade_executor
         self.rebalancer = rebalancer
-        self.MAX_LEVELS = 20   # sweep up to 20 levels
+        self.MAX_LEVELS = 20
 
     @staticmethod
     def _max_volume_from_quote(available_quote: float, ask_price: float) -> float:
@@ -39,7 +41,7 @@ class ArbitrageDetector:
             return 0.0
         d_quote = Decimal(str(available_quote))
         d_price = Decimal(str(ask_price))
-        max_vol_dec = (d_quote / d_price).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+        max_vol_dec = (d_quote / d_price).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
         return float(max_vol_dec)
 
     @staticmethod
@@ -47,13 +49,9 @@ class ArbitrageDetector:
         if available_base <= 0:
             return 0.0
         d_base = Decimal(str(available_base))
-        return float(d_base.quantize(Decimal('0.00000001'), rounding=ROUND_DOWN))
+        return float(d_base.quantize(Decimal('0.01'), rounding=ROUND_DOWN))
 
     def _get_cumulative_levels(self, levels: List[List[float]], max_volume: float, max_levels: int = None) -> Tuple[List[float], List[float], float, float]:
-        """
-        Sweep orderbook levels to accumulate up to max_volume.
-        Returns: (prices, volumes, total_volume, vwap)
-        """
         if max_levels is None:
             max_levels = self.MAX_LEVELS
         cum_vol = 0.0
@@ -74,6 +72,7 @@ class ArbitrageDetector:
         if cum_vol == 0:
             return [], [], 0.0, 0.0
         vwap = cum_value / cum_vol
+        cum_vol = round(cum_vol, 2)
         return prices, vols, cum_vol, vwap
 
     async def detect_for_symbol(
@@ -90,7 +89,6 @@ class ArbitrageDetector:
         else:
             return False, {}, {}, []
 
-        # Get settings
         stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == common_symbol)
         settings = (await db.execute(stmt)).scalar_one_or_none()
         if not settings or not settings.is_active:
@@ -103,12 +101,12 @@ class ArbitrageDetector:
 
         exchange_names = list(exchange_orderbooks.keys())
 
-        # Pre-fetch all static data
         exchange_modes = {}
         base_balances = {}
         quote_balances = {}
         taker_fees = {}
         exchange_ids = {}
+        price_factors = {}
         pair_weights = {}
 
         for name in exchange_names:
@@ -131,9 +129,17 @@ class ArbitrageDetector:
                 .where(Exchange.name == name, ExchangeFee.quote_currency == quote_currency)
             )).scalar_one_or_none() or 0.0)
 
-            exchange_ids[name] = (await db.execute(
+            exch_id = (await db.execute(
                 select(Exchange.id).where(Exchange.name == name)
             )).scalar_one_or_none()
+            exchange_ids[name] = exch_id
+
+            factor_stmt = select(ExchangeSymbol.price_conversion_factor).where(
+                ExchangeSymbol.exchange_id == exch_id,
+                ExchangeSymbol.common_symbol == common_symbol
+            )
+            factor = (await db.execute(factor_stmt)).scalar_one_or_none()
+            price_factors[name] = float(factor) if factor else 1.0
 
         for buy_ex in exchange_names:
             for sell_ex in exchange_names:
@@ -143,8 +149,7 @@ class ArbitrageDetector:
         network_fee_base = await self._get_network_fee_base(db, settings)
         max_base_pool = await self._get_max_base_pool(db, common_symbol)
 
-        # Build asks/bids with effective prices
-        asks = []  # (exchange, raw_price, volume, effective_price, fee)
+        asks = []
         bids = []
         for exch_name, (ask_levels, bid_levels) in exchange_orderbooks.items():
             fee = taker_fees.get(exch_name, 0.0)
@@ -183,26 +188,23 @@ class ArbitrageDetector:
                 continue
 
             if eff_ask >= eff_bid:
-                break  # no profit possible further due to sorted order
+                break
 
             weight = pair_weights.get((buy_exch, sell_exch), 0.5)
 
-            # Determine maximum possible volume from balances
             available_quote = avail_quote.get(buy_exch, 0.0)
             available_base = avail_base.get(sell_exch, 0.0)
 
             max_vol_by_quote = self._max_volume_from_quote(available_quote, ask_price)
             max_vol_by_base = self._max_volume_from_base(available_base)
 
-            # We want to trade at least MIN_ORDER_SIZE if possible
             desired_vol = min(max_vol_by_quote, max_vol_by_base)
 
-            # Safety: don't use more than 25% of quote balance to avoid draining
             max_safe_quote = available_quote
             max_vol_safe = self._max_volume_from_quote(max_safe_quote, ask_price)
             desired_vol = min(desired_vol, max_vol_safe)
 
-            # logger.info(f"max_safe_quote : {max_safe_quote:.4f} , max_vol_safe: {max_vol_safe:.4f}")
+            desired_vol = round(desired_vol, 2)
 
             if desired_vol < MIN_ORDER_SIZE:
                 reason = f"Desired volume {desired_vol:.4f} below minimum {MIN_ORDER_SIZE}"
@@ -216,11 +218,9 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
-            # Now sweep orderbook to see how much we can get at VWAP
-            buy_original_levels = exchange_orderbooks[buy_exch][0]  # asks
-            sell_original_levels = exchange_orderbooks[sell_exch][1]  # bids
+            buy_original_levels = exchange_orderbooks[buy_exch][0]
+            sell_original_levels = exchange_orderbooks[sell_exch][1]
 
-            # Get cumulative up to desired_vol (or max levels)
             buy_prices, buy_vols, total_buy_vol, vwap_buy = self._get_cumulative_levels(buy_original_levels, desired_vol, self.MAX_LEVELS)
             sell_prices, sell_vols, total_sell_vol, vwap_sell = self._get_cumulative_levels(sell_original_levels, desired_vol, self.MAX_LEVELS)
 
@@ -236,10 +236,9 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
-            # The volume we can trade is the minimum of the two cumulative volumes
             max_vol = min(total_buy_vol, total_sell_vol)
+            max_vol = round(max_vol, 2)
 
-            # Ensure we meet minimum order size
             if max_vol < MIN_ORDER_SIZE:
                 reason = f"Max volume {max_vol:.4f} below minimum {MIN_ORDER_SIZE}"
                 await self.logger.log_rejected_opportunity(
@@ -252,7 +251,6 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
-            # Apply profit check using VWAP prices
             effective_buy = vwap_buy * (1 + ask_fee)
             effective_sell = vwap_sell * (1 - bid_fee)
             profit_percent = (effective_sell - effective_buy) / effective_buy * 100
@@ -271,7 +269,6 @@ class ArbitrageDetector:
 
             net_gain = max_vol * (effective_sell - effective_buy)
 
-            # Risk manager decides how much of max_vol to trade
             trade_pct = self.risk_manager.calculate_trade_percent(
                 net_gain=net_gain,
                 network_commission_quote=0.0,
@@ -295,11 +292,11 @@ class ArbitrageDetector:
                 continue
 
             volume = max_vol * trade_pct
+            volume = round(volume, 2)
 
-            # Safety: ensure we don't exceed available balances
             if volume > desired_vol:
                 volume = desired_vol
-            logger.info(f"volume : {volume:.4f} = max_vol: {max_vol} * trade_pct: {trade_pct}")
+                volume = round(volume, 2)
 
             if volume < MIN_ORDER_SIZE:
                 reason = f"Final volume {volume:.4f} below minimum {MIN_ORDER_SIZE}"
@@ -313,13 +310,14 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
-            # Determine worst prices for limit orders
             buy_limit_price = buy_prices[-1] if buy_prices else vwap_buy
             sell_limit_price = sell_prices[-1] if sell_prices else vwap_sell
 
             is_live = (exchange_modes.get(buy_exch) == "live" and exchange_modes.get(sell_exch) == "live")
 
-            success, filled_vol, vwap_buy_exec, vwap_sell_exec, b_delta_buy, b_delta_sell, q_delta_buy, q_delta_sell, net_profit = \
+            success, filled_vol, vwap_buy_exec, vwap_sell_exec, \
+            b_delta_buy, b_delta_sell, q_delta_buy, q_delta_sell, \
+            net_profit, buy_execs, sell_execs = \
                 await self.trade_executor.execute_and_get_deltas(
                     db=db, common_symbol=common_symbol,
                     buy_exchange=buy_exch, sell_exchange=sell_exch,
@@ -332,7 +330,9 @@ class ArbitrageDetector:
                     vwap_buy=vwap_buy, vwap_sell=vwap_sell,
                     limit_price_buy=buy_limit_price,
                     limit_price_sell=sell_limit_price,
-                    is_live=is_live
+                    is_live=is_live,
+                    buy_price_factor=price_factors.get(buy_exch, 1.0),
+                    sell_price_factor=price_factors.get(sell_exch, 1.0)
                 )
 
             if success:
@@ -342,12 +342,12 @@ class ArbitrageDetector:
                     quote_deltas[buy_exch] += q_delta_buy
                     quote_deltas[sell_exch] += q_delta_sell
 
-                # Update available balances for future loops
                 avail_quote[buy_exch] = max(0.0, avail_quote[buy_exch] + q_delta_buy)
                 avail_base[buy_exch] = max(0.0, avail_base[buy_exch] + b_delta_buy)
                 avail_quote[sell_exch] = max(0.0, avail_quote[sell_exch] + q_delta_sell)
                 avail_base[sell_exch] = max(0.0, avail_base[sell_exch] + b_delta_sell)
 
+                # Create opportunity
                 opp = ArbitrageOpportunity(
                     common_symbol=common_symbol,
                     exchange_a_id=exchange_ids[buy_exch],
@@ -359,9 +359,43 @@ class ArbitrageDetector:
                     traded_volume=filled_vol,
                     profit_quote=net_profit
                 )
-                opportunities.append(opp)
+                db.add(opp)
+                await db.flush()  # get ID
+                logger.info(f"[DB] Created opportunity {opp.id} for {common_symbol} profit={net_profit:.2f}")
 
-                # Advance indices to avoid reusing same levels
+                # Save executions
+                all_execs = buy_execs + sell_execs
+                for exec_data in all_execs:
+                    exec_record = OrderExecution(
+                        opportunity_id=opp.id,
+                        exchange_name=exec_data["exchange_name"],
+                        side=exec_data["side"],
+                        price=exec_data["price"],
+                        volume=exec_data["volume"],
+                        fee=exec_data["fee"],
+                        client_order_id=exec_data.get("client_order_id")
+                    )
+                    db.add(exec_record)
+                    logger.debug(f"[DB] Execution: {exec_data['exchange_name']} {exec_data['side']} {exec_data['volume']} @ {exec_data['price']}")
+
+                # Commit immediately to ensure data is persisted
+                try:
+                    await db.commit()
+                    logger.info(f"[DB] Committed opportunity {opp.id} and {len(all_execs)} executions")
+                except Exception as e:
+                    await db.rollback()
+                    logger.error(f"[DB] Failed to commit: {e}")
+                    raise
+
+                # After successful trade, sync balances for the exchanges involved
+                try:
+                    await BalanceSyncService.sync_exchange_balance(db, buy_exch)
+                    await BalanceSyncService.sync_exchange_balance(db, sell_exch)
+                    logger.info(f"[SYNC] Synced balances for {buy_exch} and {sell_exch} after trade")
+                except Exception as e:
+                    logger.error(f"[SYNC] Failed to sync balances: {e}")
+
+                opportunities.append(opp)
                 i += 1
                 j += 1
             else:
