@@ -70,7 +70,7 @@ class ArbitrageService:
             # Commit inventory updates (if any)
             try:
                 await db.commit()
-                logger.info(f"[DB] Committed inventory updates and {len(all_opportunities)} opportunities")
+                # logger.info(f"[DB] Committed inventory updates and {len(all_opportunities)} opportunities")
             except Exception as e:
                 await db.rollback()
                 logger.error(f"[DB] Failed to commit inventory updates: {e}")
