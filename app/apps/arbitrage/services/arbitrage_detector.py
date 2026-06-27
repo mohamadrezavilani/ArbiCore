@@ -347,7 +347,7 @@ class ArbitrageDetector:
                 avail_quote[sell_exch] = max(0.0, avail_quote[sell_exch] + q_delta_sell)
                 avail_base[sell_exch] = max(0.0, avail_base[sell_exch] + b_delta_sell)
 
-                # Create opportunity
+                # --- CREATE AND COMMIT OPPORTUNITY ---
                 opp = ArbitrageOpportunity(
                     common_symbol=common_symbol,
                     exchange_a_id=exchange_ids[buy_exch],
@@ -363,7 +363,7 @@ class ArbitrageDetector:
                 await db.flush()  # get ID
                 logger.info(f"[DB] Created opportunity {opp.id} for {common_symbol} profit={net_profit:.2f}")
 
-                # Save executions
+                # --- SAVE EXECUTIONS ---
                 all_execs = buy_execs + sell_execs
                 for exec_data in all_execs:
                     exec_record = OrderExecution(
@@ -378,7 +378,7 @@ class ArbitrageDetector:
                     db.add(exec_record)
                     logger.debug(f"[DB] Execution: {exec_data['exchange_name']} {exec_data['side']} {exec_data['volume']} @ {exec_data['price']}")
 
-                # Commit immediately to ensure data is persisted
+                # --- COMMIT TO DATABASE ---
                 try:
                     await db.commit()
                     logger.info(f"[DB] Committed opportunity {opp.id} and {len(all_execs)} executions")
@@ -387,7 +387,7 @@ class ArbitrageDetector:
                     logger.error(f"[DB] Failed to commit: {e}")
                     raise
 
-                # After successful trade, sync balances for the exchanges involved
+                # --- SYNC BALANCES AFTER TRADE ---
                 try:
                     await BalanceSyncService.sync_exchange_balance(db, buy_exch)
                     await BalanceSyncService.sync_exchange_balance(db, sell_exch)

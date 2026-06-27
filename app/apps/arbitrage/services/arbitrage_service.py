@@ -59,7 +59,7 @@ class ArbitrageService:
                         all_quote_deltas[(ex, quote_currency)] = all_quote_deltas.get((ex, quote_currency), 0.0) + delta
                     all_opportunities.extend(opportunities)
 
-            # Apply inventory deltas
+            # Apply inventory deltas (only for simulation – live mode already synced after trade)
             for (ex, sym), delta in all_base_deltas.items():
                 if abs(delta) > 1e-8:
                     await update_base_balance(db, ex, sym, delta)
@@ -67,17 +67,16 @@ class ArbitrageService:
                 if abs(delta) > 1e-8:
                     await update_quote_balance(db, ex, cur, delta)
 
-            # Commit inventory updates (if not already committed by detector)
+            # Commit inventory updates (if any)
             try:
                 await db.commit()
-                # logger.info(f"[DB] Committed inventory updates and {len(all_opportunities)} opportunities")
+                logger.info(f"[DB] Committed inventory updates and {len(all_opportunities)} opportunities")
             except Exception as e:
                 await db.rollback()
                 logger.error(f"[DB] Failed to commit inventory updates: {e}")
                 raise
 
-            # Rebalancing (if enabled) – skipped if rebalancer is deactivated
-            # (You can keep this part if rebalancing is ever re‑enabled)
+            # Rebalancing (if enabled) – you can comment out if not used
             try:
                 for common_symbol in traded_symbols:
                     orderbooks = exchange_data.get(common_symbol)
@@ -100,7 +99,7 @@ class ArbitrageService:
                             quote_currency = "IRT" if sym.endswith("IRT") else "USDT"
                             await self.rebalancer.rebalance_symbol_if_needed(db, sym, quote_currency, orderbooks_dict)
 
-                # Quote rebalancing (if enabled)
+                # Quote rebalancing
                 for common_symbol in traded_symbols:
                     orderbooks = exchange_data.get(common_symbol)
                     if orderbooks:

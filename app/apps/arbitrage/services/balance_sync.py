@@ -46,7 +46,6 @@ class BalanceSyncService:
         if "IRT" in balances:
             await BalanceSyncService._update_quote_inventory(db, exchange.id, "IRT", balances["IRT"])
         if "USDT" in balances:
-            # Find the common_symbol for this exchange that uses USDT as base
             symbol_stmt = select(ExchangeSymbol).where(
                 ExchangeSymbol.exchange_id == exchange.id,
                 ExchangeSymbol.common_symbol == "USDTIRT"
@@ -56,6 +55,7 @@ class BalanceSyncService:
                 await BalanceSyncService._update_base_inventory(db, exchange.id, "USDTIRT", balances["USDT"])
             else:
                 logger.warning(f"No symbol mapping for USDT on {exchange_name}, skipping base update.")
+        await db.commit()
         return balances
 
     @staticmethod
