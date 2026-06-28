@@ -247,13 +247,13 @@ class BitpinClient(ExchangeClient):
 
     async def fetch_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
         url = f"{self.base_url}/api/v1/mth/orderbook/{symbol}/"
-        api_logger.debug(f"Fetching orderbook for {symbol}")
+        # api_logger.debug(f"Fetching orderbook for {symbol}")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        api_logger.debug(f"Orderbook fetched for {symbol}")
+                        # api_logger.debug(f"Orderbook fetched for {symbol}")
                         return data
                     else:
                         api_logger.error(f"Orderbook fetch failed: {resp.status} {await resp.text()}")

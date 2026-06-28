@@ -208,14 +208,14 @@ class WallexClient(ExchangeClient):
     async def fetch_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
         url = f"{self.base_url}/v1/depth"
         params = {"symbol": symbol}
-        api_logger.debug(f"Fetching orderbook for {symbol}")
+        # api_logger.debug(f"Fetching orderbook for {symbol}")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params, timeout=10) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if data.get("success"):
-                            api_logger.debug(f"Orderbook fetched for {symbol}")
+                            # api_logger.debug(f"Orderbook fetched for {symbol}")
                             return data["result"]
                         else:
                             api_logger.error(f"Orderbook fetch failed: {data}")
