@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from app.core.config import settings
 from app.exchanges.base import ExchangeClient, OrderResult
 
+logger = logging.getLogger(__name__)
 
 class BitpinClient(ExchangeClient):
     def __init__(self):
@@ -33,7 +34,7 @@ class BitpinClient(ExchangeClient):
                             self.token_expiry = time.time() + 900
                             return
                         else:
-                            self.logger.warning(f"Refresh token failed, clearing")
+                            self.logger.warning("Refresh token failed, clearing")
                             self.refresh_token = None
                 except Exception:
                     self.logger.exception("Token refresh exception")
@@ -56,12 +57,13 @@ class BitpinClient(ExchangeClient):
         url = f"{self.base_url}{path}"
         async with aiohttp.ClientSession() as session:
             async with session.request(method, url, headers=headers, json=json_data) as resp:
-                if resp.status == 204:
-                    return None
-                if resp.status != 200:
+                if 200 <= resp.status < 300:
+                    if resp.status == 204:
+                        return None
+                    return await resp.json()
+                else:
                     text = await resp.text()
                     raise Exception(f"Bitpin API error {resp.status}: {text}")
-                return await resp.json()
 
     async def get_balances(self) -> Dict[str, float]:
         try:
@@ -81,14 +83,7 @@ class BitpinClient(ExchangeClient):
             self.logger.exception("Failed to fetch balances")
             return {}
 
-    async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str,
-                                 price: float = None) -> OrderResult:
-        if price is None:
-            ob_data = await self._request("GET", f"/api/v1/mth/orderbook/{symbol}/")
-            if side.lower() == "buy":
-                price = float(ob_data["asks"][0][0])
-            else:
-                price = float(ob_data["bids"][0][0])
+    async def place_limit_order(self, symbol: str, side: str, amount: float, client_order_id: str, price: float) -> OrderResult:
         payload = {
             "symbol": symbol,
             "type": "limit",
@@ -98,25 +93,30 @@ class BitpinClient(ExchangeClient):
             "identifier": client_order_id
         }
         response = await self._request("POST", "/api/v1/odr/orders/", json_data=payload)
-        order_id = str(response.get("id"))
-        # Bitpin may return "dealed_base_amount" and "commission"
+        # Bitpin returns 201 Created, and response contains order details
+        state = response.get("state", "").lower()
+        if state == "active":
+            status = "pending"
+        elif state == "closed":
+            status = "filled"
+        else:
+            status = "partial"
         filled_vol = float(response.get("dealed_base_amount", 0))
         fee = float(response.get("commission", 0))
         executions = []
-        if filled_vol > 0:
+        if filled_vol > 0 and price > 0:
             executions.append({
                 "price": price,
                 "volume": filled_vol,
                 "fee": fee
             })
-        status = "filled" if filled_vol >= amount else "partial"
         return OrderResult(
-            order_id=order_id,
+            order_id=str(response.get("id")),
             client_order_id=client_order_id,
             status=status,
             filled_price=0.0,
-            filled_volume=0.0,
-            fee=0.0,
+            filled_volume=filled_vol,
+            fee=fee,
             raw_response=response,
             executions=executions
         )
@@ -169,8 +169,8 @@ class BitpinClient(ExchangeClient):
             client_order_id=client_order_id,
             status=status,
             filled_price=0.0,
-            filled_volume=0.0,
-            fee=0.0,
+            filled_volume=filled_vol,
+            fee=fee,
             raw_response=response,
             executions=executions
         )
@@ -195,9 +195,6 @@ class BitpinClient(ExchangeClient):
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     resp.raise_for_status()
                     return await resp.json()
-        except aiohttp.ClientConnectorDNSError as e:
-            self.logger.error(f"DNS error for {symbol}: {e}")
-            return None
         except Exception:
             self.logger.exception(f"Failed to fetch orderbook for {symbol}")
             return None

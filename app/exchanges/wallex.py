@@ -1,9 +1,7 @@
 import uuid
 import aiohttp
-import asyncio
 import logging
 from typing import Dict, Any, Optional, List, Tuple
-from decimal import Decimal
 from app.exchanges.base import ExchangeClient, OrderResult
 from app.core.config import settings
 
@@ -14,7 +12,6 @@ class WallexClient(ExchangeClient):
         self.api_key = settings.WALLEX_API_KEY
         self.api_secret = settings.WALLEX_API_SECRET
         self.base_url = "https://api.wallex.ir"
-        self.session = None
 
     async def _request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
         headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
@@ -23,14 +20,14 @@ class WallexClient(ExchangeClient):
         url = f"{self.base_url}{path}"
         async with aiohttp.ClientSession() as session:
             async with session.request(method, url, headers=headers, **kwargs) as resp:
-                if resp.status not in (200, 201):
-                    # Read raw text first (already UTF-8)
+                if 200 <= resp.status < 300:
+                    return await resp.json()
+                else:
                     text = await resp.text()
-                    # Try to parse JSON to extract human-readable error message
+                    # Try to parse JSON for better error message
                     try:
                         import json
                         error_data = json.loads(text)
-                        # Build a readable message: include error_code and field-specific messages
                         msg_parts = []
                         if error_data.get("result"):
                             for field, msgs in error_data["result"].items():
@@ -43,10 +40,8 @@ class WallexClient(ExchangeClient):
                         readable_msg = " | ".join(msg_parts) if msg_parts else text
                     except:
                         readable_msg = text
-                    # Log the full error for debugging
                     logger.error(f"Wallex API error {resp.status}: {readable_msg}")
                     raise Exception(f"Wallex API error {resp.status}: {readable_msg}")
-                return await resp.json()
 
     async def get_balances(self) -> Dict[str, float]:
         data = await self._request("GET", "/v1/account/balances")
@@ -62,43 +57,11 @@ class WallexClient(ExchangeClient):
                 mapped[asset] = float(info.get("value", 0))
         return mapped
 
-    async def _get_tick_size(self, symbol: str) -> float:
-        """Fetch orderbook and compute price tick size from asks."""
-        ob = await self.fetch_orderbook(symbol)
-        if not ob:
-            return 1.0
-        asks = ob.get("ask", [])
-        if len(asks) < 2:
-            return 1.0
-        prices = sorted([float(a["price"]) for a in asks])
-        diffs = [prices[i+1] - prices[i] for i in range(len(prices)-1)]
-        if not diffs:
-            return 1.0
-        return min(diffs)
-
-    async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str,
-                                 price: float = None, price_factor: float = 1.0) -> OrderResult:
-        if price is None:
-            ob_data = await self._request("GET", f"/v1/depth", params={"symbol": symbol})
-            result = ob_data.get("result", {})
-            if not result:
-                raise Exception("Failed to fetch orderbook")
-            if side.lower() == "buy":
-                native_price = float(result["ask"][0]["price"])
-            else:
-                native_price = float(result["bid"][0]["price"])
-        else:
-            # Convert from common quote (IRT) to native (TMN) by dividing by factor
-            native_price = price / price_factor
-            # Round to nearest tick (price step)
-            tick = await self._get_tick_size(symbol)
-            native_price = round(native_price / tick) * tick
-            native_price = int(native_price)
-
+    async def place_limit_order(self, symbol: str, side: str, amount: float, client_order_id: str, price: float) -> OrderResult:
         payload = {
             "client_id": client_order_id,
-            "price": str(native_price),  # integer, no decimals
-            "quantity": str(amount),      # amount is in base currency (USDT)
+            "price": str(price),
+            "quantity": str(amount),
             "side": side.upper(),
             "symbol": symbol,
             "type": "LIMIT"
@@ -106,7 +69,6 @@ class WallexClient(ExchangeClient):
         response = await self._request("POST", "/v1/account/orders", json=payload)
         order_data = response.get("result", {})
         executions = []
-        # Wallex uses "fills" field for executions
         raw_execs = order_data.get("fills", [])
         for exec_item in raw_execs:
             executions.append({
@@ -118,19 +80,19 @@ class WallexClient(ExchangeClient):
             filled_qty = float(order_data.get("executedQty", 0))
             if filled_qty > 0:
                 executions.append({
-                    "price": float(order_data.get("executedPrice", native_price)),
+                    "price": float(order_data.get("executedPrice", price)),
                     "volume": filled_qty,
                     "fee": float(order_data.get("fee", 0))
                 })
         total_vol = sum(e["volume"] for e in executions)
-        status = "filled" if total_vol >= amount else "partial"
+        status = "filled" if total_vol >= amount else "pending" if order_data.get("status") == "active" else "partial"
         return OrderResult(
             order_id=order_data.get("clientOrderId", client_order_id),
             client_order_id=client_order_id,
             status=status,
             filled_price=0.0,
-            filled_volume=0.0,
-            fee=0.0,
+            filled_volume=total_vol,
+            fee=sum(e["fee"] for e in executions),
             raw_response=response,
             executions=executions
         )
@@ -177,13 +139,14 @@ class WallexClient(ExchangeClient):
                     "volume": filled_qty,
                     "fee": float(order_data.get("fee", 0))
                 })
+        total_vol = sum(e["volume"] for e in executions)
         return OrderResult(
             order_id=order_data.get("clientOrderId", client_order_id),
             client_order_id=client_order_id,
             status=status,
             filled_price=0.0,
-            filled_volume=0.0,
-            fee=0.0,
+            filled_volume=total_vol,
+            fee=sum(e["fee"] for e in executions),
             raw_response=response,
             executions=executions
         )
@@ -198,7 +161,7 @@ class WallexClient(ExchangeClient):
             return False
 
     async def withdraw(self, currency: str, amount: float, address: str, network: str) -> str:
-        raise NotImplementedError("Withdraw not implemented for Wallex in this version")
+        raise NotImplementedError("Withdraw not implemented for Wallex")
 
     async def fetch_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
         url = f"{self.base_url}/v1/depth"
@@ -212,7 +175,7 @@ class WallexClient(ExchangeClient):
                         return data["result"]
                     else:
                         return None
-        except Exception as e:
+        except Exception:
             return None
 
     def extract_levels(self, raw_orderbook: Dict[str, Any]) -> Tuple[List[List[float]], List[List[float]]]:

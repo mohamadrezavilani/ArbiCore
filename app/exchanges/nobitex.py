@@ -98,17 +98,8 @@ class NobitexClient(ExchangeClient):
         bid_levels = [[float(price), float(vol)] for price, vol in bids] if bids else []
         return ask_levels, bid_levels
 
-    # ---------- ORDER PLACEMENT ----------
-    async def place_market_order(self, symbol: str, side: str, amount: float, client_order_id: str,
-                                 price: float = None) -> OrderResult:
-        if price is None:
-            ob = await self.fetch_orderbook(symbol)
-            if not ob:
-                raise Exception("Failed to fetch orderbook")
-            if side.lower() == "buy":
-                price = float(ob["asks"][0][0])
-            else:
-                price = float(ob["bids"][0][0])
+    async def place_limit_order(self, symbol: str, side: str, amount: float, client_order_id: str,
+                                price: float) -> OrderResult:
         symbol_lower = symbol.lower()
         if symbol_lower.endswith("irt"):
             base = symbol_lower.replace("irt", "")
@@ -130,25 +121,23 @@ class NobitexClient(ExchangeClient):
         }
         response = await self._signed_request("POST", "/market/orders/add", json_data=payload)
         order = response.get("order", {})
-        # Nobitex may not return executions immediately; we'll get them via status later
-        # But we can extract from response if present
-        executions = []
-        # Sometimes they include "trades" or similar? For now we set one execution based on matchedAmount
         matched_amount = float(order.get("matchedAmount", 0))
+        status = "filled" if matched_amount >= amount else "pending" if order.get(
+            "status") == "active" else "partial"
+        executions = []
         if matched_amount > 0:
             executions.append({
                 "price": float(order.get("price", price)),
                 "volume": matched_amount,
                 "fee": float(order.get("fee", 0))
             })
-        status = "filled" if matched_amount >= amount else "partial"
         return OrderResult(
             order_id=str(order.get("id")),
             client_order_id=client_order_id,
             status=status,
             filled_price=0.0,
-            filled_volume=0.0,
-            fee=0.0,
+            filled_volume=matched_amount,
+            fee=float(order.get("fee", 0)),
             raw_response=response,
             executions=executions
         )
