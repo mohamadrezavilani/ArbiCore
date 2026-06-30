@@ -12,24 +12,26 @@ from app.exchanges.base import ExchangeClient, OrderResult
 logger = logging.getLogger(__name__)
 api_logger = logging.getLogger("exchange_api.bitpin")
 api_logger.setLevel(logging.DEBUG)
-# Ensure the logger has a handler (will inherit root handler, but we set explicitly)
 if not api_logger.handlers:
     ch = logging.StreamHandler()
     ch.setFormatter(logging.Formatter('%(asctime)s [%(name)s] %(message)s'))
     api_logger.addHandler(ch)
 
+
 class BitpinClient(ExchangeClient):
     def __init__(self):
-        self.logger = logging.getLogger(__name__)
         self.api_key = settings.BITPIN_API_KEY
         self.secret_key = settings.BITPIN_API_SECRET
         self.access_token = None
         self.refresh_token = None
         self.token_expiry = 0
         self.base_url = "https://api.bitpin.ir"
+        # Optional: map client_order_id -> order_id if needed, but we now pass order_id directly
+        self._order_id_map = {}
 
     async def _ensure_token(self):
         if self.access_token and time.time() < self.token_expiry:
+            api_logger.debug("Token still valid")
             return
         api_logger.debug("Acquiring new token")
         async with aiohttp.ClientSession() as session:
@@ -67,14 +69,10 @@ class BitpinClient(ExchangeClient):
                 api_logger.debug("Authentication successful")
 
     async def _request(self, method: str, path: str, json_data: Optional[Dict] = None, retries: int = 3) -> Any:
-        """
-        Send authenticated request with retry for 5xx errors.
-        """
         await self._ensure_token()
         headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
         url = f"{self.base_url}{path}"
         api_logger.debug(f"Request: {method} {url} | data={json.dumps(json_data) if json_data else 'None'}")
-        last_exception = None
         for attempt in range(retries):
             try:
                 async with aiohttp.ClientSession() as session:
@@ -82,7 +80,7 @@ class BitpinClient(ExchangeClient):
                         status = resp.status
                         if 200 <= status < 300:
                             if status == 204:
-                                api_logger.debug(f"Response: {status} No Content")
+                                api_logger.debug("Response: No Content")
                                 return None
                             data = await resp.json()
                             api_logger.debug(f"Response: {status} {json.dumps(data, ensure_ascii=False)[:500]}")
@@ -90,14 +88,11 @@ class BitpinClient(ExchangeClient):
                         else:
                             text = await resp.text()
                             api_logger.error(f"Error response: {status} {text}")
-                            # For 5xx, retry; for 4xx, raise immediately unless it's a 404 (which we handle separately in order_status)
-                            if 500 <= status < 600:
-                                if attempt < retries - 1:
-                                    wait = 2 ** attempt
-                                    api_logger.warning(f"Received {status}, retrying in {wait}s (attempt {attempt+1}/{retries})")
-                                    await sleep(wait)
-                                    continue
-                            # For 400, 401, 403, 422, etc., raise
+                            if 500 <= status < 600 and attempt < retries - 1:
+                                wait = 2 ** attempt
+                                api_logger.warning(f"Received {status}, retrying in {wait}s (attempt {attempt+1}/{retries})")
+                                await sleep(wait)
+                                continue
                             raise Exception(f"Bitpin API error {status}: {text}")
             except asyncio.TimeoutError:
                 api_logger.error(f"Timeout on request {method} {url}")
@@ -120,6 +115,7 @@ class BitpinClient(ExchangeClient):
         raise Exception(f"Request failed after {retries} retries")
 
     async def get_balances(self) -> Dict[str, float]:
+        api_logger.debug("Fetching balances")
         try:
             data = await self._request("GET", "/api/v1/wlt/wallets/")
             balances = {}
@@ -169,8 +165,9 @@ class BitpinClient(ExchangeClient):
                 "volume": filled_vol,
                 "fee": fee
             })
+        order_id_str = str(response.get("id"))
         result = OrderResult(
-            order_id=str(response.get("id")),
+            order_id=order_id_str,
             client_order_id=client_order_id,
             status=status,
             filled_price=0.0,
@@ -182,16 +179,19 @@ class BitpinClient(ExchangeClient):
         api_logger.info(f"Order placement result: {result}")
         return result
 
-    async def order_status(self, client_order_id: str) -> OrderResult:
-        api_logger.debug(f"Checking status for order {client_order_id}")
+    async def order_status(self, order_id: str) -> OrderResult:
+        """
+        Get order status using numeric order_id (as per documentation).
+        """
+        api_logger.debug(f"Checking status for order_id {order_id}")
+        path = f"/api/v1/odr/orders/{order_id}/"
         try:
-            response = await self._request("GET", f"/api/v1/odr/orders/identifier/{client_order_id}/", retries=1)
+            response = await self._request("GET", path, retries=1)
         except Exception as e:
-            # If it's a 404 or any error, treat as pending (do not cancel)
-            api_logger.warning(f"Order {client_order_id} status check failed: {e}, treating as pending")
+            api_logger.warning(f"Order {order_id} status check failed: {e}, treating as pending")
             return OrderResult(
-                order_id="",
-                client_order_id=client_order_id,
+                order_id=order_id,
+                client_order_id="",
                 status="pending",
                 filled_price=0,
                 filled_volume=0,
@@ -217,8 +217,8 @@ class BitpinClient(ExchangeClient):
                 "fee": fee
             })
         result = OrderResult(
-            order_id=str(response.get("id")),
-            client_order_id=client_order_id,
+            order_id=order_id,
+            client_order_id=response.get("identifier", ""),
             status=status,
             filled_price=0.0,
             filled_volume=filled_vol,
@@ -229,31 +229,33 @@ class BitpinClient(ExchangeClient):
         api_logger.debug(f"Order status result: {result}")
         return result
 
-    async def cancel_order(self, client_order_id: str) -> bool:
-        api_logger.info(f"Cancelling order {client_order_id}")
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel order using numeric order_id."""
+        api_logger.info(f"Cancelling order {order_id}")
+        path = f"/api/v1/odr/orders/{order_id}/"
         try:
-            await self._request("DELETE", f"/api/v1/odr/orders/identifier/{client_order_id}/", retries=1)
-            api_logger.info(f"Order {client_order_id} cancelled successfully")
+            await self._request("DELETE", path, retries=1)
+            api_logger.info(f"Order {order_id} cancelled successfully")
             return True
         except Exception as e:
             if "404" in str(e) or "406" in str(e) or "500" in str(e):
-                api_logger.warning(f"Order {client_order_id} already cancelled or not found, treating as success")
+                api_logger.warning(f"Order {order_id} already cancelled or not found, treating as success")
                 return True
-            api_logger.exception(f"Failed to cancel order {client_order_id}")
+            api_logger.exception(f"Failed to cancel order {order_id}")
             return False
 
     async def withdraw(self, currency: str, amount: float, address: str, network: str) -> str:
-        raise NotImplementedError("Withdraw not implemented for Bitpin")
+        raise NotImplementedError("Withdraw not implemented")
 
     async def fetch_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
         url = f"{self.base_url}/api/v1/mth/orderbook/{symbol}/"
-        # api_logger.debug(f"Fetching orderbook for {symbol}")
+        api_logger.debug(f"Fetching orderbook for {symbol}")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        # api_logger.debug(f"Orderbook fetched for {symbol}")
+                        api_logger.debug(f"Orderbook fetched for {symbol}")
                         return data
                     else:
                         api_logger.error(f"Orderbook fetch failed: {resp.status} {await resp.text()}")
