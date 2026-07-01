@@ -67,6 +67,18 @@
     @media (max-width: 1200px) { .layout { grid-template-columns: 1fr; } }
     .execution-badge-buy { background: #22c55e20; color: #4ade80; border: 1px solid #22c55e40; padding: 2px 8px; border-radius: 12px; font-size: 11px; }
     .execution-badge-sell { background: #ef444420; color: #f87171; border: 1px solid #ef444440; padding: 2px 8px; border-radius: 12px; font-size: 11px; }
+    /* New styles for rebalance status */
+    .rb-status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 8px; }
+    .rb-status-item { background: #09090b; border-radius: 12px; padding: 14px; border: 1px solid #27272a; }
+    .rb-status-item .label { color: #71717a; font-size: 11px; margin-bottom: 4px; }
+    .rb-status-item .value { font-size: 14px; font-weight: 600; }
+    .rb-status-item .sub { color: #a1a1aa; font-size: 12px; }
+    .rb-balance-row { display: flex; gap: 16px; margin-top: 8px; }
+    .rb-balance { background: #1f1f24; border-radius: 8px; padding: 6px 12px; font-size: 12px; }
+    .rb-spread { font-weight: bold; }
+    .rb-spread.good { color: #4ade80; }
+    .rb-spread.bad { color: #facc15; }
+    .rb-spread.critical { color: #f87171; }
   </style>
 </head>
 <body>
@@ -412,61 +424,164 @@ async function loadLastActivity() {
   }
 }
 
-// ===== Rebalancing Status =====
+// ===== Detailed Rebalancing Status =====
 async function loadRebalanceStatus() {
   try {
-    const resp = await fetch(API_BASE + "/settings/risk/USDTIRT");
-    const data = await resp.json();
+    // Fetch settings, balances, and snapshots in parallel
+    const [settings, balances, snapshots] = await Promise.all([
+      apiFetch("/settings/risk/USDTIRT"),
+      apiFetch("/balances/"),
+      apiFetch("/snapshots/?limit=10")
+    ]);
+
     const el = document.getElementById("rebalance-status");
     if (!el) return;
 
-    let html = '<div class="card" style="grid-column: span 2; padding: 16px 20px;">';
+    // Extract USDT balances and IRT balances
+    const baseBalances = {};
+    const quoteBalances = {};
+    if (balances) {
+      (balances.base_balances || []).forEach(b => {
+        if (b.symbol === "USDTIRT") {
+          baseBalances[b.exchange] = b.balance;
+        }
+      });
+      (balances.quote_balances || []).forEach(b => {
+        if (b.currency === "IRT") {
+          quoteBalances[b.exchange] = b.balance;
+        }
+      });
+    }
+
+    // Extract latest snapshots for Wallex and Bitpin
+    const snapMap = {};
+    if (snapshots) {
+      snapshots.forEach(s => {
+        if (s.common_symbol === "USDTIRT") {
+          // Keep only the most recent per exchange
+          if (!snapMap[s.exchange_name] || new Date(s.created_at) > new Date(snapMap[s.exchange_name].created_at)) {
+            snapMap[s.exchange_name] = s;
+          }
+        }
+      });
+    }
+
+    const wallexSnap = snapMap['wallex'];
+    const bitpinSnap = snapMap['bitpin'];
+
+    const baseSellPrice = wallexSnap ? wallexSnap.best_bid_price : null;
+    const baseBuyPrice = bitpinSnap ? bitpinSnap.best_ask_price : null;
+    const quoteSellPrice = bitpinSnap ? bitpinSnap.best_bid_price : null; // for quote rebalance, we sell on Bitpin
+    const quoteBuyPrice = wallexSnap ? wallexSnap.best_ask_price : null;   // buy on Wallex
+
+    // Compute spreads
+    let baseSpread = null;
+    if (baseSellPrice && baseBuyPrice && baseSellPrice > 0) {
+      baseSpread = (baseBuyPrice - baseSellPrice) / baseSellPrice * 100;
+    }
+    let quoteSpread = null;
+    if (quoteSellPrice && quoteBuyPrice && quoteSellPrice > 0) {
+      quoteSpread = (quoteBuyPrice - quoteSellPrice) / quoteSellPrice * 100;
+    }
+
+    const maxSpread = 0.2; // from settings, could also read from settings object
+
+    // Build HTML
+    let html = '<div class="card" style="padding: 16px 20px;">';
     html += '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">';
     html += '<div style="font-weight: bold; font-size: 18px;">🔄 Rebalancing Status</div>';
     html += `<div style="font-size: 12px; color: #71717a;">Last updated: ${new Date().toLocaleTimeString()}</div>`;
     html += '</div>';
 
-    // Base rebalance
-    const baseTime = data.last_rebalance_check_time ? new Date(data.last_rebalance_check_time).toLocaleTimeString() : 'Never';
-    const basePending = data.rebalance_pending ? '🔴 Pending' : '✅ Not pending';
-    html += `<div style="display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 8px;">`;
-    html += `<span style="font-weight: bold; color: #60a5fa;">Base (USDT):</span>`;
-    if (data.last_rebalance_reason && data.last_rebalance_reason.includes('Executed')) {
-      html += `<span style="color: #4ade80;">✅ ${data.last_rebalance_reason}</span>`;
-    } else if (data.last_rebalance_reason && data.last_rebalance_reason.includes('Spread')) {
-      html += `<span style="color: #facc15;">⏳ ${data.last_rebalance_reason}</span>`;
-    } else if (data.last_rebalance_reason) {
-      html += `<span style="color: #f87171;">${data.last_rebalance_reason}</span>`;
-    } else {
-      html += `<span style="color: #a1a1aa;">No recent check</span>`;
-    }
-    html += ` <span style="color: #71717a; font-size: 12px;">(last: ${baseTime})</span>`;
-    html += ` <span style="color: #71717a; font-size: 12px;">| Pending: ${basePending}</span>`;
-    if (data.last_rebalance_spread !== null && data.last_rebalance_spread !== undefined) {
-      html += ` <span style="color: #71717a; font-size: 12px;">| Spread: <span style="color: #facc15;">${data.last_rebalance_spread.toFixed(2)}%</span></span>`;
-    }
-    html += `</div>`;
+    // ---- Base Rebalance (USDT) ----
+    const basePending = settings?.rebalance_pending ? '🔴 Pending' : '✅ Not pending';
+    const baseLastTime = settings?.last_rebalance_check_time ? new Date(settings.last_rebalance_check_time).toLocaleTimeString() : 'Never';
+    html += '<div class="rb-status-item" style="margin-bottom: 12px; border-left: 4px solid #60a5fa;">';
+    html += '<div style="display: flex; justify-content: space-between; align-items: center;">';
+    html += '<span style="font-weight: bold; color: #60a5fa;">Base (USDT)</span>';
+    html += `<span style="font-size: 12px; color: #71717a;">Last check: ${baseLastTime} | ${basePending}</span>`;
+    html += '</div>';
 
-    // Quote rebalance
-    const quoteTime = data.last_quote_rebalance_check_time ? new Date(data.last_quote_rebalance_check_time).toLocaleTimeString() : 'Never';
-    const quotePending = data.quote_rebalance_pending ? '🔴 Pending' : '✅ Not pending';
-    html += `<div style="display: flex; flex-wrap: wrap; gap: 8px 16px;">`;
-    html += `<span style="font-weight: bold; color: #a78bfa;">Quote (IRT):</span>`;
-    if (data.last_quote_rebalance_reason && data.last_quote_rebalance_reason.includes('Executed')) {
-      html += `<span style="color: #4ade80;">✅ ${data.last_quote_rebalance_reason}</span>`;
-    } else if (data.last_quote_rebalance_reason && data.last_quote_rebalance_reason.includes('Spread')) {
-      html += `<span style="color: #facc15;">⏳ ${data.last_quote_rebalance_reason}</span>`;
-    } else if (data.last_quote_rebalance_reason) {
-      html += `<span style="color: #f87171;">${data.last_quote_rebalance_reason}</span>`;
+    // Balances
+    html += '<div class="rb-balance-row">';
+    html += `<div class="rb-balance">🏦 Wallex: <span class="green">${formatNumber(baseBalances['wallex'] || 0, 4)}</span></div>`;
+    html += `<div class="rb-balance">🏦 Bitpin: <span class="green">${formatNumber(baseBalances['bitpin'] || 0, 4)}</span></div>`;
+    html += '</div>';
+
+    // Prices & spread
+    if (baseSellPrice && baseBuyPrice) {
+      html += `<div style="margin-top: 6px; font-size: 12px; color: #a1a1aa;">`;
+      html += `Sell @ Wallex bid: <span class="yellow">${formatNumber(baseSellPrice)}</span> | `;
+      html += `Buy @ Bitpin ask: <span class="yellow">${formatNumber(baseBuyPrice)}</span> | `;
+      let spreadClass = 'good';
+      if (baseSpread !== null) {
+        if (baseSpread > maxSpread * 1.5) spreadClass = 'critical';
+        else if (baseSpread > maxSpread) spreadClass = 'bad';
+        else spreadClass = 'good';
+      }
+      html += `Spread: <span class="rb-spread ${spreadClass}">${baseSpread !== null ? baseSpread.toFixed(2) : '--'}%</span> `;
+      html += `<span style="color: #71717a;">(max ${maxSpread}%)</span>`;
+      html += '</div>';
     } else {
-      html += `<span style="color: #a1a1aa;">No recent check</span>`;
+      html += '<div style="margin-top: 6px; font-size: 12px; color: #71717a;">No orderbook data available</div>';
     }
-    html += ` <span style="color: #71717a; font-size: 12px;">(last: ${quoteTime})</span>`;
-    html += ` <span style="color: #71717a; font-size: 12px;">| Pending: ${quotePending}</span>`;
-    if (data.last_quote_rebalance_spread !== null && data.last_quote_rebalance_spread !== undefined) {
-      html += ` <span style="color: #71717a; font-size: 12px;">| Spread: <span style="color: #facc15;">${data.last_quote_rebalance_spread.toFixed(2)}%</span></span>`;
+
+    // Reason
+    if (settings?.last_rebalance_reason) {
+      let reasonColor = '#a1a1aa';
+      if (settings.last_rebalance_reason.includes('Spread')) reasonColor = '#facc15';
+      else if (settings.last_rebalance_reason.includes('Executed')) reasonColor = '#4ade80';
+      else if (settings.last_rebalance_reason.includes('Skipping')) reasonColor = '#f87171';
+      html += `<div style="margin-top: 4px; font-size: 12px; color: ${reasonColor};">${settings.last_rebalance_reason}</div>`;
+    } else {
+      html += '<div style="margin-top: 4px; font-size: 12px; color: #71717a;">No recent check</div>';
     }
-    html += `</div>`;
+    html += '</div>';
+
+    // ---- Quote Rebalance (IRT) ----
+    const quotePending = settings?.quote_rebalance_pending ? '🔴 Pending' : '✅ Not pending';
+    const quoteLastTime = settings?.last_quote_rebalance_check_time ? new Date(settings.last_quote_rebalance_check_time).toLocaleTimeString() : 'Never';
+    html += '<div class="rb-status-item" style="border-left: 4px solid #a78bfa;">';
+    html += '<div style="display: flex; justify-content: space-between; align-items: center;">';
+    html += '<span style="font-weight: bold; color: #a78bfa;">Quote (IRT)</span>';
+    html += `<span style="font-size: 12px; color: #71717a;">Last check: ${quoteLastTime} | ${quotePending}</span>`;
+    html += '</div>';
+
+    // Balances
+    html += '<div class="rb-balance-row">';
+    html += `<div class="rb-balance">🏦 Wallex: <span class="green">${formatNumber(quoteBalances['wallex'] || 0, 0)}</span></div>`;
+    html += `<div class="rb-balance">🏦 Bitpin: <span class="green">${formatNumber(quoteBalances['bitpin'] || 0, 0)}</span></div>`;
+    html += '</div>';
+
+    // Prices & spread (for quote rebalance: sell on Bitpin (bid), buy on Wallex (ask))
+    if (quoteSellPrice && quoteBuyPrice) {
+      html += `<div style="margin-top: 6px; font-size: 12px; color: #a1a1aa;">`;
+      html += `Sell @ Bitpin bid: <span class="yellow">${formatNumber(quoteSellPrice)}</span> | `;
+      html += `Buy @ Wallex ask: <span class="yellow">${formatNumber(quoteBuyPrice)}</span> | `;
+      let spreadClass = 'good';
+      if (quoteSpread !== null) {
+        if (quoteSpread > maxSpread * 1.5) spreadClass = 'critical';
+        else if (quoteSpread > maxSpread) spreadClass = 'bad';
+        else spreadClass = 'good';
+      }
+      html += `Spread: <span class="rb-spread ${spreadClass}">${quoteSpread !== null ? quoteSpread.toFixed(2) : '--'}%</span> `;
+      html += `<span style="color: #71717a;">(max ${maxSpread}%)</span>`;
+      html += '</div>';
+    } else {
+      html += '<div style="margin-top: 6px; font-size: 12px; color: #71717a;">No orderbook data available</div>';
+    }
+
+    // Reason
+    if (settings?.last_quote_rebalance_reason) {
+      let reasonColor = '#a1a1aa';
+      if (settings.last_quote_rebalance_reason.includes('Spread')) reasonColor = '#facc15';
+      else if (settings.last_quote_rebalance_reason.includes('Executed')) reasonColor = '#4ade80';
+      else if (settings.last_quote_rebalance_reason.includes('Skipping')) reasonColor = '#f87171';
+      html += `<div style="margin-top: 4px; font-size: 12px; color: ${reasonColor};">${settings.last_quote_rebalance_reason}</div>`;
+    } else {
+      html += '<div style="margin-top: 4px; font-size: 12px; color: #71717a;">No recent check</div>';
+    }
+    html += '</div>';
 
     html += '</div>';
     el.innerHTML = html;
@@ -686,7 +801,7 @@ async function loadAll() {
   await Promise.allSettled([
     loadProfitStats(),
     loadLastActivity(),
-    loadRebalanceStatus(),   // new
+    loadRebalanceStatus(),
     loadOpportunities(),
     loadRejectedOpportunities(),
     loadPools(),
