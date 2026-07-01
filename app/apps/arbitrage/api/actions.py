@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, union_all, func, cast, String
 from sqlalchemy.orm import aliased
+
+from app.apps.arbitrage.services.trade_executor import TradeExecutor
 from app.core.database import get_db
 from app.apps.arbitrage.models import ArbitrageOpportunity, RebalanceLog, RejectedOpportunity, Exchange, ExchangeFee, ExchangeSymbol, OrderbookSnapshot
 from typing import Optional, List
@@ -10,6 +12,8 @@ from pydantic import BaseModel
 from fastapi import HTTPException
 from app.apps.arbitrage.inventory import get_quote_balance, get_base_balance, set_base_balance, set_quote_balance, update_quote_balance, update_base_balance
 from app.apps.arbitrage.services.opportunity_logger import OpportunityLogger
+from app.apps.arbitrage.services.rebalancer import Rebalancer
+from app.apps.arbitrage.services.orderbook_fetcher import OrderbookFetcher
 
 router = APIRouter()
 
@@ -271,3 +275,37 @@ async def sync_balances(db: AsyncSession = Depends(get_db)):
     from app.apps.arbitrage.services.balance_sync import BalanceSyncService
     result = await BalanceSyncService.sync_all_balances(db)
     return {"status": "success", "result": result}
+
+@router.post("/rebalance-full/{symbol}")
+async def rebalance_full(symbol: str, db: AsyncSession = Depends(get_db)):
+    """
+    Manually trigger both base (USDT) and quote (IRT) rebalancing for a symbol,
+    using the same logic as the automatic poll cycle.
+    """
+    # Fetch latest orderbooks
+    fetcher = OrderbookFetcher()
+    exchange_data = await fetcher.fetch_all(db)
+    if symbol not in exchange_data:
+        raise HTTPException(404, f"Symbol '{symbol}' not found in current orderbooks")
+
+    orderbooks_dict = exchange_data[symbol][0]  # the tuple of dicts
+    quote_currency = "IRT" if symbol.endswith("IRT") else "USDT"
+
+    rebalancer = Rebalancer(OpportunityLogger(), TradeExecutor(OpportunityLogger()))
+
+    # Run base rebalance
+    base_success, base_reason = await rebalancer.rebalance_symbol_if_needed(
+        db, symbol, quote_currency, orderbooks_dict
+    )
+    # Run quote rebalance
+    quote_success, quote_reason = await rebalancer.rebalance_quote_if_needed(
+        db, symbol, quote_currency, orderbooks_dict
+    )
+
+    await db.commit()
+
+    return {
+        "symbol": symbol,
+        "base_rebalance": {"success": base_success, "reason": base_reason},
+        "quote_rebalance": {"success": quote_success, "reason": quote_reason}
+    }
