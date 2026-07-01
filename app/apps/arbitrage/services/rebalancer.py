@@ -5,7 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.apps.arbitrage.models import (
-    Exchange, BaseInventory, SymbolArbitrageSettings, ExchangeFee, QuoteInventory
+    Exchange, BaseInventory, SymbolArbitrageSettings, ExchangeFee, QuoteInventory,
+    ArbitrageOpportunity, OrderExecution
 )
 from app.apps.arbitrage.inventory import update_base_balance, update_quote_balance, get_quote_balance
 from app.exchanges.factory import get_exchange_client
@@ -22,7 +23,7 @@ class Rebalancer:
         self.trade_executor = trade_executor or TradeExecutor(logger)
 
     # ----------------------------------------------------------------------
-    # Base asset rebalancing (USDT)
+    # Base asset rebalancing (USDT) – moves ALL USDT from Wallex to Bitpin
     # ----------------------------------------------------------------------
     async def rebalance_symbol_if_needed(
         self,
@@ -52,10 +53,15 @@ class Rebalancer:
         balances.sort(key=lambda x: x[1])
         poorest = balances[0]
         richest = balances[-1]
-        avg_balance = sum(b for _, b in balances) / len(balances)
 
         logger.info(f"[REBALANCE] Balances: {balances}")
-        logger.info(f"[REBALANCE] Avg={avg_balance:.2f}, poorest={poorest[0]}={poorest[1]:.2f}, richest={richest[0]}={richest[1]:.2f}")
+        logger.info(f"[REBALANCE] richest={richest[0]}={richest[1]:.2f}, poorest={poorest[0]}={poorest[1]:.2f}")
+
+        # --- DIRECTION GUARD: only rebalance if Wallex has more USDT and Bitpin has less ---
+        if richest[0] != 'wallex' or poorest[0] != 'bitpin':
+            reason = f"Skipping: richest={richest[0]}, poorest={poorest[0]} – not the expected direction (Wallex rich, Bitpin poor)"
+            logger.info(f"[REBALANCE] {reason}")
+            return False, reason
 
         # 2. Get settings
         settings_stmt = select(SymbolArbitrageSettings).where(
@@ -69,23 +75,6 @@ class Rebalancer:
 
         if not settings.market_rebalance_enabled:
             reason = f"market_rebalance_enabled=False for {common_symbol}"
-            logger.info(f"[REBALANCE] {reason}")
-            return False, reason
-
-        imbalance_ratio = float(settings.market_rebalance_imbalance_ratio)
-        trigger_threshold = imbalance_ratio * avg_balance
-        logger.info(f"[REBALANCE] Imbalance ratio = {imbalance_ratio} (trigger when min < {trigger_threshold:.2f})")
-
-        if poorest[1] < trigger_threshold:
-            settings.rebalance_pending = True
-            await db.flush()
-            logger.info(f"[REBALANCE] Imbalance detected, set pending flag for {common_symbol}")
-        else:
-            if settings.rebalance_pending:
-                settings.rebalance_pending = False
-                await db.flush()
-                logger.info(f"[REBALANCE] No imbalance, cleared pending flag for {common_symbol}")
-            reason = f"No imbalance: poorest {poorest[0]} balance {poorest[1]:.2f} >= {trigger_threshold:.2f}"
             logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
@@ -115,16 +104,19 @@ class Rebalancer:
             logger.warning(f"[REBALANCE] {reason}")
             return False, reason
 
-        richest_asks, _ = richest_ob
-        _, poorest_bids = poorest_ob
-        if not richest_asks or not poorest_bids:
-            reason = f"Incomplete levels: richest_asks={bool(richest_asks)}, poorest_bids={bool(poorest_bids)}"
+        # Sell USDT on richest (Wallex) -> use its BID side
+        # Buy USDT on poorest (Bitpin) -> use its ASK side
+        _, richest_bids = richest_ob
+        poorest_asks, _ = poorest_ob
+
+        if not richest_bids or not poorest_asks:
+            reason = f"Incomplete levels: richest_bids={bool(richest_bids)}, poorest_asks={bool(poorest_asks)}"
             logger.warning(f"[REBALANCE] {reason}")
             return False, reason
 
-        sell_price = richest_asks[0][0]
-        buy_price = poorest_bids[0][0]
-        spread_percent = abs(sell_price - buy_price) / buy_price * 100
+        sell_price = richest_bids[0][0]   # price at which we sell USDT on richest exchange
+        buy_price = poorest_asks[0][0]    # price at which we buy USDT on poorest exchange
+        spread_percent = (buy_price - sell_price) / sell_price * 100   # cost of rebalancing
         max_spread = float(settings.market_rebalance_max_spread_percent)
         logger.info(f"[REBALANCE] Prices: sell@{richest[0]}={sell_price:.2f}, buy@{poorest[0]}={buy_price:.2f}, spread={spread_percent:.3f}%, max_spread={max_spread}%")
 
@@ -133,21 +125,18 @@ class Rebalancer:
             logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
-        # 5. Target amount
-        target_amount = avg_balance * (float(settings.market_rebalance_amount_percent) / 100.0)
-        logger.info(f"[REBALANCE] Target amount = {target_amount:.4f} ({settings.market_rebalance_amount_percent}% of avg)")
+        # 5. Target amount = ALL USDT on the richest exchange (Wallex)
+        target_amount = richest[1]  # move everything from Wallex to Bitpin
+        logger.info(f"[REBALANCE] Target amount = {target_amount:.4f} (all USDT from Wallex)")
 
-        if target_amount > richest[1]:
-            old = target_amount
-            target_amount = richest[1] * 0.9
-            logger.info(f"[REBALANCE] Reduced target from {old:.4f} to {target_amount:.4f} due to richest balance {richest[1]:.2f}")
-
+        # Ensure we have enough IRT on Bitpin to buy
         poorest_quote_balance = await get_quote_balance(db, poorest[0], quote_currency)
         cost_estimate = target_amount * buy_price
         if cost_estimate > poorest_quote_balance:
+            # Reduce target to fit within available IRT
             old = target_amount
-            target_amount = poorest_quote_balance / buy_price * 0.95
-            logger.info(f"[REBALANCE] Reduced target from {old:.4f} to {target_amount:.4f} due to poor quote balance {poorest_quote_balance:.2f} (need {cost_estimate:.2f})")
+            target_amount = (poorest_quote_balance / buy_price) * 0.95
+            logger.info(f"[REBALANCE] Reduced target from {old:.4f} to {target_amount:.4f} due to low quote balance {poorest_quote_balance:.2f} (need {cost_estimate:.2f})")
 
         if target_amount < 0.001:
             reason = f"Target amount too small ({target_amount:.6f})"
@@ -194,8 +183,8 @@ class Rebalancer:
         fee_res = await db.execute(fee_stmt)
         sell_fee = float(fee_res.scalar() or 0.0)
 
-        # Execute and get deltas (9 values)
-        success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit = \
+        # Execute and get all 11 values
+        success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit, buy_execs, sell_execs = \
             await self.trade_executor.execute_and_get_deltas(
                 db=db,
                 common_symbol=common_symbol,
@@ -211,6 +200,8 @@ class Rebalancer:
                 sell_fee_rate=sell_fee,
                 vwap_buy=buy_price,
                 vwap_sell=sell_price,
+                limit_price_buy=buy_price,
+                limit_price_sell=sell_price,
                 is_live=is_live
             )
 
@@ -225,7 +216,37 @@ class Rebalancer:
         await update_quote_balance(db, poorest[0], quote_currency, quote_delta_buy)
         await update_quote_balance(db, richest[0], quote_currency, quote_delta_sell)
 
-        # 7. Log rebalance
+        # 7. Create an ArbitrageOpportunity for this rebalance (so executions are linked)
+        profit_percent = (net_profit / (filled_vol * vwap_buy)) * 100 if filled_vol > 0 and vwap_buy > 0 else 0.0
+        opp = ArbitrageOpportunity(
+            common_symbol=common_symbol,
+            exchange_a_id=buy_exch_obj_id,
+            exchange_b_id=sell_exch_obj_id,
+            trade_type="rebalance_base",
+            price_a=vwap_buy,
+            price_b=vwap_sell,
+            profit_percent=profit_percent,
+            traded_volume=filled_vol,
+            profit_quote=net_profit
+        )
+        db.add(opp)
+        await db.flush()
+
+        # Add executions
+        all_execs = buy_execs + sell_execs
+        for exec_data in all_execs:
+            exec_record = OrderExecution(
+                opportunity_id=opp.id,
+                exchange_name=exec_data["exchange_name"],
+                side=exec_data["side"],
+                price=exec_data["price"],
+                volume=exec_data["volume"],
+                fee=exec_data["fee"],
+                client_order_id=exec_data.get("client_order_id")
+            )
+            db.add(exec_record)
+
+        # 8. Log rebalance
         await self.logger.log_rebalance(
             db,
             common_symbol=common_symbol,
@@ -235,21 +256,21 @@ class Rebalancer:
             amount_sent=filled_vol,
             fee=0.0,
             net=filled_vol,
-            reason=f"market_rebalance_{common_symbol}_imbalance_{imbalance_ratio}",
-            profit_quote=net_profit   # ADD THIS
+            reason=f"market_rebalance_{common_symbol}_full_swap",
+            profit_quote=net_profit
         )
 
-        # 8. Update last rebalance time and clear pending flag
+        # 9. Update last rebalance time and clear any pending flag
         settings.last_rebalance_time = datetime.utcnow()
         settings.rebalance_pending = False
         await db.commit()
 
-        reason = f"Rebalance executed: sold {filled_vol:.4f} on {richest[0]} at VWAP {vwap_sell:.2f}, bought on {poorest[0]} at VWAP {vwap_buy:.2f}"
+        reason = f"✅ BASE rebalance executed: moved {filled_vol:.4f} USDT from {richest[0]} to {poorest[0]}, net_profit={net_profit:.2f} {quote_currency}"
         logger.info(f"[REBALANCE] {reason}")
         return True, reason
 
     # ----------------------------------------------------------------------
-    # Quote asset rebalancing (IRT)
+    # Quote asset rebalancing (IRT) – moves ALL IRT from Bitpin to Wallex
     # ----------------------------------------------------------------------
     async def rebalance_quote_if_needed(
         self,
@@ -277,12 +298,17 @@ class Rebalancer:
         exchange_modes = {name: mode for name, mode, _ in rows}
         balances = [(name, float(bal)) for name, _, bal in rows]
         balances.sort(key=lambda x: x[1])
-        poorest = balances[0]      # exchange with smallest IRT
-        richest = balances[-1]     # exchange with largest IRT
-        avg_balance = sum(b for _, b in balances) / len(balances)
+        poorest = balances[0]
+        richest = balances[-1]
 
         logger.info(f"[QUOTE REBALANCE] Quote balances: {balances}")
-        logger.info(f"[QUOTE REBALANCE] Avg={avg_balance:.2f}, poorest={poorest[0]}={poorest[1]:.2f}, richest={richest[0]}={richest[1]:.2f}")
+        logger.info(f"[QUOTE REBALANCE] richest={richest[0]}={richest[1]:.2f}, poorest={poorest[0]}={poorest[1]:.2f}")
+
+        # --- DIRECTION GUARD: only rebalance if Bitpin has more IRT and Wallex has less ---
+        if richest[0] != 'bitpin' or poorest[0] != 'wallex':
+            reason = f"Skipping: richest={richest[0]}, poorest={poorest[0]} – not the expected direction (Bitpin rich, Wallex poor)"
+            logger.info(f"[QUOTE REBALANCE] {reason}")
+            return False, reason
 
         # 2. Get settings
         settings_stmt = select(SymbolArbitrageSettings).where(
@@ -296,23 +322,6 @@ class Rebalancer:
 
         if not settings.quote_rebalance_enabled:
             reason = f"quote_rebalance_enabled=False for {common_symbol}"
-            logger.info(f"[QUOTE REBALANCE] {reason}")
-            return False, reason
-
-        imbalance_ratio = float(settings.quote_rebalance_imbalance_ratio)
-        trigger_threshold = imbalance_ratio * avg_balance
-        logger.info(f"[QUOTE REBALANCE] Imbalance ratio = {imbalance_ratio} (trigger when min < {trigger_threshold:.2f})")
-
-        if poorest[1] < trigger_threshold:
-            settings.quote_rebalance_pending = True
-            await db.flush()
-            logger.info(f"[QUOTE REBALANCE] Imbalance detected, set pending flag")
-        else:
-            if settings.quote_rebalance_pending:
-                settings.quote_rebalance_pending = False
-                await db.flush()
-                logger.info(f"[QUOTE REBALANCE] No imbalance, cleared pending flag")
-            reason = f"No imbalance: poorest {poorest[0]} balance {poorest[1]:.2f} >= {trigger_threshold:.2f}"
             logger.info(f"[QUOTE REBALANCE] {reason}")
             return False, reason
 
@@ -342,16 +351,19 @@ class Rebalancer:
             logger.warning(f"[QUOTE REBALANCE] {reason}")
             return False, reason
 
-        _, poorest_bids = poorest_ob   # sell USDT – use bid side
-        richest_asks, _ = richest_ob   # buy USDT – use ask side
+        # Sell USDT on poorest IRT exchange (Bitpin) -> use its BID side (to sell USDT)
+        # Buy USDT on richest IRT exchange (Wallex) -> use its ASK side (to buy USDT)
+        _, poorest_bids = poorest_ob   # Bitpin has IRT, so we sell USDT there
+        richest_asks, _ = richest_ob   # Wallex has no IRT, so we buy USDT there
+
         if not poorest_bids or not richest_asks:
             reason = f"Incomplete levels: poorest_bids={bool(poorest_bids)}, richest_asks={bool(richest_asks)}"
             logger.warning(f"[QUOTE REBALANCE] {reason}")
             return False, reason
 
-        sell_price = poorest_bids[0][0]    # price at which we sell USDT on the poor IRT exchange
-        buy_price = richest_asks[0][0]     # price at which we buy USDT on the rich IRT exchange
-        spread_percent = abs(sell_price - buy_price) / buy_price * 100
+        sell_price = poorest_bids[0][0]    # price at which we sell USDT on Bitpin
+        buy_price = richest_asks[0][0]     # price at which we buy USDT on Wallex
+        spread_percent = (buy_price - sell_price) / sell_price * 100
         max_spread = float(settings.quote_rebalance_max_spread_percent)
         logger.info(f"[QUOTE REBALANCE] Prices: sell@{poorest[0]}={sell_price:.2f}, buy@{richest[0]}={buy_price:.2f}, spread={spread_percent:.3f}%, max_spread={max_spread}%")
 
@@ -360,12 +372,12 @@ class Rebalancer:
             logger.info(f"[QUOTE REBALANCE] {reason}")
             return False, reason
 
-        # 5. Target amount in USDT
-        target_irt = avg_balance * (float(settings.quote_rebalance_amount_percent) / 100.0)
+        # 5. Target amount = ALL IRT on the richest exchange (Bitpin) converted to USDT
+        target_irt = richest[1]  # all IRT on Bitpin
         target_usdt = target_irt / buy_price
-        logger.info(f"[QUOTE REBALANCE] Target amount = {target_usdt:.4f} USDT ({settings.quote_rebalance_amount_percent}% of avg quote in IRT)")
+        logger.info(f"[QUOTE REBALANCE] Target amount = {target_usdt:.4f} USDT (all IRT from Bitpin)")
 
-        # Respect available USDT on the poorest exchange (need to sell there)
+        # Respect available USDT on Bitpin (need to sell USDT there)
         stmt = select(BaseInventory.balance).join(Exchange).where(
             Exchange.name == poorest[0],
             BaseInventory.common_symbol == common_symbol
@@ -374,21 +386,8 @@ class Rebalancer:
         available_base = float(bal_result.scalar_one_or_none() or 0.0)
         if target_usdt > available_base:
             old = target_usdt
-            target_usdt = available_base * 0.9
+            target_usdt = available_base * 0.95
             logger.info(f"[QUOTE REBALANCE] Reduced target from {old:.4f} to {target_usdt:.4f} due to low base balance on {poorest[0]}")
-
-        # Respect available IRT on the richest exchange (need to pay with IRT)
-        stmt = select(QuoteInventory.balance).join(Exchange).where(
-            Exchange.name == richest[0],
-            QuoteInventory.currency == quote_currency
-        )
-        bal_result = await db.execute(stmt)
-        available_quote_richest = float(bal_result.scalar_one_or_none() or 0.0)
-        cost_estimate = target_usdt * buy_price
-        if cost_estimate > available_quote_richest:
-            old = target_usdt
-            target_usdt = (available_quote_richest / buy_price) * 0.95
-            logger.info(f"[QUOTE REBALANCE] Reduced target from {old:.4f} to {target_usdt:.4f} due to low quote balance on {richest[0]}")
 
         if target_usdt < 0.001:
             reason = f"Target amount too small ({target_usdt:.6f} USDT)"
@@ -405,8 +404,8 @@ class Rebalancer:
         buy_exch_obj_id = None
         sell_exch_obj_id = None
         if is_live:
-            buy_client = get_exchange_client(richest[0])   # buy USDT on rich IRT exchange
-            sell_client = get_exchange_client(poorest[0])  # sell USDT on poor IRT exchange
+            buy_client = get_exchange_client(richest[0])   # buy USDT on Wallex
+            sell_client = get_exchange_client(poorest[0])  # sell USDT on Bitpin
             if not buy_client or not sell_client:
                 reason = f"Client creation failed for {richest[0]} or {poorest[0]}"
                 logger.error(f"[QUOTE REBALANCE] {reason}")
@@ -435,13 +434,13 @@ class Rebalancer:
         fee_res = await db.execute(fee_stmt)
         sell_fee = float(fee_res.scalar() or 0.0)
 
-        # Execute and get deltas (9 values)
-        success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit = \
+        # Execute and get all 11 values
+        success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit, buy_execs, sell_execs = \
             await self.trade_executor.execute_and_get_deltas(
                 db=db,
                 common_symbol=common_symbol,
-                buy_exchange=richest[0],      # buy USDT on rich IRT exchange
-                sell_exchange=poorest[0],     # sell USDT on poor IRT exchange
+                buy_exchange=richest[0],      # buy USDT on Wallex
+                sell_exchange=poorest[0],     # sell USDT on Bitpin
                 volume=target_usdt,
                 quote_currency=quote_currency,
                 buy_client=buy_client,
@@ -452,6 +451,8 @@ class Rebalancer:
                 sell_fee_rate=sell_fee,
                 vwap_buy=buy_price,
                 vwap_sell=sell_price,
+                limit_price_buy=buy_price,
+                limit_price_sell=sell_price,
                 is_live=is_live
             )
 
@@ -466,25 +467,55 @@ class Rebalancer:
         await update_quote_balance(db, poorest[0], quote_currency, quote_delta_sell)
         await update_quote_balance(db, richest[0], quote_currency, quote_delta_buy)
 
-        # 7. Log rebalance
+        # 7. Create an ArbitrageOpportunity for this quote rebalance
+        profit_percent = (net_profit / (filled_vol * vwap_buy)) * 100 if filled_vol > 0 and vwap_buy > 0 else 0.0
+        opp = ArbitrageOpportunity(
+            common_symbol=common_symbol,
+            exchange_a_id=buy_exch_obj_id,   # buy exchange (Wallex)
+            exchange_b_id=sell_exch_obj_id,  # sell exchange (Bitpin)
+            trade_type="rebalance_quote",
+            price_a=vwap_buy,
+            price_b=vwap_sell,
+            profit_percent=profit_percent,
+            traded_volume=filled_vol,
+            profit_quote=net_profit
+        )
+        db.add(opp)
+        await db.flush()
+
+        # Add executions
+        all_execs = buy_execs + sell_execs
+        for exec_data in all_execs:
+            exec_record = OrderExecution(
+                opportunity_id=opp.id,
+                exchange_name=exec_data["exchange_name"],
+                side=exec_data["side"],
+                price=exec_data["price"],
+                volume=exec_data["volume"],
+                fee=exec_data["fee"],
+                client_order_id=exec_data.get("client_order_id")
+            )
+            db.add(exec_record)
+
+        # 8. Log rebalance
         await self.logger.log_rebalance(
             db,
             common_symbol=None,
             currency=quote_currency,
-            from_exch=richest[0],
-            to_exch=poorest[0],
+            from_exch=poorest[0],   # Bitpin (sold USDT)
+            to_exch=richest[0],     # Wallex (bought USDT)
             amount_sent=filled_vol,
             fee=0.0,
             net=filled_vol,
-            reason=f"quote_rebalance_{common_symbol}_imbalance_{imbalance_ratio}",
-            profit_quote=net_profit   # ADD THIS
+            reason=f"quote_rebalance_{common_symbol}_full_swap",
+            profit_quote=net_profit
         )
 
-        # 8. Update last rebalance time and clear pending flag
+        # 9. Update last rebalance time and clear pending flag
         settings.last_quote_rebalance_time = datetime.utcnow()
         settings.quote_rebalance_pending = False
         await db.commit()
 
-        reason = f"Quote rebalance executed: sold {filled_vol:.4f} {common_symbol} on {poorest[0]} at VWAP {vwap_sell:.2f}, bought on {richest[0]} at VWAP {vwap_buy:.2f}"
+        reason = f"✅ QUOTE rebalance executed: moved {filled_vol:.4f} USDT from {poorest[0]} to {richest[0]}, net_profit={net_profit:.2f} {quote_currency}"
         logger.info(f"[QUOTE REBALANCE] {reason}")
         return True, reason

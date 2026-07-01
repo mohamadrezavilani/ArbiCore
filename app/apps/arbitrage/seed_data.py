@@ -2,8 +2,7 @@ import asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from app.core.config import settings
-from app.models.base import Base  # Import your declarative base
-# Import all models so that Base.metadata knows about them
+from app.models.base import Base
 from app.apps.arbitrage.models import (
     Exchange, ExchangeSymbol, BaseInventory, QuoteInventory, ExchangeFee,
     SymbolArbitrageSettings, Network, ExchangePairWeight
@@ -13,13 +12,11 @@ async def seed():
     engine = create_async_engine(str(settings.DATABASE_URL), echo=True)
     async_session = async_sessionmaker(engine, expire_on_commit=False)
 
-    # ✅ Create tables if they don't exist
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         print("✅ Tables created (if not existed).")
 
     async with async_session() as session:
-        # Check if already seeded
         existing = await session.execute(select(Exchange).limit(1))
         if existing.first():
             print("✅ Exchanges already seeded – skipping.")
@@ -76,10 +73,8 @@ async def seed():
         # for exchange in [wallex, nobitex, bitpin]:
         #     session.add(QuoteInventory(exchange_id=exchange.id, currency="IRT", balance=1_000_000_000.0))
 
-        await session.commit()
-        print("✅ Inventories created.")
 
-        # ========== 5. Networks ==========
+        # ========== 4. Networks ==========
         networks = [
             Network(symbol="USDTIRT", network_name="TRC20", fee_per_transfer=0.7),
         ]
@@ -87,18 +82,100 @@ async def seed():
         await session.commit()
         print("✅ Networks created.")
 
-        # ========== 6. Symbol arbitrage settings ==========
+        # ========== 5. Symbol arbitrage settings ==========
         trc20_network = (await session.execute(
             select(Network).where(Network.symbol == "USDTIRT", Network.network_name == "TRC20")
         )).scalar_one()
 
-        # ========== 7. Exchange Pair Weights ==========
+        settings_rows = [
+            SymbolArbitrageSettings(
+                common_symbol="USDTIRT",
+
+                # ---------- ARBITRAGE THRESHOLDS ----------
+                # Minimum profit % required to execute a trade.
+                # Set to 0.7% to ensure you only trade when the spread is large.
+                # This compensates for using 100% of your volume.
+                min_profit_percent=0.7,
+
+                # Disables the net‑gain cutoff. You don't want a fixed cutoff
+                # when you're using 100% of your available depth.
+                cutoff_threshold=0,
+
+                # ---------- VOLUME CONTROL (RISK MANAGER) ----------
+                # Fraction of the max available volume to trade.
+                # 1.0 = 100% → use all available funds on every qualifying trade.
+                min_trade_percent=1.0,
+
+                # Interpolation factor. 0 means the risk manager scales linearly
+                # from 0 net gain upward. With min_trade_percent=1.0, it immediately
+                # returns 1.0 for any positive net gain → full volume on every trade.
+                min_trade_factor=0,
+
+                # Multiplier for "full threshold". Kept at 1.0 (neutral).
+                valuability_factor=1.0,
+
+                # ---------- NETWORK (NOT USED FOR REBALANCING) ----------
+                default_network_id=trc20_network.id,  # TRC20 for possible future withdrawals
+                is_active=True,
+
+                # ---------- OPPORTUNISTIC REBALANCE (DISABLED) ----------
+                opportunistic_rebalance_enabled=False,
+                opportunistic_rebalance_max_loss_percent=50.0,
+
+                # ---------- BASE REBALANCING (USDT) ----------
+                market_rebalance_enabled=True,
+
+                # Amount to move, as % of the average balance.
+                # 100.0% = move the full average → with 2 exchanges, this perfectly
+                # equalizes them (e.g., 10 & 0 → avg=5 → move 5 → both become 5).
+                market_rebalance_amount_percent=100.0,
+
+                # Maximum allowable spread for rebalancing.
+                # If rebalancing would cost more than 0.2%, postpone it.
+                # This protects you from rebalancing when the loss is too high.
+                market_rebalance_max_spread_percent=0.2,
+
+                # Trigger rebalancing only when the poorest exchange has less than
+                # 25% of the average balance. Prevents tiny, unnecessary rebalances.
+                market_rebalance_imbalance_ratio=0.25,
+
+                # Wait 5 minutes after a rebalance before allowing another one.
+                # Prevents rapid oscillation between exchanges.
+                market_rebalance_cooldown_seconds=300,
+
+                last_rebalance_time=None,
+                rebalance_pending=False,
+
+                # ---------- QUOTE REBALANCING (IRT) ----------
+                quote_rebalance_enabled=True,
+
+                # Move 100% of the average IRT balance → perfectly equalises IRT
+                # across exchanges (just like USDT above).
+                quote_rebalance_amount_percent=100.0,
+
+                # Same spread protection as base rebalancing.
+                quote_rebalance_max_spread_percent=0.2,
+
+                # Trigger when poorest IRT exchange < 25% of average IRT.
+                quote_rebalance_imbalance_ratio=0.25,
+
+                # Cooldown 5 minutes.
+                quote_rebalance_cooldown_seconds=300,
+
+                last_quote_rebalance_time=None,
+                quote_rebalance_pending=False
+            )
+        ]
+        session.add_all(settings_rows)
+        await session.commit()
+        print("✅ Settings created (rebalancing enabled).")
+
+        # ========== 6. Exchange Pair Weights ==========
         exchange_list = [wallex, nobitex, bitpin]
         for i in range(len(exchange_list)):
             for j in range(i + 1, len(exchange_list)):
                 a = exchange_list[i]
                 b = exchange_list[j]
-                # Ensure canonical order: exchange_a_id < exchange_b_id
                 if a.id < b.id:
                     pair = ExchangePairWeight(
                         exchange_a_id=a.id,
@@ -117,39 +194,8 @@ async def seed():
                     )
                 session.add(pair)
         await session.commit()
-        print("✅ Exchange pair weights initialized (0.5 each).")
+        print("✅ Exchange pair weights initialized.")
 
-        settings_rows = [
-            SymbolArbitrageSettings(
-                common_symbol="USDTIRT",
-                min_profit_percent=0.5,
-                cutoff_threshold=0,
-                min_trade_percent=1.0, # change to 0.20
-                min_trade_factor=0, # change to 0.3
-                valuability_factor=1.0,
-                default_network_id=trc20_network.id,
-                is_active=True,
-                opportunistic_rebalance_enabled=False,
-                opportunistic_rebalance_max_loss_percent=50.0,
-                market_rebalance_enabled=False,
-                market_rebalance_amount_percent=20.0,
-                market_rebalance_max_spread_percent=0.1,
-                market_rebalance_imbalance_ratio=0.25,
-                market_rebalance_cooldown_seconds=60,
-                last_rebalance_time=None,
-                rebalance_pending=False,
-                # NEW
-                quote_rebalance_enabled=False,
-                quote_rebalance_amount_percent=20.0,
-                quote_rebalance_max_spread_percent=0.1,
-                quote_rebalance_imbalance_ratio=0.25,
-                quote_rebalance_cooldown_seconds=60,
-                last_quote_rebalance_time=None,
-                quote_rebalance_pending=False
-            )
-        ]
-        session.add_all(settings_rows)
-        await session.commit()
         print("✅ Database seeded successfully.")
 
 if __name__ == "__main__":
