@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from app.apps.arbitrage.models import (
     Exchange, BaseInventory, SymbolArbitrageSettings, ExchangeFee, QuoteInventory,
-    ArbitrageOpportunity, OrderExecution
+    ArbitrageOpportunity, OrderExecution, ExchangeSymbol
 )
 from app.apps.arbitrage.inventory import update_base_balance, update_quote_balance, get_quote_balance
 from app.exchanges.factory import get_exchange_client
@@ -32,7 +32,7 @@ class Rebalancer:
         quote_currency: str,
         exchange_orderbooks: Dict[str, Tuple[List[List[float]], List[List[float]]]],
     ) -> Tuple[bool, str]:
-        logger.info(f"[REBALANCE] Checking {common_symbol} (quote={quote_currency})")
+        # logger.info(f"[REBALANCE] Checking {common_symbol} (quote={quote_currency})")
 
         # 0. Get settings early so we can update monitoring fields
         settings_stmt = select(SymbolArbitrageSettings).where(
@@ -72,22 +72,22 @@ class Rebalancer:
         poorest = balances[0]
         richest = balances[-1]
 
-        logger.info(f"[REBALANCE] Balances: {balances}")
-        logger.info(f"[REBALANCE] richest={richest[0]}={richest[1]:.2f}, poorest={poorest[0]}={poorest[1]:.2f}")
+        # logger.info(f"[REBALANCE] Balances: {balances}")
+        # logger.info(f"[REBALANCE] richest={richest[0]}={richest[1]:.2f}, poorest={poorest[0]}={poorest[1]:.2f}")
 
         # Direction guard: only rebalance if Wallex has more USDT and Bitpin has less
         if richest[0] != 'wallex' or poorest[0] != 'bitpin':
             reason = f"Skipping: richest={richest[0]}, poorest={poorest[0]} – not the expected direction (Wallex rich, Bitpin poor)"
             settings.last_rebalance_reason = reason
             await db.commit()
-            logger.info(f"[REBALANCE] {reason}")
+            # logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
         if not settings.market_rebalance_enabled:
             reason = f"market_rebalance_enabled=False for {common_symbol}"
             settings.last_rebalance_reason = reason
             await db.commit()
-            logger.info(f"[REBALANCE] {reason}")
+            # logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
         # 2. Cooldown
@@ -100,7 +100,7 @@ class Rebalancer:
                 reason = f"Cooldown active until {next_allowed_str}"
                 settings.last_rebalance_reason = reason
                 await db.commit()
-                logger.info(f"[REBALANCE] {reason}")
+                # logger.info(f"[REBALANCE] {reason}")
                 return False, reason
             else:
                 logger.info(f"[REBALANCE] Cooldown passed (last rebalance at {format_local_time(settings.last_rebalance_time)})")
@@ -136,22 +136,21 @@ class Rebalancer:
         buy_price = poorest_asks[0][0]
         spread_percent = (buy_price - sell_price) / sell_price * 100
         max_spread = float(settings.market_rebalance_max_spread_percent)
-        logger.info(f"[REBALANCE] Prices: sell@{richest[0]}={sell_price:.2f}, buy@{poorest[0]}={buy_price:.2f}, spread={spread_percent:.3f}%, max_spread={max_spread}%")
+        # logger.info(f"[REBALANCE] Prices: sell@{richest[0]}={sell_price:.2f}, buy@{poorest[0]}={buy_price:.2f}, spread={spread_percent:.3f}%, max_spread={max_spread}%")
 
-        # Store spread for monitoring
         settings.last_rebalance_spread = spread_percent
 
         if spread_percent > max_spread:
             reason = f"Spread {spread_percent:.2f}% > {max_spread}% – will retry later (pending flag remains)"
             settings.last_rebalance_reason = reason
-            settings.rebalance_pending = True  # keep pending flag
+            settings.rebalance_pending = True
             await db.commit()
-            logger.info(f"[REBALANCE] {reason}")
+            # logger.info(f"[REBALANCE] {reason}")
             return False, reason
 
         # 4. Target amount = ALL USDT on the richest exchange (Wallex)
         target_amount = richest[1]
-        logger.info(f"[REBALANCE] Target amount = {target_amount:.4f} (all USDT from Wallex)")
+        # logger.info(f"[REBALANCE] Target amount = {target_amount:.4f} (all USDT from Wallex)")
 
         # Ensure we have enough IRT on Bitpin to buy
         poorest_quote_balance = await get_quote_balance(db, poorest[0], quote_currency)
@@ -212,6 +211,23 @@ class Rebalancer:
         fee_res = await db.execute(fee_stmt)
         sell_fee = float(fee_res.scalar() or 0.0)
 
+        # ---- FETCH PRICE FACTORS ----
+        factor_stmt = select(ExchangeSymbol.price_conversion_factor).where(
+            ExchangeSymbol.exchange_id == buy_exch_obj_id,
+            ExchangeSymbol.common_symbol == common_symbol
+        )
+        factor_res = await db.execute(factor_stmt)
+        buy_price_factor = float(factor_res.scalar_one_or_none() or 1.0)
+
+        factor_stmt = select(ExchangeSymbol.price_conversion_factor).where(
+            ExchangeSymbol.exchange_id == sell_exch_obj_id,
+            ExchangeSymbol.common_symbol == common_symbol
+        )
+        factor_res = await db.execute(factor_stmt)
+        sell_price_factor = float(factor_res.scalar_one_or_none() or 1.0)
+
+        logger.info(f"[REBALANCE] Price factors: buy={buy_price_factor}, sell={sell_price_factor}")
+
         # Execute and get all 11 values
         success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit, buy_execs, sell_execs = \
             await self.trade_executor.execute_and_get_deltas(
@@ -231,6 +247,8 @@ class Rebalancer:
                 vwap_sell=sell_price,
                 limit_price_buy=buy_price,
                 limit_price_sell=sell_price,
+                buy_price_factor=buy_price_factor,
+                sell_price_factor=sell_price_factor,
                 is_live=is_live
             )
 
@@ -494,6 +512,23 @@ class Rebalancer:
         fee_res = await db.execute(fee_stmt)
         sell_fee = float(fee_res.scalar() or 0.0)
 
+        # ---- FETCH PRICE FACTORS ----
+        factor_stmt = select(ExchangeSymbol.price_conversion_factor).where(
+            ExchangeSymbol.exchange_id == buy_exch_obj_id,
+            ExchangeSymbol.common_symbol == common_symbol
+        )
+        factor_res = await db.execute(factor_stmt)
+        buy_price_factor = float(factor_res.scalar_one_or_none() or 1.0)
+
+        factor_stmt = select(ExchangeSymbol.price_conversion_factor).where(
+            ExchangeSymbol.exchange_id == sell_exch_obj_id,
+            ExchangeSymbol.common_symbol == common_symbol
+        )
+        factor_res = await db.execute(factor_stmt)
+        sell_price_factor = float(factor_res.scalar_one_or_none() or 1.0)
+
+        logger.info(f"[QUOTE REBALANCE] Price factors: buy={buy_price_factor}, sell={sell_price_factor}")
+
         # Execute and get all 11 values
         success, filled_vol, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, net_profit, buy_execs, sell_execs = \
             await self.trade_executor.execute_and_get_deltas(
@@ -513,6 +548,8 @@ class Rebalancer:
                 vwap_sell=sell_price,
                 limit_price_buy=buy_price,
                 limit_price_sell=sell_price,
+                buy_price_factor=buy_price_factor,
+                sell_price_factor=sell_price_factor,
                 is_live=is_live
             )
 
