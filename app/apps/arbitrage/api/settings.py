@@ -33,6 +33,15 @@ async def get_risk_settings(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(SymbolArbitrageSettings))
     return result.scalars().all()
 
+@router.get("/risk/{symbol}", response_model=schemas.RiskSettingsResponse)
+async def get_risk_settings_by_symbol(symbol: str, db: AsyncSession = Depends(get_db)):
+    stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == symbol)
+    result = await db.execute(stmt)
+    settings_obj = result.scalar_one_or_none()
+    if not settings_obj:
+        raise HTTPException(status_code=404, detail="Symbol not found")
+    return settings_obj
+
 @router.put("/risk/{symbol}", response_model=schemas.RiskSettingsResponse)
 async def update_risk_settings(symbol: str, data: schemas.RiskSettingsUpdate, db: AsyncSession = Depends(get_db)):
     stmt = select(SymbolArbitrageSettings).where(SymbolArbitrageSettings.common_symbol == symbol)
