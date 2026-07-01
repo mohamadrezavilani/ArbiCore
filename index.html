@@ -115,6 +115,9 @@
     </div>
   </div>
 
+  <!-- Rebalancing Status Panel -->
+  <div id="rebalance-status" style="margin-bottom: 24px;"></div>
+
   <div id="api-status" style="margin-bottom: 20px;"></div>
 
   <!-- Last Activity Panel -->
@@ -409,6 +412,69 @@ async function loadLastActivity() {
   }
 }
 
+// ===== Rebalancing Status =====
+async function loadRebalanceStatus() {
+  try {
+    const resp = await fetch(API_BASE + "/settings/risk/USDTIRT");
+    const data = await resp.json();
+    const el = document.getElementById("rebalance-status");
+    if (!el) return;
+
+    let html = '<div class="card" style="grid-column: span 2; padding: 16px 20px;">';
+    html += '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">';
+    html += '<div style="font-weight: bold; font-size: 18px;">🔄 Rebalancing Status</div>';
+    html += `<div style="font-size: 12px; color: #71717a;">Last updated: ${new Date().toLocaleTimeString()}</div>`;
+    html += '</div>';
+
+    // Base rebalance
+    const baseTime = data.last_rebalance_check_time ? new Date(data.last_rebalance_check_time).toLocaleTimeString() : 'Never';
+    const basePending = data.rebalance_pending ? '🔴 Pending' : '✅ Not pending';
+    html += `<div style="display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 8px;">`;
+    html += `<span style="font-weight: bold; color: #60a5fa;">Base (USDT):</span>`;
+    if (data.last_rebalance_reason && data.last_rebalance_reason.includes('Executed')) {
+      html += `<span style="color: #4ade80;">✅ ${data.last_rebalance_reason}</span>`;
+    } else if (data.last_rebalance_reason && data.last_rebalance_reason.includes('Spread')) {
+      html += `<span style="color: #facc15;">⏳ ${data.last_rebalance_reason}</span>`;
+    } else if (data.last_rebalance_reason) {
+      html += `<span style="color: #f87171;">${data.last_rebalance_reason}</span>`;
+    } else {
+      html += `<span style="color: #a1a1aa;">No recent check</span>`;
+    }
+    html += ` <span style="color: #71717a; font-size: 12px;">(last: ${baseTime})</span>`;
+    html += ` <span style="color: #71717a; font-size: 12px;">| Pending: ${basePending}</span>`;
+    if (data.last_rebalance_spread !== null && data.last_rebalance_spread !== undefined) {
+      html += ` <span style="color: #71717a; font-size: 12px;">| Spread: <span style="color: #facc15;">${data.last_rebalance_spread.toFixed(2)}%</span></span>`;
+    }
+    html += `</div>`;
+
+    // Quote rebalance
+    const quoteTime = data.last_quote_rebalance_check_time ? new Date(data.last_quote_rebalance_check_time).toLocaleTimeString() : 'Never';
+    const quotePending = data.quote_rebalance_pending ? '🔴 Pending' : '✅ Not pending';
+    html += `<div style="display: flex; flex-wrap: wrap; gap: 8px 16px;">`;
+    html += `<span style="font-weight: bold; color: #a78bfa;">Quote (IRT):</span>`;
+    if (data.last_quote_rebalance_reason && data.last_quote_rebalance_reason.includes('Executed')) {
+      html += `<span style="color: #4ade80;">✅ ${data.last_quote_rebalance_reason}</span>`;
+    } else if (data.last_quote_rebalance_reason && data.last_quote_rebalance_reason.includes('Spread')) {
+      html += `<span style="color: #facc15;">⏳ ${data.last_quote_rebalance_reason}</span>`;
+    } else if (data.last_quote_rebalance_reason) {
+      html += `<span style="color: #f87171;">${data.last_quote_rebalance_reason}</span>`;
+    } else {
+      html += `<span style="color: #a1a1aa;">No recent check</span>`;
+    }
+    html += ` <span style="color: #71717a; font-size: 12px;">(last: ${quoteTime})</span>`;
+    html += ` <span style="color: #71717a; font-size: 12px;">| Pending: ${quotePending}</span>`;
+    if (data.last_quote_rebalance_spread !== null && data.last_quote_rebalance_spread !== undefined) {
+      html += ` <span style="color: #71717a; font-size: 12px;">| Spread: <span style="color: #facc15;">${data.last_quote_rebalance_spread.toFixed(2)}%</span></span>`;
+    }
+    html += `</div>`;
+
+    html += '</div>';
+    el.innerHTML = html;
+  } catch(e) {
+    console.error("Failed to load rebalance status", e);
+  }
+}
+
 // ===== Opportunities =====
 async function loadOpportunities() {
   const data = await apiFetch("/opportunities/?limit=30");
@@ -620,12 +686,13 @@ async function loadAll() {
   await Promise.allSettled([
     loadProfitStats(),
     loadLastActivity(),
+    loadRebalanceStatus(),   // new
     loadOpportunities(),
     loadRejectedOpportunities(),
     loadPools(),
     loadActions(),
     loadRebalanceLogs(),
-    loadExecutions()   // new
+    loadExecutions()
   ]);
   updateApiStatus();
 }

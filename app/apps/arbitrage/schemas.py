@@ -32,8 +32,8 @@ class OrderbookSnapshotResponse(BaseModel):
     best_ask_volume: Optional[float]
     best_bid_price: Optional[float]
     best_bid_volume: Optional[float]
-    asks: Optional[List[List[float]]]   # added
-    bids: Optional[List[List[float]]]   # added
+    asks: Optional[List[List[float]]]
+    bids: Optional[List[List[float]]]
     created_at: datetime
 
 class ArbitrageOpportunityResponse(BaseModel):
@@ -46,7 +46,7 @@ class ArbitrageOpportunityResponse(BaseModel):
     price_b: float
     profit_percent: float
     traded_volume: float
-    profit_quote: float           # now stored, not computed
+    profit_quote: float
     created_at: datetime
 
 class OpportunitySummaryItem(BaseModel):
@@ -54,7 +54,7 @@ class OpportunitySummaryItem(BaseModel):
     total_opportunities: int
     sum_profit_percent: float
     avg_profit_percent: float
-    total_estimated_profit_quote: float   # in IRT or USDT (based on symbol)
+    total_estimated_profit_quote: float
     quote_currency: str
 
 class SystemStats(BaseModel):
@@ -67,7 +67,7 @@ class SystemStats(BaseModel):
 
 class ScanTriggerResponse(BaseModel):
     message: str
-    task_id: Optional[str]   # if you implement background task ID
+    task_id: Optional[str]
 
 class SymbolSettingsCreate(BaseModel):
     common_symbol: str
@@ -96,7 +96,6 @@ class RiskSettingsResponse(BaseModel):
     market_rebalance_cooldown_seconds: int
     last_rebalance_time: Optional[datetime]
     rebalance_pending: bool
-    # New quote rebalancing fields
     quote_rebalance_enabled: bool
     quote_rebalance_amount_percent: float
     quote_rebalance_max_spread_percent: float
@@ -104,6 +103,13 @@ class RiskSettingsResponse(BaseModel):
     quote_rebalance_cooldown_seconds: int
     last_quote_rebalance_time: Optional[datetime]
     quote_rebalance_pending: bool
+    # NEW monitoring fields
+    last_rebalance_check_time: Optional[datetime]
+    last_rebalance_reason: Optional[str]
+    last_rebalance_spread: Optional[float]
+    last_quote_rebalance_check_time: Optional[datetime]
+    last_quote_rebalance_reason: Optional[str]
+    last_quote_rebalance_spread: Optional[float]
 
 
 class RiskSettingsUpdate(BaseModel):
@@ -122,7 +128,6 @@ class RiskSettingsUpdate(BaseModel):
     market_rebalance_imbalance_ratio: Optional[float] = None
     market_rebalance_cooldown_seconds: Optional[int] = None
     rebalance_pending: Optional[bool] = None
-    # New
     quote_rebalance_enabled: Optional[bool] = None
     quote_rebalance_amount_percent: Optional[float] = None
     quote_rebalance_max_spread_percent: Optional[float] = None
@@ -143,7 +148,6 @@ class NetworkResponse(BaseModel):
     network_name: str
     fee_per_transfer: float
     is_active: bool
-
 
 
 class RejectedOpportunityResponse(BaseModel):
@@ -171,16 +175,15 @@ class RebalanceLogResponse(BaseModel):
 
 class DashboardResponse(BaseModel):
     timestamp: datetime
-    balances: Dict[str, Any]  # {"base": [...], "quote": [...]}
-    opportunities: Dict[str, Any]  # {"executed_today": int, "rejected_today": int, "last_24h_profit": float}
-    rebalances: Dict[str, Any]  # {"last_24h_count": int, "last_24h_total_sent": float}
-    system_health: Dict[str, Any]  # {"active_exchanges": int, "active_symbols": int, "last_scan_time": str}
+    balances: Dict[str, Any]
+    opportunities: Dict[str, Any]
+    rebalances: Dict[str, Any]
+    system_health: Dict[str, Any]
 
-# Add at the end of schemas.py
 class ActionLogResponse(BaseModel):
     id: UUID4
     timestamp: datetime
-    action_type: str  # trade, rebalance, rejection
+    action_type: str
     details: Dict[str, Any]
 
 class RealizedProfitResponse(BaseModel):

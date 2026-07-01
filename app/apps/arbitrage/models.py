@@ -65,6 +65,7 @@ class ArbitrageOpportunity(Base, UUIDMixin, TimestampMixin):
     profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
     executions: Mapped[list["OrderExecution"]] = relationship(back_populates="opportunity", cascade="all, delete-orphan")
 
+
 class BaseInventory(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "base_inventories"
     exchange_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"), nullable=False)
@@ -126,6 +127,15 @@ class SymbolArbitrageSettings(Base, UUIDMixin, TimestampMixin):
     last_quote_rebalance_time: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     quote_rebalance_pending: Mapped[bool] = mapped_column(default=False)
 
+    # ---- NEW FIELDS FOR MONITORING ----
+    last_rebalance_check_time: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    last_rebalance_reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    last_rebalance_spread: Mapped[Optional[float]] = mapped_column(Numeric(10,6), nullable=True)
+
+    last_quote_rebalance_check_time: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    last_quote_rebalance_reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    last_quote_rebalance_spread: Mapped[Optional[float]] = mapped_column(Numeric(10,6), nullable=True)
+
 
 class RejectedOpportunity(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "rejected_opportunities"
@@ -147,7 +157,7 @@ class RebalanceLog(Base, UUIDMixin, TimestampMixin):
     network_fee: Mapped[float] = mapped_column(Numeric(20, 8))
     net_received: Mapped[float] = mapped_column(Numeric(20, 8))
     reason: Mapped[str] = mapped_column(String(200))
-    profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)   # NEW
+    profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
 
 
 class ExchangePairWeight(Base, UUIDMixin, TimestampMixin):
@@ -163,15 +173,14 @@ class ExchangePairWeight(Base, UUIDMixin, TimestampMixin):
     last_sell_exchange: Mapped[Optional["Exchange"]] = relationship(foreign_keys=[last_sell_exchange_id])
     __table_args__ = (UniqueConstraint('exchange_a_id', 'exchange_b_id', name='uq_exchange_pair'),)
 
+
 class OrderExecution(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "order_executions"
     opportunity_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("arbitrage_opportunities.id", ondelete="CASCADE"), nullable=False, index=True)
     exchange_name: Mapped[str] = mapped_column(String(50), nullable=False)
-    side: Mapped[str] = mapped_column(String(10), nullable=False)  # "buy" or "sell"
+    side: Mapped[str] = mapped_column(String(10), nullable=False)
     price: Mapped[float] = mapped_column(Numeric(20, 10), nullable=False)
     volume: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)
     fee: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
-    client_order_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # for debugging
-
-    # Relationship back to opportunity (optional, for ORM ease)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     opportunity: Mapped["ArbitrageOpportunity"] = relationship(back_populates="executions")
