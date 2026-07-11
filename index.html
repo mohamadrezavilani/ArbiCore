@@ -154,10 +154,18 @@
           <span>⚡ Live Opportunities</span>
           <span class="status-badge status-online"><span>●</span> Live</span>
         </div>
-        <div style="overflow-x: auto; max-height: 250px; overflow-y: auto;">
-          <table style="min-width: 500px;">
+        <div style="overflow-x: auto; max-height: 300px; overflow-y: auto;">
+          <table style="min-width: 650px; font-size: 13px;">
             <thead>
-              <tr><th>Symbol</th><th>Exchange A</th><th>Exchange B</th><th>Profit %</th><th>Volume</th><th>Status</th></tr>
+              <tr>
+                <th>Symbol</th>
+                <th>Buy</th>
+                <th>Sell</th>
+                <th>Profit %</th>
+                <th>Volume</th>
+                <th>Potential Profit (TMN)</th>
+                <th>Status</th>
+              </tr>
             </thead>
             <tbody id="opportunities-table"></tbody>
           </table>
@@ -313,19 +321,21 @@ async function loadProfitStats() {
       const profitToman = toToman(item.profit_quote || 0);
       const oppDate = new Date(item.created_at);
       const isRecent = oppDate >= yesterday;
+      const isArbitrage = item.trade_type && item.trade_type.startsWith('buy_on_');
+      const isRebalance = item.trade_type && item.trade_type.startsWith('rebalance_');
 
       // For executed trades
       if (item.status === 'executed') {
         totalNetProfit += profitToman;
         if (isRecent) {
-          if (item.trade_type && item.trade_type.startsWith('buy_on_')) {
+          if (isArbitrage) {
             arbitrageProfit24h += profitToman;
-          } else if (item.trade_type && item.trade_type.startsWith('rebalance_')) {
+          } else if (isRebalance) {
             rebalancingCost24h += profitToman; // negative
           }
         }
-      } else if (item.status === 'detected' && isRecent) {
-        // Potential profit: only for detected (not executed) opportunities
+      } else if (item.status === 'detected' && isRecent && isArbitrage) {
+        // Only arbitrage opportunities count as potential profit
         potentialProfit24h += profitToman;
       }
     });
@@ -500,16 +510,33 @@ async function loadOpportunities() {
   table.innerHTML = "";
   if (!data || data.length === 0) {
     const row = document.createElement("tr");
-    row.innerHTML = '<td colspan="6" style="text-align:center; color:#a1a1aa; padding:30px;">No opportunities found</td>';
+    row.innerHTML = '<td colspan="7" style="text-align:center; color:#a1a1aa; padding:30px;">No opportunities found</td>';
     table.appendChild(row);
     return;
   }
-  data.slice(0, 15).forEach((item, index) => {
+  // Filter only arbitrage opportunities (trade_type starts with 'buy_on_')
+  const arbitrageData = data.filter(item => item.trade_type && item.trade_type.startsWith('buy_on_'));
+  if (arbitrageData.length === 0) {
+    const row = document.createElement("tr");
+    row.innerHTML = '<td colspan="7" style="text-align:center; color:#a1a1aa; padding:30px;">No arbitrage opportunities</td>';
+    table.appendChild(row);
+    return;
+  }
+  arbitrageData.slice(0, 15).forEach((item, index) => {
     const row = document.createElement("tr");
     const profitPercent = parseFloat(item.profit_percent) || 0;
     const status = item.status || 'detected';
     const statusColor = status === 'executed' ? 'green' : 'yellow';
-    row.innerHTML = `<td><b>${item.common_symbol || '-'}</b></td><td><span class="exchange-badge">${item.exchange_a_name || '-'}</span></td><td><span class="exchange-badge">${item.exchange_b_name || '-'}</span></td><td class="${profitPercent > 1 ? 'green' : 'yellow'} mono"><b>${formatNumber(profitPercent, 2)}%</b></td><td class="mono">${formatCompactNumber(item.traded_volume)}</td><td class="${statusColor}">${status}</td>`;
+    const potentialToman = toToman(item.profit_quote || 0);
+    row.innerHTML = `
+      <td><b>${item.common_symbol || '-'}</b></td>
+      <td><span class="exchange-badge">${item.exchange_a_name || '-'}</span></td>
+      <td><span class="exchange-badge">${item.exchange_b_name || '-'}</span></td>
+      <td class="${profitPercent > 1 ? 'green' : 'yellow'} mono"><b>${formatNumber(profitPercent, 2)}%</b></td>
+      <td class="mono">${formatCompactNumber(item.traded_volume)}</td>
+      <td class="mono">${formatNumber(potentialToman)}</td>
+      <td class="${statusColor}">${status}</td>
+    `;
     if (hasNew && index < 3) row.style.animation = "fadeIn 0.3s ease-out";
     table.appendChild(row);
   });
@@ -603,7 +630,7 @@ async function loadRebalanceLogs() {
   lastRebalanceData = data;
   container.innerHTML = "";
   if (!data || data.length === 0) {
-    container.innerHTML = '<div style="color:#a1a1aa; text-align:center; padding:20px;">No rebalance logs</div>';
+    container.innerHTML = '<div style="color: #a1a1aa; text-align:center; padding:20px;">No rebalance logs</div>';
     countSpan.innerText = "";
     return;
   }
@@ -637,7 +664,7 @@ async function loadExecutions() {
   lastExecutionsData = data;
   container.innerHTML = "";
   if (!data || data.length === 0) {
-    container.innerHTML = '<div style="color:#a1a1aa; text-align:center; padding:20px;">No executions yet</div>';
+    container.innerHTML = '<div style="color: #a1a1aa; text-align:center; padding:20px;">No executions yet</div>';
     countSpan.innerText = "";
     return;
   }
