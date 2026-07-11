@@ -191,41 +191,18 @@ class ArbitrageDetector:
             if eff_ask >= eff_bid:
                 break
 
-            weight = pair_weights.get((buy_exch, sell_exch), 0.5)
-
-            available_quote = avail_quote.get(buy_exch, 0.0)
-            available_base = avail_base.get(sell_exch, 0.0)
-
-            max_vol_by_quote = self._max_volume_from_quote(available_quote, ask_price)
-            max_vol_by_base = self._max_volume_from_base(available_base)
-
-            desired_vol = min(max_vol_by_quote, max_vol_by_base)
-
-            max_safe_quote = available_quote
-            max_vol_safe = self._max_volume_from_quote(max_safe_quote, ask_price)
-            desired_vol = min(desired_vol, max_vol_safe)
-
-            desired_vol = round(desired_vol, 2)
-
-            if desired_vol < MIN_ORDER_SIZE:
-                reason = f"Desired volume {desired_vol:.4f} below minimum {MIN_ORDER_SIZE}"
-                await self.logger.log_rejected_opportunity(
-                    db, common_symbol, buy_exch, sell_exch,
-                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
-                    reason,
-                    {"available_quote": available_quote, "available_base": available_base}
-                )
-                i += 1
-                j += 1
-                continue
-
+            # --- Step 1: Check orderbook depth and compute potential profit ---
             buy_original_levels = exchange_orderbooks[buy_exch][0]
             sell_original_levels = exchange_orderbooks[sell_exch][1]
 
-            buy_prices, buy_vols, total_buy_vol, vwap_buy = self._get_cumulative_levels(buy_original_levels, desired_vol, self.MAX_LEVELS)
-            sell_prices, sell_vols, total_sell_vol, vwap_sell = self._get_cumulative_levels(sell_original_levels, desired_vol, self.MAX_LEVELS)
+            # We need a reasonable volume to check depth. Use a large number to get full depth.
+            # We'll use 1000 USDT as a max to get all available levels, but we can cap it.
+            max_depth_vol = 1000.0  # enough to get all levels
+            buy_prices, buy_vols, total_buy_vol, vwap_buy = self._get_cumulative_levels(buy_original_levels, max_depth_vol, self.MAX_LEVELS)
+            sell_prices, sell_vols, total_sell_vol, vwap_sell = self._get_cumulative_levels(sell_original_levels, max_depth_vol, self.MAX_LEVELS)
 
             if total_buy_vol < MIN_ORDER_SIZE or total_sell_vol < MIN_ORDER_SIZE:
+                # Skip this pair – not enough depth even for one order
                 reason = f"Insufficient depth: buy_depth={total_buy_vol:.4f}, sell_depth={total_sell_vol:.4f}"
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
@@ -240,23 +217,31 @@ class ArbitrageDetector:
             max_vol = min(total_buy_vol, total_sell_vol)
             max_vol = round(max_vol, 2)
 
-            if max_vol < MIN_ORDER_SIZE:
-                reason = f"Max volume {max_vol:.4f} below minimum {MIN_ORDER_SIZE}"
-                await self.logger.log_rejected_opportunity(
-                    db, common_symbol, buy_exch, sell_exch,
-                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
-                    reason,
-                    {"max_vol": max_vol, "min_order": MIN_ORDER_SIZE}
-                )
-                i += 1
-                j += 1
-                continue
-
             effective_buy = vwap_buy * (1 + ask_fee)
             effective_sell = vwap_sell * (1 - bid_fee)
             profit_percent = (effective_sell - effective_buy) / effective_buy * 100
 
-            if profit_percent < float(settings.min_profit_percent):
+            # --- Step 2: Log as detected opportunity if profitable ---
+            if profit_percent >= float(settings.min_profit_percent):
+                potential_profit = max_vol * (effective_sell - effective_buy)
+                # Create 'detected' opportunity
+                opp = ArbitrageOpportunity(
+                    common_symbol=common_symbol,
+                    exchange_a_id=exchange_ids[buy_exch],
+                    exchange_b_id=exchange_ids[sell_exch],
+                    trade_type=f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    price_a=vwap_buy,
+                    price_b=vwap_sell,
+                    profit_percent=profit_percent,
+                    traded_volume=max_vol,
+                    profit_quote=potential_profit,
+                    status="detected"  # NEW
+                )
+                db.add(opp)
+                await db.flush()  # get ID
+                logger.info(f"[DB] Detected opportunity {opp.id} for {common_symbol} potential_profit={potential_profit:.2f}")
+            else:
+                # Not profitable – log rejection and continue
                 reason = f"Profit {profit_percent:.4f}% below minimum {settings.min_profit_percent}%"
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
@@ -268,13 +253,40 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
-            net_gain = max_vol * (effective_sell - effective_buy)
+            # --- Step 3: Balance cap and risk manager ---
+            weight = pair_weights.get((buy_exch, sell_exch), 0.5)
+
+            available_quote = avail_quote.get(buy_exch, 0.0)
+            available_base = avail_base.get(sell_exch, 0.0)
+
+            max_vol_by_quote = self._max_volume_from_quote(available_quote, ask_price)
+            max_vol_by_base = self._max_volume_from_base(available_base)
+
+            desired_vol = min(max_vol_by_quote, max_vol_by_base)
+            desired_vol = round(desired_vol, 2)
+
+            if desired_vol < MIN_ORDER_SIZE:
+                reason = f"Desired volume {desired_vol:.4f} below minimum {MIN_ORDER_SIZE}"
+                opp.rejection_reason = reason
+                # Keep status='detected', but mark the reason
+                await db.commit()
+                await self.logger.log_rejected_opportunity(
+                    db, common_symbol, buy_exch, sell_exch,
+                    f"buy_on_{buy_exch}_sell_on_{sell_exch}",
+                    reason,
+                    {"available_quote": available_quote, "available_base": available_base}
+                )
+                i += 1
+                j += 1
+                continue
+
+            net_gain = desired_vol * (effective_sell - effective_buy)  # using desired_vol for risk calc
 
             trade_pct = self.risk_manager.calculate_trade_percent(
                 net_gain=net_gain,
                 network_commission_quote=0.0,
                 params=settings,
-                vol=max_vol,
+                vol=desired_vol,
                 weight=weight,
                 current_price=vwap_buy,
                 network_fee_base=network_fee_base,
@@ -283,6 +295,8 @@ class ArbitrageDetector:
 
             if trade_pct <= 0:
                 reason = f"Risk manager rejected: trade_pct={trade_pct:.4f}, net_gain={net_gain:.6f}, weight={weight:.3f}"
+                opp.rejection_reason = reason
+                await db.commit()
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
                     f"buy_on_{buy_exch}_sell_on_{sell_exch}",
@@ -292,15 +306,13 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
-            volume = max_vol * trade_pct
+            volume = desired_vol * trade_pct
             volume = round(volume, 2)
-
-            if volume > desired_vol:
-                volume = desired_vol
-                volume = round(volume, 2)
 
             if volume < MIN_ORDER_SIZE:
                 reason = f"Final volume {volume:.4f} below minimum {MIN_ORDER_SIZE}"
+                opp.rejection_reason = reason
+                await db.commit()
                 await self.logger.log_rejected_opportunity(
                     db, common_symbol, buy_exch, sell_exch,
                     f"buy_on_{buy_exch}_sell_on_{sell_exch}",
@@ -311,11 +323,13 @@ class ArbitrageDetector:
                 j += 1
                 continue
 
+            # --- Step 4: Execute trade ---
             buy_limit_price = buy_prices[-1] if buy_prices else vwap_buy
             sell_limit_price = sell_prices[-1] if sell_prices else vwap_sell
 
             is_live = (exchange_modes.get(buy_exch) == "live" and exchange_modes.get(sell_exch) == "live")
 
+            # Pass the opportunity to the executor so it can update it
             success, filled_vol, vwap_buy_exec, vwap_sell_exec, \
             b_delta_buy, b_delta_sell, q_delta_buy, q_delta_sell, \
             net_profit, buy_execs, sell_execs = \
@@ -333,76 +347,33 @@ class ArbitrageDetector:
                     limit_price_sell=sell_limit_price,
                     is_live=is_live,
                     buy_price_factor=price_factors.get(buy_exch, 1.0),
-                    sell_price_factor=price_factors.get(sell_exch, 1.0)
+                    sell_price_factor=price_factors.get(sell_exch, 1.0),
+                    opportunity=opp  # PASS THE OPPORTUNITY HERE
                 )
 
             if success:
-                # ----- FIX: Refresh in-memory balances after a live trade -----
+                # Refresh in-memory balances after a live trade
                 if is_live:
-                    # Re-fetch balances from DB (which were just synced by TradeExecutor)
                     avail_quote[buy_exch] = await get_quote_balance(db, buy_exch, quote_currency)
                     avail_quote[sell_exch] = await get_quote_balance(db, sell_exch, quote_currency)
                     avail_base[buy_exch] = await get_base_balance(db, buy_exch, common_symbol)
                     avail_base[sell_exch] = await get_base_balance(db, sell_exch, common_symbol)
                 else:
-                    # For simulation, use the deltas returned
                     avail_quote[buy_exch] = max(0.0, avail_quote[buy_exch] + q_delta_buy)
                     avail_base[buy_exch] = max(0.0, avail_base[buy_exch] + b_delta_buy)
                     avail_quote[sell_exch] = max(0.0, avail_quote[sell_exch] + q_delta_sell)
                     avail_base[sell_exch] = max(0.0, avail_base[sell_exch] + b_delta_sell)
 
-                # --- CREATE AND COMMIT OPPORTUNITY ---
-                opp = ArbitrageOpportunity(
-                    common_symbol=common_symbol,
-                    exchange_a_id=exchange_ids[buy_exch],
-                    exchange_b_id=exchange_ids[sell_exch],
-                    trade_type=f"buy_on_{buy_exch}_sell_on_{sell_exch}",
-                    price_a=vwap_buy_exec,
-                    price_b=vwap_sell_exec,
-                    profit_percent=((filled_vol * vwap_sell_exec - filled_vol * vwap_buy_exec) / (filled_vol * vwap_buy_exec)) * 100 if filled_vol > 0 else 0,
-                    traded_volume=filled_vol,
-                    profit_quote=net_profit
-                )
-                db.add(opp)
-                await db.flush()  # get ID
-                logger.info(f"[DB] Created opportunity {opp.id} for {common_symbol} profit={net_profit:.2f}")
-
-                # --- SAVE EXECUTIONS ---
-                all_execs = buy_execs + sell_execs
-                for exec_data in all_execs:
-                    exec_record = OrderExecution(
-                        opportunity_id=opp.id,
-                        exchange_name=exec_data["exchange_name"],
-                        side=exec_data["side"],
-                        price=exec_data["price"],
-                        volume=exec_data["volume"],
-                        fee=exec_data["fee"],
-                        client_order_id=exec_data.get("client_order_id")
-                    )
-                    db.add(exec_record)
-                    logger.debug(f"[DB] Execution: {exec_data['exchange_name']} {exec_data['side']} {exec_data['volume']} @ {exec_data['price']}")
-
-                # --- COMMIT TO DATABASE ---
-                try:
-                    await db.commit()
-                    logger.info(f"[DB] Committed opportunity {opp.id} and {len(all_execs)} executions")
-                except Exception as e:
-                    await db.rollback()
-                    logger.error(f"[DB] Failed to commit: {e}")
-                    raise
-
-                # --- SYNC BALANCES AFTER TRADE ---
-                try:
-                    await BalanceSyncService.sync_exchange_balance(db, buy_exch)
-                    await BalanceSyncService.sync_exchange_balance(db, sell_exch)
-                    logger.info(f"[SYNC] Synced balances for {buy_exch} and {sell_exch} after trade")
-                except Exception as e:
-                    logger.error(f"[SYNC] Failed to sync balances: {e}")
-
+                # The opportunity was already updated by trade_executor, and executions added.
+                # Commit was done inside trade_executor, so we don't need to commit again.
                 opportunities.append(opp)
                 i += 1
                 j += 1
             else:
+                # Execution failed – keep opportunity as 'detected' with rejection reason
+                if opp.rejection_reason is None:
+                    opp.rejection_reason = "Trade execution failed (order placement error)"
+                await db.commit()
                 i += 1
                 j += 1
 

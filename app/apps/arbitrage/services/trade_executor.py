@@ -7,7 +7,7 @@ from typing import Tuple, Optional, Any, List, Dict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.apps.arbitrage.models import ExchangeSymbol
+from app.apps.arbitrage.models import ExchangeSymbol, ArbitrageOpportunity
 from app.apps.arbitrage.services.opportunity_logger import OpportunityLogger
 from app.apps.arbitrage.services.balance_sync import BalanceSyncService
 from app.apps.arbitrage.inventory import get_base_balance, get_quote_balance
@@ -60,11 +60,12 @@ class TradeExecutor:
         limit_price_sell: float,
         is_live: bool,
         buy_price_factor: float = 1.0,
-        sell_price_factor: float = 1.0
+        sell_price_factor: float = 1.0,
+        opportunity: Optional[ArbitrageOpportunity] = None,   # NEW
     ) -> Tuple[bool, float, float, float, float, float, float, float, float, List[Dict], List[Dict]]:
         """
         Execute a pair of limit orders (buy on one exchange, sell on another) and return deltas.
-        For live mode, we use balance changes as a fallback if order status API fails.
+        If `opportunity` is provided, it will be updated with the actual fill data.
         """
         if not is_live:
             # Simulation mode
@@ -86,6 +87,14 @@ class TradeExecutor:
             buy_execs = [{"price": vwap_buy, "volume": volume, "fee": 0.0, "exchange_name": buy_exchange, "side": "buy"}]
             sell_execs = [{"price": vwap_sell, "volume": volume, "fee": 0.0, "exchange_name": sell_exchange, "side": "sell"}]
             logger.info(f"[SIM] Result: filled={volume:.4f} | buy_vwap={vwap_buy:.2f} | sell_vwap={vwap_sell:.2f} | net_profit={net_profit:.2f} {quote_currency}")
+            # If opportunity exists, update it (simulation = executed)
+            if opportunity:
+                opportunity.status = "executed"
+                opportunity.price_a = vwap_buy
+                opportunity.price_b = vwap_sell
+                opportunity.traded_volume = volume
+                opportunity.profit_quote = float(net_profit)
+                opportunity.profit_percent = (float(net_profit) / (volume * vwap_buy)) * 100 if volume > 0 else 0
             return True, volume, vwap_buy, vwap_sell, base_delta_buy, base_delta_sell, quote_delta_buy, quote_delta_sell, float(net_profit), buy_execs, sell_execs
 
         # --- Live mode ---
@@ -133,7 +142,7 @@ class TradeExecutor:
         # ------------------------------------------------------------------
         # 2. Place orders (store numeric order_id for later status/cancel)
         # ------------------------------------------------------------------
-        buy_orders = []   # list of dicts with client_order_id, order_id, filled_vol, status, result
+        buy_orders = []
         sell_orders = []
         placed = {"buy": False, "sell": False}
 
@@ -152,7 +161,7 @@ class TradeExecutor:
             )
             buy_orders.append({
                 'client_order_id': buy_cid,
-                'order_id': buy_result.order_id,          # numeric order ID (as string)
+                'order_id': buy_result.order_id,
                 'filled_vol': buy_result.filled_volume,
                 'status': buy_result.status,
                 'result': buy_result
@@ -174,7 +183,7 @@ class TradeExecutor:
             )
             sell_orders.append({
                 'client_order_id': sell_cid,
-                'order_id': sell_result.order_id,         # numeric order ID (as string)
+                'order_id': sell_result.order_id,
                 'filled_vol': sell_result.filled_volume,
                 'status': sell_result.status,
                 'result': sell_result
@@ -201,9 +210,9 @@ class TradeExecutor:
         # 3. Poll order status (using numeric order_id)
         # ------------------------------------------------------------------
         POLL_INTERVAL = 0.5
-        MAX_DURATION = 300          # seconds
-        MIN_FILL_THRESHOLD = 0.01   # 1%
-        MAX_CONSECUTIVE_ERRORS = 10 # break after this many consecutive errors
+        MAX_DURATION = 300
+        MIN_FILL_THRESHOLD = 0.01
+        MAX_CONSECUTIVE_ERRORS = 10
 
         start_time = asyncio.get_event_loop().time()
         last_log_time = start_time
@@ -214,13 +223,11 @@ class TradeExecutor:
             iteration += 1
             now = asyncio.get_event_loop().time()
 
-            # Update status of all orders
             any_error = False
             for order in buy_orders + sell_orders:
                 if order['status'] not in ('filled', 'cancelled', 'failed'):
                     try:
                         client = buy_client if order in buy_orders else sell_client
-                        # Use the numeric order_id for status checks (fix for Bitpin)
                         status = await client.order_status(order['order_id'])
                         old_filled = order['filled_vol']
                         new_filled = status.filled_volume
@@ -238,7 +245,6 @@ class TradeExecutor:
             else:
                 consecutive_errors = 0
 
-            # If too many errors, break and use balance fallback
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 logger.warning(f"[LIVE] Too many consecutive errors ({consecutive_errors}), switching to balance fallback.")
                 break
@@ -250,7 +256,6 @@ class TradeExecutor:
                 logger.info(f"[LIVE] Poll #{iteration} | elapsed={now-start_time:.1f}s | buy={total_buy_filled:.4f}/{volume:.4f} | sell={total_sell_filled:.4f}/{volume:.4f}")
                 last_log_time = now
 
-            # Check if both sides are sufficiently filled (based on status)
             if total_buy_filled >= volume * (1 - MIN_FILL_THRESHOLD) and total_sell_filled >= volume * (1 - MIN_FILL_THRESHOLD):
                 filled_vol = min(total_buy_filled, total_sell_filled)
                 filled_vol = round(filled_vol, 2)
@@ -265,7 +270,16 @@ class TradeExecutor:
                 sell_execs = self._extract_executions(sell_orders, sell_exchange, "sell")
 
                 logger.info(f"[LIVE] ✅ Full fill achieved (status) | filled={filled_vol:.4f} | buy_vwap={buy_vwap:.2f} | sell_vwap={sell_vwap:.2f} | net_profit={net_profit:.2f} {quote_currency}")
-                # Sync balances and return
+
+                # UPDATE OPPORTUNITY
+                if opportunity:
+                    opportunity.status = "executed"
+                    opportunity.price_a = buy_vwap
+                    opportunity.price_b = sell_vwap
+                    opportunity.traded_volume = filled_vol
+                    opportunity.profit_quote = net_profit
+                    opportunity.profit_percent = (net_profit / (filled_vol * buy_vwap)) * 100 if filled_vol > 0 else 0
+
                 try:
                     await BalanceSyncService.sync_exchange_balance(db, buy_exchange)
                     await BalanceSyncService.sync_exchange_balance(db, sell_exchange)
@@ -281,11 +295,9 @@ class TradeExecutor:
         elapsed = asyncio.get_event_loop().time() - start_time
         logger.warning(f"[LIVE] ⏰ Ended polling after {elapsed:.1f}s. Will use balance fallback to detect fills.")
 
-        # Cancel any still‑open orders (use order_id)
         await self._cancel_orders(buy_orders, buy_client, "buy")
         await self._cancel_orders(sell_orders, sell_client, "sell")
 
-        # Sync balances now
         try:
             logger.info("[LIVE] Syncing balances after poll timeout/error")
             await BalanceSyncService.sync_exchange_balance(db, buy_exchange)
@@ -293,7 +305,6 @@ class TradeExecutor:
         except Exception as e:
             logger.error(f"[SYNC] Failed to sync after fallback: {e}")
 
-        # Read new balances
         post_base_buy = await get_base_balance(db, buy_exchange, common_symbol)
         post_base_sell = await get_base_balance(db, sell_exchange, common_symbol)
         post_quote_buy = await get_quote_balance(db, buy_exchange, quote_currency)
@@ -302,7 +313,6 @@ class TradeExecutor:
         logger.info(f"[LIVE] Post‑balances: {buy_exchange} base={post_base_buy:.4f}, quote={post_quote_buy:.2f} | "
                     f"{sell_exchange} base={post_base_sell:.4f}, quote={post_quote_sell:.2f}")
 
-        # Compute actual changes
         base_delta_buy = post_base_buy - pre_base_buy
         base_delta_sell = post_base_sell - pre_base_sell
         quote_delta_buy = post_quote_buy - pre_quote_buy
@@ -325,19 +335,27 @@ class TradeExecutor:
             buy_execs = [{"price": buy_vwap, "volume": filled_vol, "fee": 0.0, "exchange_name": buy_exchange, "side": "buy"}]
             sell_execs = [{"price": sell_vwap, "volume": filled_vol, "fee": 0.0, "exchange_name": sell_exchange, "side": "sell"}]
 
+            if opportunity:
+                opportunity.status = "executed"
+                opportunity.price_a = buy_vwap
+                opportunity.price_b = sell_vwap
+                opportunity.traded_volume = filled_vol
+                opportunity.profit_quote = net_profit
+                opportunity.profit_percent = (net_profit / (filled_vol * buy_vwap)) * 100 if filled_vol > 0 else 0
+
             logger.info(f"[LIVE] ✅ Trade detected via balance fallback | filled={filled_vol:.4f} | buy_vwap={buy_vwap:.2f} | sell_vwap={sell_vwap:.2f} | net_profit={net_profit:.2f} {quote_currency}")
             return True, filled_vol, buy_vwap, sell_vwap, 0.0, 0.0, 0.0, 0.0, net_profit, buy_execs, sell_execs
         else:
             logger.info("[LIVE] ❌ No fill detected via balance fallback.")
             return False, 0, 0, 0, 0, 0, 0, 0, 0, [], []
 
-    # ---------- Helper methods (use order_id for cancellation) ----------
+    # ---------- Helper methods ----------
     async def _cancel_orders(self, orders: List[Dict], client, side_label: str):
         for order in orders:
             if order['status'] not in ('filled', 'cancelled', 'failed'):
                 try:
                     logger.info(f"[LIVE] Attempting to cancel {side_label} order cid={order['client_order_id']} order_id={order['order_id']}")
-                    await client.cancel_order(order['order_id'])  # Use numeric order_id
+                    await client.cancel_order(order['order_id'])
                     order['status'] = 'cancelled'
                     logger.info(f"[LIVE] Cancelled {side_label} order: cid={order['client_order_id']} (order_id={order['order_id']})")
                 except Exception as e:

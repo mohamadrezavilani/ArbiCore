@@ -67,7 +67,6 @@
     @media (max-width: 1200px) { .layout { grid-template-columns: 1fr; } }
     .execution-badge-buy { background: #22c55e20; color: #4ade80; border: 1px solid #22c55e40; padding: 2px 8px; border-radius: 12px; font-size: 11px; }
     .execution-badge-sell { background: #ef444420; color: #f87171; border: 1px solid #ef444440; padding: 2px 8px; border-radius: 12px; font-size: 11px; }
-    /* New styles for rebalance status */
     .rb-status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 8px; }
     .rb-status-item { background: #09090b; border-radius: 12px; padding: 14px; border: 1px solid #27272a; }
     .rb-status-item .label { color: #71717a; font-size: 11px; margin-bottom: 4px; }
@@ -107,7 +106,7 @@
 </div>
 
 <div class="container">
-  <!-- Stats row: 4 cards -->
+  <!-- Stats row: 5 cards now -->
   <div class="stats-row">
     <div class="card">
       <div class="card-label">📈 Arbitrage Profit (24h)</div>
@@ -125,20 +124,16 @@
       <div class="card-label">📊 Total Net Profit (All Time)</div>
       <div id="total-net-profit" class="card-value purple">0 TMN</div>
     </div>
+    <div class="card">
+      <div class="card-label">🚀 Potential Profit (24h)</div>
+      <div id="potential-profit" class="card-value yellow">0 TMN</div>
+    </div>
   </div>
 
   <!-- Rebalancing Status Panel -->
   <div id="rebalance-status" style="margin-bottom: 24px;"></div>
 
   <div id="api-status" style="margin-bottom: 20px;"></div>
-
-  <!-- Last Activity Panel -->
-  <div id="last-activity-container" class="last-activity">
-    <div style="text-align: center; padding: 20px;">
-      <div style="color: #a1a1aa; font-size: 14px;">Loading latest activity...</div>
-      <div style="color: #4ade80; font-size: 12px; margin-top: 12px;">●</div>
-    </div>
-  </div>
 
   <div class="layout">
     <!-- Liquidity Pools -->
@@ -162,7 +157,7 @@
         <div style="overflow-x: auto; max-height: 250px; overflow-y: auto;">
           <table style="min-width: 500px;">
             <thead>
-              <tr><th>Symbol</th><th>Exchange A</th><th>Exchange B</th><th>Profit %</th><th>Volume</th></tr>
+              <tr><th>Symbol</th><th>Exchange A</th><th>Exchange B</th><th>Profit %</th><th>Volume</th><th>Status</th></tr>
             </thead>
             <tbody id="opportunities-table"></tbody>
           </table>
@@ -179,21 +174,13 @@
 
       <div class="panel" style="margin-top:24px;">
         <div class="panel-title">
-          <span>📋 Actions Feed</span>
-          <span id="actions-count" style="font-size:12px; color:#71717a;"></span>
-        </div>
-        <div id="actions-feed" class="actions-feed" style="max-height: 200px;"></div>
-      </div>
-
-      <div class="panel" style="margin-top:24px;">
-        <div class="panel-title">
           <span>🔄 Rebalance Logs</span>
           <span id="rebalance-count" style="font-size:12px; color:#60a5fa;"></span>
         </div>
         <div id="rebalance-container" class="rebalance-feed" style="max-height: 200px;"></div>
       </div>
 
-      <!-- NEW: Executions Panel -->
+      <!-- Executions Panel -->
       <div class="panel" style="margin-top:24px;">
         <div class="panel-title">
           <span>📊 Order Executions (Fills)</span>
@@ -221,10 +208,8 @@ let lastApiError = null;
 let lastPoolsData = null;
 let lastOpportunitiesData = [];
 let lastRejectedData = [];
-let lastActionsData = [];
 let lastRebalanceData = [];
 let lastExecutionsData = [];
-let lastActivityId = null;
 
 function toToman(value) {
   if (value === null || value === undefined) return 0;
@@ -316,112 +301,43 @@ async function triggerRefresh() {
 async function loadProfitStats() {
   const opportunities = await apiFetch("/opportunities/?limit=1000000");
   let arbitrageProfit24h = 0;
-  let arbitrageProfitAll = 0;
+  let rebalancingCost24h = 0;
+  let netProfit24h = 0;
+  let totalNetProfit = 0;
+  let potentialProfit24h = 0;
   const now = new Date();
   const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
   if (opportunities) {
     opportunities.forEach(item => {
       const profitToman = toToman(item.profit_quote || 0);
-      arbitrageProfitAll += profitToman;
       const oppDate = new Date(item.created_at);
-      if (oppDate >= yesterday) arbitrageProfit24h += profitToman;
+      const isRecent = oppDate >= yesterday;
+
+      // For executed trades
+      if (item.status === 'executed') {
+        totalNetProfit += profitToman;
+        if (isRecent) {
+          if (item.trade_type && item.trade_type.startsWith('buy_on_')) {
+            arbitrageProfit24h += profitToman;
+          } else if (item.trade_type && item.trade_type.startsWith('rebalance_')) {
+            rebalancingCost24h += profitToman; // negative
+          }
+        }
+      } else if (item.status === 'detected' && isRecent) {
+        // Potential profit: only for detected (not executed) opportunities
+        potentialProfit24h += profitToman;
+      }
     });
   }
+
+  netProfit24h = arbitrageProfit24h + rebalancingCost24h;
+
   document.getElementById("arbitrage-profit").innerHTML = formatNumber(arbitrageProfit24h) + " TMN";
-
-  const rebalanceLogs = await apiFetch("/rebalance-logs/");
-  let rebalancingCost24h = 0;
-  let rebalancingCostAll = 0;
-  if (rebalanceLogs) {
-    rebalanceLogs.forEach(log => {
-      const lossToman = toToman(log.profit_quote || 0);
-      rebalancingCostAll += lossToman;
-      const logDate = new Date(log.created_at);
-      if (logDate >= yesterday) rebalancingCost24h += lossToman;
-    });
-  }
   document.getElementById("rebalancing-cost").innerHTML = formatNumber(-rebalancingCost24h) + " TMN";
-  const netProfit24h = arbitrageProfit24h + rebalancingCost24h;
   document.getElementById("net-profit").innerHTML = formatNumber(netProfit24h) + " TMN";
-  const totalNet = arbitrageProfitAll + rebalancingCostAll;
-  document.getElementById("total-net-profit").innerHTML = formatNumber(totalNet) + " TMN";
-}
-
-// ===== Last Activity =====
-async function loadLastActivity() {
-  const [opportunities, rejections] = await Promise.all([
-    apiFetch("/opportunities/?limit=1"),
-    apiFetch("/actions/?limit=1&action_type=rejection")
-  ]);
-  const container = document.getElementById("last-activity-container");
-  let latestEvent = null, eventType = null;
-  const oppTime = opportunities && opportunities[0] ? new Date(opportunities[0].created_at).getTime() : 0;
-  const rejTime = rejections && rejections[0] ? new Date(rejections[0].timestamp).getTime() : 0;
-  if (oppTime > 0 && oppTime >= rejTime) { latestEvent = opportunities[0]; eventType = 'opportunity'; }
-  else if (rejTime > 0) { latestEvent = rejections[0]; eventType = 'rejection'; }
-  const hasNew = lastActivityId ? (latestEvent?.id !== lastActivityId) : false;
-  if (latestEvent) lastActivityId = latestEvent.id;
-  if (!latestEvent) {
-    container.className = "last-activity";
-    container.innerHTML = `<div style="text-align: center; padding: 20px;"><div style="color: #a1a1aa; font-size: 14px;">No activity yet</div><div style="color: #facc15; font-size: 12px; margin-top: 12px;">Waiting for events...</div></div>`;
-    return;
-  }
-  container.className = "last-activity";
-  if (hasNew) { container.classList.add("activity-new"); setTimeout(() => container.classList.remove("activity-new"), 400); }
-  if (eventType === 'opportunity') {
-    const opp = latestEvent;
-    const profitPercent = parseFloat(opp.profit_percent) || 0;
-    const profitAmount = toToman(opp.profit_quote) || 0;
-    const buyPrice = toToman(opp.price_a) || 0;
-    const sellPrice = toToman(opp.price_b) || 0;
-    const buyExchange = opp.exchange_a_name || 'Unknown';
-    const sellExchange = opp.exchange_b_name || 'Unknown';
-    const symbol = opp.common_symbol || 'Unknown';
-    const volume = opp.traded_volume || 0;
-    const isProfitable = profitPercent > 0;
-    container.classList.add(isProfitable ? 'profitable' : 'unprofitable');
-    container.innerHTML = `
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
-        <div><span class="activity-badge ${isProfitable ? 'badge-profitable' : 'badge-unprofitable'}">${isProfitable ? '✅ PROFITABLE OPPORTUNITY' : '⚠️ UNPROFITABLE OPPORTUNITY'}</span><span style="margin-left: 12px; font-size: 18px; font-weight: bold;">${symbol}</span></div>
-        <div style="color: #71717a; font-size: 12px;">${toLocalTime(opp.created_at)}</div>
-      </div>
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
-        <div class="price-card" style="border-left: 3px solid #f87171;"><div style="color: #f87171; font-size: 12px; margin-bottom: 8px;">🟢 BUY EXCHANGE</div><div style="font-size: 20px; font-weight: bold;">${buyExchange}</div><div style="color: #71717a; font-size: 11px; margin-top: 8px;">Price</div><div class="red" style="font-size: 22px; font-weight: bold;">${formatNumber(buyPrice)} TMN</div></div>
-        <div class="price-card" style="border-left: 3px solid #4ade80;"><div style="color: #4ade80; font-size: 12px; margin-bottom: 8px;">🔴 SELL EXCHANGE</div><div style="font-size: 20px; font-weight: bold;">${sellExchange}</div><div style="color: #71717a; font-size: 11px; margin-top: 8px;">Price</div><div class="green" style="font-size: 22px; font-weight: bold;">${formatNumber(sellPrice)} TMN</div></div>
-      </div>
-      <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 16px;">
-        <div style="text-align: center; padding: 12px; background: #09090b; border-radius: 12px;"><div style="color: #71717a; font-size: 11px;">Trade Direction</div><div class="${isProfitable ? 'green' : 'red'} mono" style="font-size: 12px; font-weight: bold;">Buy ${buyExchange} → Sell ${sellExchange}</div></div>
-        <div style="text-align: center; padding: 12px; background: #09090b; border-radius: 12px;"><div style="color: #71717a; font-size: 11px;">Profit / Loss</div><div class="${isProfitable ? 'green' : 'red'}" style="font-size: 20px; font-weight: bold;">${isProfitable ? '+' : ''}${formatNumber(profitPercent, 2)}%</div><div class="${isProfitable ? 'green' : 'red'} mono" style="font-size: 12px;">${isProfitable ? '+' : ''}${formatNumber(profitAmount)} TMN</div></div>
-        <div style="text-align: center; padding: 12px; background: #09090b; border-radius: 12px;"><div style="color: #71717a; font-size: 11px;">Spread</div><div class="${sellPrice > buyPrice ? 'green' : 'red'} mono" style="font-size: 16px; font-weight: bold;">${formatNumber(Math.abs(sellPrice - buyPrice))} TMN</div></div>
-      </div>
-      <div style="display: flex; justify-content: space-between; gap: 16px; padding-top: 12px; border-top: 1px solid #27272a;"><div><span style="color: #71717a; font-size: 11px;">Volume</span><div class="mono" style="font-size: 13px;">${formatCompactNumber(volume)}</div></div><div><span style="color: #71717a; font-size: 11px;">Status</span><div class="${isProfitable ? 'green' : 'red'}" style="font-size: 13px; font-weight: bold;">${isProfitable ? 'EXECUTABLE ✓' : 'NOT EXECUTABLE ✗'}</div></div></div>
-    `;
-  } else {
-    const rej = latestEvent;
-    const details = rej.details || {};
-    const tradeType = details.trade_type || '';
-    const exchangeA = details.exchange_a || '';
-    const exchangeB = details.exchange_b || '';
-    const symbol = details.common_symbol || 'Unknown';
-    const rejectionReason = details.rejection_reason || rej.action_type || 'Unknown reason';
-    let tradeDirection = '';
-    if (tradeType.includes('buy_on_') && tradeType.includes('sell_on_')) {
-      const buyExchange = tradeType.split('buy_on_')[1]?.split('_sell')[0] || '';
-      const sellExchange = tradeType.split('sell_on_')[1] || '';
-      tradeDirection = `Buy ${buyExchange} → Sell ${sellExchange}`;
-    } else { tradeDirection = tradeType || 'Unknown'; }
-    let buyPrice = null, sellPrice = null;
-    const priceMatch = rejectionReason.match(/buy\s+([\d.]+)\s+vs\s+sell\s+([\d.]+)/i);
-    if (priceMatch) { buyPrice = toToman(parseFloat(priceMatch[1])); sellPrice = toToman(parseFloat(priceMatch[2])); }
-    container.classList.add('rejected');
-    container.innerHTML = `
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;"><div><span class="activity-badge badge-rejected">❌ REJECTED OPPORTUNITY</span><span style="margin-left: 12px; font-size: 18px; font-weight: bold;">${symbol}</span></div><div style="color: #71717a; font-size: 12px;">${toLocalTime(rej.timestamp)}</div></div>
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;"><div class="price-card" style="border-left: 3px solid #f87171;"><div style="color: #f87171; font-size: 12px; margin-bottom: 8px;">🟢 POTENTIAL BUY</div><div style="font-size: 18px; font-weight: bold;">${exchangeA}</div>${buyPrice !== null ? `<div style="color: #71717a; font-size: 11px; margin-top: 8px;">Price</div><div class="red" style="font-size: 20px; font-weight: bold;">${formatNumber(buyPrice)} TMN</div>` : ''}</div><div class="price-card" style="border-left: 3px solid #4ade80;"><div style="color: #4ade80; font-size: 12px; margin-bottom: 8px;">🔴 POTENTIAL SELL</div><div style="font-size: 18px; font-weight: bold;">${exchangeB}</div>${sellPrice !== null ? `<div style="color: #71717a; font-size: 11px; margin-top: 8px;">Price</div><div class="green" style="font-size: 20px; font-weight: bold;">${formatNumber(sellPrice)} TMN</div>` : ''}</div></div>
-      <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-bottom: 16px;"><div style="text-align: center; padding: 12px; background: #09090b; border-radius: 12px;"><div style="color: #71717a; font-size: 11px;">Proposed Trade</div><div class="yellow mono" style="font-size: 12px; font-weight: bold;">${tradeDirection}</div></div>${buyPrice !== null && sellPrice !== null ? `<div style="text-align: center; padding: 12px; background: #09090b; border-radius: 12px;"><div style="color: #71717a; font-size: 11px;">Potential Loss</div><div class="red" style="font-size: 16px; font-weight: bold;">${formatNumber(Math.abs(buyPrice - sellPrice))} TMN</div><div class="red mono" style="font-size: 11px;">(${formatNumber(((buyPrice - sellPrice) / buyPrice) * 100, 2)}%)</div></div>` : ''}</div>
-      <div style="background:#7f1d1d20; border-left: 3px solid #facc15; padding: 12px; border-radius: 8px; margin-top: 8px;"><div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;"><span>⚠️</span><span style="font-weight:bold; font-size:12px;">Rejection Reason</span></div><div style="font-size: 13px;">${rejectionReason}</div></div>
-    `;
-  }
+  document.getElementById("total-net-profit").innerHTML = formatNumber(totalNetProfit) + " TMN";
+  document.getElementById("potential-profit").innerHTML = formatNumber(potentialProfit24h) + " TMN";
 }
 
 // ===== Detailed Rebalancing Status =====
@@ -458,7 +374,6 @@ async function loadRebalanceStatus() {
     if (snapshots) {
       snapshots.forEach(s => {
         if (s.common_symbol === "USDTIRT") {
-          // Keep only the most recent per exchange
           if (!snapMap[s.exchange_name] || new Date(s.created_at) > new Date(snapMap[s.exchange_name].created_at)) {
             snapMap[s.exchange_name] = s;
           }
@@ -471,10 +386,9 @@ async function loadRebalanceStatus() {
 
     const baseSellPrice = wallexSnap ? wallexSnap.best_bid_price : null;
     const baseBuyPrice = bitpinSnap ? bitpinSnap.best_ask_price : null;
-    const quoteSellPrice = bitpinSnap ? bitpinSnap.best_bid_price : null; // for quote rebalance, we sell on Bitpin
-    const quoteBuyPrice = wallexSnap ? wallexSnap.best_ask_price : null;   // buy on Wallex
+    const quoteSellPrice = bitpinSnap ? bitpinSnap.best_bid_price : null;
+    const quoteBuyPrice = wallexSnap ? wallexSnap.best_ask_price : null;
 
-    // Compute spreads
     let baseSpread = null;
     if (baseSellPrice && baseBuyPrice && baseSellPrice > 0) {
       baseSpread = (baseBuyPrice - baseSellPrice) / baseSellPrice * 100;
@@ -484,16 +398,15 @@ async function loadRebalanceStatus() {
       quoteSpread = (quoteBuyPrice - quoteSellPrice) / quoteSellPrice * 100;
     }
 
-    const maxSpread = 0.2; // from settings, could also read from settings object
+    const maxSpread = 0.2;
 
-    // Build HTML
     let html = '<div class="card" style="padding: 16px 20px;">';
     html += '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">';
     html += '<div style="font-weight: bold; font-size: 18px;">🔄 Rebalancing Status</div>';
     html += `<div style="font-size: 12px; color: #71717a;">Last updated: ${new Date().toLocaleTimeString()}</div>`;
     html += '</div>';
 
-    // ---- Base Rebalance (USDT) ----
+    // Base rebalance
     const basePending = settings?.rebalance_pending ? '🔴 Pending' : '✅ Not pending';
     const baseLastTime = settings?.last_rebalance_check_time ? new Date(settings.last_rebalance_check_time).toLocaleTimeString() : 'Never';
     html += '<div class="rb-status-item" style="margin-bottom: 12px; border-left: 4px solid #60a5fa;">';
@@ -501,14 +414,10 @@ async function loadRebalanceStatus() {
     html += '<span style="font-weight: bold; color: #60a5fa;">Base (USDT)</span>';
     html += `<span style="font-size: 12px; color: #71717a;">Last check: ${baseLastTime} | ${basePending}</span>`;
     html += '</div>';
-
-    // Balances
     html += '<div class="rb-balance-row">';
     html += `<div class="rb-balance">🏦 Wallex: <span class="green">${formatNumber(baseBalances['wallex'] || 0, 4)}</span></div>`;
     html += `<div class="rb-balance">🏦 Bitpin: <span class="green">${formatNumber(baseBalances['bitpin'] || 0, 4)}</span></div>`;
     html += '</div>';
-
-    // Prices & spread
     if (baseSellPrice && baseBuyPrice) {
       html += `<div style="margin-top: 6px; font-size: 12px; color: #a1a1aa;">`;
       html += `Sell @ Wallex bid: <span class="yellow">${formatNumber(baseSellPrice)}</span> | `;
@@ -525,8 +434,6 @@ async function loadRebalanceStatus() {
     } else {
       html += '<div style="margin-top: 6px; font-size: 12px; color: #71717a;">No orderbook data available</div>';
     }
-
-    // Reason
     if (settings?.last_rebalance_reason) {
       let reasonColor = '#a1a1aa';
       if (settings.last_rebalance_reason.includes('Spread')) reasonColor = '#facc15';
@@ -538,7 +445,7 @@ async function loadRebalanceStatus() {
     }
     html += '</div>';
 
-    // ---- Quote Rebalance (IRT) ----
+    // Quote rebalance
     const quotePending = settings?.quote_rebalance_pending ? '🔴 Pending' : '✅ Not pending';
     const quoteLastTime = settings?.last_quote_rebalance_check_time ? new Date(settings.last_quote_rebalance_check_time).toLocaleTimeString() : 'Never';
     html += '<div class="rb-status-item" style="border-left: 4px solid #a78bfa;">';
@@ -546,14 +453,10 @@ async function loadRebalanceStatus() {
     html += '<span style="font-weight: bold; color: #a78bfa;">Quote (IRT)</span>';
     html += `<span style="font-size: 12px; color: #71717a;">Last check: ${quoteLastTime} | ${quotePending}</span>`;
     html += '</div>';
-
-    // Balances
     html += '<div class="rb-balance-row">';
     html += `<div class="rb-balance">🏦 Wallex: <span class="green">${formatNumber(quoteBalances['wallex'] || 0, 0)}</span></div>`;
     html += `<div class="rb-balance">🏦 Bitpin: <span class="green">${formatNumber(quoteBalances['bitpin'] || 0, 0)}</span></div>`;
     html += '</div>';
-
-    // Prices & spread (for quote rebalance: sell on Bitpin (bid), buy on Wallex (ask))
     if (quoteSellPrice && quoteBuyPrice) {
       html += `<div style="margin-top: 6px; font-size: 12px; color: #a1a1aa;">`;
       html += `Sell @ Bitpin bid: <span class="yellow">${formatNumber(quoteSellPrice)}</span> | `;
@@ -570,8 +473,6 @@ async function loadRebalanceStatus() {
     } else {
       html += '<div style="margin-top: 6px; font-size: 12px; color: #71717a;">No orderbook data available</div>';
     }
-
-    // Reason
     if (settings?.last_quote_rebalance_reason) {
       let reasonColor = '#a1a1aa';
       if (settings.last_quote_rebalance_reason.includes('Spread')) reasonColor = '#facc15';
@@ -599,14 +500,16 @@ async function loadOpportunities() {
   table.innerHTML = "";
   if (!data || data.length === 0) {
     const row = document.createElement("tr");
-    row.innerHTML = '<td colspan="5" style="text-align:center; color:#a1a1aa; padding:30px;">No opportunities found</td>';
+    row.innerHTML = '<td colspan="6" style="text-align:center; color:#a1a1aa; padding:30px;">No opportunities found</td>';
     table.appendChild(row);
     return;
   }
   data.slice(0, 15).forEach((item, index) => {
     const row = document.createElement("tr");
     const profitPercent = parseFloat(item.profit_percent) || 0;
-    row.innerHTML = `<td><b>${item.common_symbol || '-'}</b></td><td><span class="exchange-badge">${item.exchange_a_name || '-'}</span></td><td><span class="exchange-badge">${item.exchange_b_name || '-'}</span></td><td class="${profitPercent > 1 ? 'green' : 'yellow'} mono"><b>${formatNumber(profitPercent, 2)}%</b></td><td class="mono">${formatCompactNumber(item.traded_volume)}</td>`;
+    const status = item.status || 'detected';
+    const statusColor = status === 'executed' ? 'green' : 'yellow';
+    row.innerHTML = `<td><b>${item.common_symbol || '-'}</b></td><td><span class="exchange-badge">${item.exchange_a_name || '-'}</span></td><td><span class="exchange-badge">${item.exchange_b_name || '-'}</span></td><td class="${profitPercent > 1 ? 'green' : 'yellow'} mono"><b>${formatNumber(profitPercent, 2)}%</b></td><td class="mono">${formatCompactNumber(item.traded_volume)}</td><td class="${statusColor}">${status}</td>`;
     if (hasNew && index < 3) row.style.animation = "fadeIn 0.3s ease-out";
     table.appendChild(row);
   });
@@ -691,25 +594,6 @@ async function loadPools() {
   }
 }
 
-// ===== Actions =====
-async function loadActions() {
-  const data = await apiFetch("/actions/?limit=15&action_type=trade");
-  const container = document.getElementById("actions-feed");
-  const actionsCountSpan = document.getElementById("actions-count");
-  const hasNew = JSON.stringify(lastActionsData) !== JSON.stringify(data);
-  lastActionsData = data;
-  container.innerHTML = "";
-  if (!data || data.length === 0) { container.innerHTML = '<div style="color:#a1a1aa; text-align:center; padding:20px;">No recent trades</div>'; actionsCountSpan.innerText = ""; return; }
-  actionsCountSpan.innerHTML = `(${data.length} trades) ${hasNew ? '🆕' : ''}`;
-  data.slice(0, 8).forEach((action, index) => {
-    const item = document.createElement("div");
-    item.className = "action-item";
-    if (hasNew && index === 0) item.style.animation = "fadeIn 0.3s ease-out";
-    item.innerHTML = `<div style="display:flex; justify-content:space-between; margin-bottom:6px;"><div class="green" style="font-weight:bold; font-size:12px;">💰 TRADE</div><div style="color:#71717a; font-size:10px;">${toLocalTime(action.timestamp)}</div></div><pre style="overflow:auto; font-size:9px; white-space:pre-wrap; word-break:break-word; color:#a1a1aa; max-height:60px;">${JSON.stringify(action.details, null, 2).substring(0, 200)}${JSON.stringify(action.details, null, 2).length > 200 ? '...' : ''}</pre>`;
-    container.appendChild(item);
-  });
-}
-
 // ===== Rebalance Logs =====
 async function loadRebalanceLogs() {
   const data = await apiFetch("/rebalance-logs/");
@@ -744,7 +628,7 @@ async function loadRebalanceLogs() {
   });
 }
 
-// ===== NEW: Executions =====
+// ===== Executions =====
 async function loadExecutions() {
   const data = await apiFetch("/executions/?limit=30");
   const container = document.getElementById("executions-container");
@@ -758,7 +642,6 @@ async function loadExecutions() {
     return;
   }
   countSpan.innerHTML = `(${data.length} fills) ${hasNew ? '🆕' : ''}`;
-  // Build a table
   const table = document.createElement("table");
   table.style.width = "100%";
   table.style.fontSize = "12px";
@@ -800,12 +683,10 @@ async function loadAll() {
   setLastUpdate();
   await Promise.allSettled([
     loadProfitStats(),
-    loadLastActivity(),
     loadRebalanceStatus(),
     loadOpportunities(),
     loadRejectedOpportunities(),
     loadPools(),
-    loadActions(),
     loadRebalanceLogs(),
     loadExecutions()
   ]);

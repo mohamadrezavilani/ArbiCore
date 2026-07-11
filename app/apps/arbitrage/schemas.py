@@ -48,6 +48,8 @@ class ArbitrageOpportunityResponse(BaseModel):
     traded_volume: float
     profit_quote: float
     created_at: datetime
+    status: Optional[str] = "detected"          # NEW
+    rejection_reason: Optional[str] = None      # NEW
 
 class OpportunitySummaryItem(BaseModel):
     common_symbol: str

@@ -63,6 +63,8 @@ class ArbitrageOpportunity(Base, UUIDMixin, TimestampMixin):
     profit_percent: Mapped[float] = mapped_column(Numeric(10, 4))
     traded_volume: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
     profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
+    status: Mapped[str] = mapped_column(String(20), default="detected")  # detected, executed
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     executions: Mapped[list["OrderExecution"]] = relationship(back_populates="opportunity", cascade="all, delete-orphan")
 
 
