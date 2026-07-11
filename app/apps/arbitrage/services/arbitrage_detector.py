@@ -15,6 +15,7 @@ from .trade_executor import TradeExecutor
 from .rebalancer import Rebalancer
 from .pair_weight import get_pair_weight
 from .balance_sync import BalanceSyncService
+from app.apps.arbitrage.inventory import get_base_balance, get_quote_balance
 
 logger = logging.getLogger(__name__)
 
@@ -336,16 +337,19 @@ class ArbitrageDetector:
                 )
 
             if success:
-                if not is_live:
-                    base_deltas[buy_exch] += b_delta_buy
-                    base_deltas[sell_exch] += b_delta_sell
-                    quote_deltas[buy_exch] += q_delta_buy
-                    quote_deltas[sell_exch] += q_delta_sell
-
-                avail_quote[buy_exch] = max(0.0, avail_quote[buy_exch] + q_delta_buy)
-                avail_base[buy_exch] = max(0.0, avail_base[buy_exch] + b_delta_buy)
-                avail_quote[sell_exch] = max(0.0, avail_quote[sell_exch] + q_delta_sell)
-                avail_base[sell_exch] = max(0.0, avail_base[sell_exch] + b_delta_sell)
+                # ----- FIX: Refresh in-memory balances after a live trade -----
+                if is_live:
+                    # Re-fetch balances from DB (which were just synced by TradeExecutor)
+                    avail_quote[buy_exch] = await get_quote_balance(db, buy_exch, quote_currency)
+                    avail_quote[sell_exch] = await get_quote_balance(db, sell_exch, quote_currency)
+                    avail_base[buy_exch] = await get_base_balance(db, buy_exch, common_symbol)
+                    avail_base[sell_exch] = await get_base_balance(db, sell_exch, common_symbol)
+                else:
+                    # For simulation, use the deltas returned
+                    avail_quote[buy_exch] = max(0.0, avail_quote[buy_exch] + q_delta_buy)
+                    avail_base[buy_exch] = max(0.0, avail_base[buy_exch] + b_delta_buy)
+                    avail_quote[sell_exch] = max(0.0, avail_quote[sell_exch] + q_delta_sell)
+                    avail_base[sell_exch] = max(0.0, avail_base[sell_exch] + b_delta_sell)
 
                 # --- CREATE AND COMMIT OPPORTUNITY ---
                 opp = ArbitrageOpportunity(
