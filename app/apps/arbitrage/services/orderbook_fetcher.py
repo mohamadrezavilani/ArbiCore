@@ -5,16 +5,43 @@ from typing import Dict, List, Tuple, Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+
 from app.apps.arbitrage.models import Exchange, ExchangeSymbol, OrderbookSnapshot
 from app.exchanges.factory import get_exchange_client
+from app.utils.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
 # Track which exchange/keys have already been warned about missing timestamps
 _warned_keys = set()
 
+
 class OrderbookFetcher:
+    # Per-exchange rate limiters
+    _rate_limiters: Dict[str, RateLimiter] = {}
+    _lock = asyncio.Lock()
+
+    @classmethod
+    async def _get_limiter(cls, exchange_name: str) -> RateLimiter:
+        """
+        Get or create a rate limiter for the given exchange.
+        Bitpin: 60 requests per minute → 1 request per second.
+        Others: 5 requests per second (adjustable).
+        """
+        async with cls._lock:
+            if exchange_name not in cls._rate_limiters:
+                if exchange_name == "bitpin":
+                    min_interval = 1.0   # 1 second → 60/min
+                else:
+                    min_interval = 0.2   # 5 requests per second
+                cls._rate_limiters[exchange_name] = RateLimiter(min_interval)
+            return cls._rate_limiters[exchange_name]
+
     async def fetch_all(self, db: AsyncSession, timeout_per_exchange: float = 10.0) -> Dict[str, Tuple[Dict[str, Tuple[List[List[float]], List[List[float]]]], float]]:
+        """
+        Fetch orderbooks for all active symbols on all active exchanges.
+        Returns a dict mapping common_symbol -> (exchange_orderbooks, max_timestamp).
+        """
         stmt = (
             select(ExchangeSymbol)
             .where(ExchangeSymbol.is_active == True)
@@ -24,25 +51,32 @@ class OrderbookFetcher:
         )
         result = await db.execute(stmt)
         symbols = result.scalars().all()
+
         if not symbols:
             logger.warning("No active exchange symbols found.")
             return {}
 
+        logger.info(f"Fetching orderbooks for {len(symbols)} active symbols")
+
+        # Group by common_symbol
         symbol_group: Dict[str, List[ExchangeSymbol]] = {}
         for sym in symbols:
             symbol_group.setdefault(sym.common_symbol, []).append(sym)
 
+        # Create clients for each exchange
         clients = {}
         for ex_sym in symbols:
             ex_name = ex_sym.exchange.name
             if ex_name not in clients:
                 clients[ex_name] = get_exchange_client(ex_name)
 
+        # Fetch each symbol group in parallel
         tasks = []
         for common_symbol, ex_symbols in symbol_group.items():
             tasks.append(self._fetch_for_symbol(common_symbol, ex_symbols, clients, db, timeout_per_exchange))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
         final_data = {}
         for res in results:
             if isinstance(res, Exception):
@@ -62,9 +96,13 @@ class OrderbookFetcher:
         db: AsyncSession,
         timeout_per_exchange: float
     ) -> Tuple[str, Dict[str, Tuple[List[List[float]], List[List[float]]]], float]:
+        """
+        Fetch orderbooks for a single common symbol from all exchanges that have it.
+        """
         exchange_data = {}
         fetch_tasks = []
         max_timestamp = 0.0
+
         for ex_sym in exchange_symbols:
             ex_name = ex_sym.exchange.name
             client = clients.get(ex_name)
@@ -73,6 +111,7 @@ class OrderbookFetcher:
             fetch_tasks.append(self._fetch_one(ex_sym, client, timeout_per_exchange))
 
         results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
         for res in results:
             if isinstance(res, Exception):
                 logger.warning(f"Fetch error for {common_symbol}: {res}")
@@ -94,8 +133,8 @@ class OrderbookFetcher:
 
     async def _fetch_one(self, ex_sym: ExchangeSymbol, client, timeout: float):
         """
-        Fetch orderbook with retry logic (exponential backoff).
-        Returns (exchange_name, ask_levels, bid_levels, snapshot, timestamp) or None.
+        Fetch a single orderbook with retries.
+        Applies rate limiting before each attempt (including retries).
         """
         ex_name = ex_sym.exchange.name
         original_symbol = ex_sym.original_symbol
@@ -103,7 +142,13 @@ class OrderbookFetcher:
         max_retries = 3
         base_delay = 1.0
 
+        # Acquire the rate limiter for this exchange
+        limiter = await self._get_limiter(ex_name)
+
         for attempt in range(max_retries):
+            # Enforce rate limit before each attempt
+            await limiter.acquire()
+
             try:
                 raw_ob = await asyncio.wait_for(client.fetch_orderbook(original_symbol), timeout=timeout)
                 if not raw_ob:

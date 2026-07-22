@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import time
+
+from app.apps.arbitrage.services.orderbook_fetcher import OrderbookFetcher
 from app.core.database import AsyncSessionLocal
 from app.apps.arbitrage.services import ArbitrageService
 
@@ -79,3 +81,23 @@ async def periodic_arbitrage_poll():
         except Exception as e:
             logger.exception(f"Unhandled error in periodic_arbitrage_poll: {e}")
             await asyncio.sleep(UPDATE_INTERVAL_SECONDS)
+
+async def collect_all_snapshots():
+    """Periodically fetch orderbooks for all symbols and store snapshots."""
+    from app.apps.arbitrage.services.orderbook_fetcher import OrderbookFetcher
+    from app.core.database import AsyncSessionLocal
+    import asyncio
+    import traceback
+
+    while True:
+        try:
+            logger.info("[COLLECTOR] Starting fetch cycle")
+            async with AsyncSessionLocal() as db:
+                fetcher = OrderbookFetcher()
+                await fetcher.fetch_all(db)
+                await db.commit()
+                logger.info("[COLLECTOR] Commit successful")
+        except Exception as e:
+            logger.exception(f"[COLLECTOR] Error in fetch cycle: {e}\n{traceback.format_exc()}")
+        logger.info("[COLLECTOR] Cycle finished, sleeping...")
+        await asyncio.sleep(UPDATE_INTERVAL_SECONDS)

@@ -1,7 +1,8 @@
+from app.apps.arbitrage.services.analysis_service import AnalysisService
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
-from app.apps.arbitrage.services.analysis_service import AnalysisService
+from app.apps.arbitrage.services.symbol_ranking import SymbolRankingService
 
 router = APIRouter()
 
@@ -95,3 +96,31 @@ async def get_rebalancing_loss_analysis(
 ):
     data = await AnalysisService.get_rebalancing_loss_analysis(db, symbol, hours)
     return data
+
+@router.get("/rank-symbols")
+async def rank_symbols(
+    days: int = Query(3, ge=1, le=30, description="Number of days of historical data to analyze"),
+    min_profit_percent: float = Query(0.7, ge=0.1, le=10, description="Minimum profit % to count as opportunity"),
+    trade_notional_usdt: float = Query(100.0, ge=1, le=10000, description="Trade notional in USDT for simulation"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Rank symbols by arbitrage profitability based on historical orderbook snapshots."""
+    return await SymbolRankingService.rank_symbols(
+        db, days=days, min_profit_percent=min_profit_percent, trade_notional_usdt=trade_notional_usdt
+    )
+
+@router.post("/discover-symbols")
+async def discover_symbols(db: AsyncSession = Depends(get_db)):
+    from app.apps.arbitrage.services.symbol_discovery import discover_and_seed_symbols
+    await discover_and_seed_symbols(db)
+    return {"message": "Symbol discovery completed. Check logs for details."}
+
+@router.get("/rank-symbols")
+async def rank_symbols(
+    days: int = Query(3, ge=1, le=30, description="Number of days of historical data to analyze"),
+    min_profit_percent: float = Query(0.7, ge=0.1, le=10, description="Minimum profit % to count as opportunity"),
+    trade_notional_usdt: float = Query(100.0, ge=1, le=10000, description="Trade notional in USDT for simulation"),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.apps.arbitrage.services.symbol_ranking import SymbolRankingService
+    return await SymbolRankingService.rank_symbols(db, days, min_profit_percent, trade_notional_usdt)

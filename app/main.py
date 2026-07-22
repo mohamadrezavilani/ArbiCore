@@ -8,7 +8,7 @@ from app.core.handlers import register_exception_handlers
 from app.core.logging import setup_logging
 from app.apps.arbitrage.api import router as arbitrage_router
 from app.apps.arbitrage.api.analysis import router as analysis_router   # NEW
-from app.apps.arbitrage.tasks import periodic_arbitrage_poll
+from app.apps.arbitrage.tasks import periodic_arbitrage_poll, collect_all_snapshots
 from app.apps.arbitrage.seed_data import seed
 from fastapi.responses import HTMLResponse
 from app.apps.arbitrage.services.balance_sync import BalanceSyncService
@@ -36,12 +36,14 @@ async def lifespan(app: FastAPI):
 
     # Start background arbitrage polling
     poll_task = asyncio.create_task(periodic_arbitrage_poll())
-    print("🚀 Arbitrage polling started.")
+    collector_task = asyncio.create_task(collect_all_snapshots())
+    print("🚀 Arbitrage polling and snapshot collector started.")
 
     yield
 
     # Shutdown
     poll_task.cancel()
+    collector_task.cancel()
     await engine.dispose()
     print("🛑 Application shutdown.")
 
@@ -67,11 +69,11 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     # Include main arbitrage API router
-    app.include_router(
-        arbitrage_router,
-        prefix=f"{settings.API_V1_PREFIX}/arbitrage",
-        tags=["arbitrage"]
-    )
+    # app.include_router(
+    #     arbitrage_router,
+    #     prefix=f"{settings.API_V1_PREFIX}/arbitrage",
+    #     tags=["arbitrage"]
+    # )
 
     # Include analysis API router (under the same base path)
     app.include_router(
