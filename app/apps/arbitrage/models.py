@@ -43,10 +43,10 @@ class OrderbookSnapshot(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "orderbook_snapshots"
     exchange_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"), nullable=False)
     symbol_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchange_symbols.id"), nullable=False)
-    best_ask_price: Mapped[float] = mapped_column(Numeric(20, 10), nullable=True)
-    best_ask_volume: Mapped[float] = mapped_column(Numeric(20, 10), nullable=True)
-    best_bid_price: Mapped[float] = mapped_column(Numeric(20, 10), nullable=True)
-    best_bid_volume: Mapped[float] = mapped_column(Numeric(20, 10), nullable=True)
+    best_ask_price: Mapped[float] = mapped_column(Numeric(28, 10), nullable=True)
+    best_ask_volume: Mapped[float] = mapped_column(Numeric(28, 10), nullable=True)
+    best_bid_price: Mapped[float] = mapped_column(Numeric(28, 10), nullable=True)
+    best_bid_volume: Mapped[float] = mapped_column(Numeric(28, 10), nullable=True)
     asks: Mapped[list] = mapped_column(JSON, nullable=True)
     bids: Mapped[list] = mapped_column(JSON, nullable=True)
     raw_data: Mapped[dict] = mapped_column(JSON, nullable=True)
@@ -58,8 +58,8 @@ class ArbitrageOpportunity(Base, UUIDMixin, TimestampMixin):
     exchange_a_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"))
     exchange_b_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exchanges.id"))
     trade_type: Mapped[str] = mapped_column(String(50))
-    price_a: Mapped[float] = mapped_column(Numeric(20, 10))
-    price_b: Mapped[float] = mapped_column(Numeric(20, 10))
+    price_a: Mapped[float] = mapped_column(Numeric(28, 10))  # CHANGED
+    price_b: Mapped[float] = mapped_column(Numeric(28, 10))  # CHANGED
     profit_percent: Mapped[float] = mapped_column(Numeric(10, 4))
     traded_volume: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
     profit_quote: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
@@ -181,7 +181,7 @@ class OrderExecution(Base, UUIDMixin, TimestampMixin):
     opportunity_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("arbitrage_opportunities.id", ondelete="CASCADE"), nullable=False, index=True)
     exchange_name: Mapped[str] = mapped_column(String(50), nullable=False)
     side: Mapped[str] = mapped_column(String(10), nullable=False)
-    price: Mapped[float] = mapped_column(Numeric(20, 10), nullable=False)
+    price: Mapped[float] = mapped_column(Numeric(28, 10), nullable=False)  # CHANGED
     volume: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)
     fee: Mapped[float] = mapped_column(Numeric(20, 8), default=0.0)
     client_order_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
