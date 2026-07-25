@@ -32,7 +32,7 @@ class ArbitrageService:
 
     async def poll_and_store(self, db: AsyncSession):
         try:
-            exchange_data = await self.fetcher.fetch_all(db)
+            exchange_data = await self.fetcher.fetch_all(db, symbols_per_cycle=5)
             if not exchange_data:
                 logger.warning("[POLL] No exchange data received")
                 return
